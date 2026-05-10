@@ -1798,6 +1798,40 @@ Rockets +4.5  Alt Spread  -950"
     </div>
   </div>
 
+  <!-- Settled props results panel -->
+  <div style="margin-top:20px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <div style="font-weight:600;font-size:14px">Recent Settled Props</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="scout-settled-days" onchange="loadSettledProps()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:6px;font-size:12px">
+          <option value="7">Last 7 days</option>
+          <option value="14">Last 14 days</option>
+          <option value="30">Last 30 days</option>
+        </select>
+        <span id="scout-settled-stat" style="font-size:12px;color:var(--muted)"></span>
+      </div>
+    </div>
+    <div class="card" style="padding:0;overflow:hidden">
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border);text-align:left">
+            <th style="padding:8px 12px;color:var(--muted);font-weight:600;font-size:10px;text-transform:uppercase">Date</th>
+            <th style="padding:8px 12px;color:var(--muted);font-weight:600;font-size:10px;text-transform:uppercase">Player</th>
+            <th style="padding:8px 12px;color:var(--muted);font-weight:600;font-size:10px;text-transform:uppercase">Market</th>
+            <th style="padding:8px 12px;color:var(--muted);font-weight:600;font-size:10px;text-transform:uppercase">Line</th>
+            <th style="padding:8px 12px;color:var(--muted);font-weight:600;font-size:10px;text-transform:uppercase">Proj</th>
+            <th style="padding:8px 12px;color:var(--muted);font-weight:600;font-size:10px;text-transform:uppercase">Hit %</th>
+            <th style="padding:8px 12px;color:var(--muted);font-weight:600;font-size:10px;text-transform:uppercase">Grade</th>
+            <th style="padding:8px 12px;color:var(--muted);font-weight:600;font-size:10px;text-transform:uppercase">Result</th>
+          </tr>
+        </thead>
+        <tbody id="scout-settled-body">
+          <tr><td colspan="8" style="padding:16px;text-align:center;color:var(--muted)">No settled props yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- Detail modal -->
   <div id="scout-detail-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:2000;align-items:center;justify-content:center">
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;width:min(500px,95vw);max-height:88vh;overflow-y:auto;padding:24px">
@@ -11537,6 +11571,59 @@ async function loadScoutAccuracy() {
   }
 }
 
+async function loadSettledProps() {
+  const days = document.getElementById('scout-settled-days')?.value || 7;
+  const sport = document.getElementById('scout-sport')?.value || '';
+  const grade = document.getElementById('scout-grade')?.value || '';
+  const body  = document.getElementById('scout-settled-body');
+  const stat  = document.getElementById('scout-settled-stat');
+
+  const params = new URLSearchParams({ days, limit: 50 });
+  if (sport) params.set('sport', sport);
+  if (grade) params.set('grade', grade);
+
+  try {
+    const d = await fetch('/api/scout/settled?' + params).then(r => r.json());
+    const props = d.props || [];
+
+    if (stat) {
+      if (d.total > 0) {
+        const hitPct = d.hit_rate != null ? (d.hit_rate * 100).toFixed(1) + '% hit rate' : '';
+        stat.textContent = `${d.total} props · ${hitPct}`;
+      } else {
+        stat.textContent = 'No settled props';
+      }
+    }
+
+    if (!body) return;
+    if (!props.length) {
+      body.innerHTML = '<tr><td colspan="8" style="padding:16px;text-align:center;color:var(--muted)">No settled props in this window</td></tr>';
+      return;
+    }
+
+    body.innerHTML = props.map(p => {
+      const result = p.actual_hit === 1 ? '✓ HIT' : p.actual_hit === 0 ? '✗ MISS' : '—';
+      const resultCol = p.actual_hit === 1 ? 'var(--green)' : p.actual_hit === 0 ? 'var(--red)' : 'var(--muted)';
+      const hitPct = p.hit_probability != null ? (p.hit_probability * 100).toFixed(0) + '%' : '—';
+      const proj = p.projected_value != null ? p.projected_value.toFixed(1) : '—';
+      const thr  = p.threshold != null ? `${(p.side||'O').toUpperCase()} ${p.threshold}` : '—';
+      const actVal = p.actual_outcome_value != null ? ` (${p.actual_outcome_value.toFixed(1)})` : '';
+      return `<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:7px 12px;color:var(--muted)">${(p.scout_date||'').slice(5)}</td>
+        <td style="padding:7px 12px;font-weight:600">${p.player_name||p.team||'—'}</td>
+        <td style="padding:7px 12px;color:var(--muted)">${_mktLabel(p.market_type)}</td>
+        <td style="padding:7px 12px">${thr}</td>
+        <td style="padding:7px 12px">${proj}</td>
+        <td style="padding:7px 12px">${hitPct}</td>
+        <td style="padding:7px 12px">${_gradeChip(p.quality_grade)}</td>
+        <td style="padding:7px 12px;font-weight:700;color:${resultCol}">${result}${actVal}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    if (body) body.innerHTML = `<tr><td colspan="8" style="padding:16px;text-align:center;color:var(--red)">Error loading settled props</td></tr>`;
+  }
+}
+
 function exportScoutProps() {
   const sport = document.getElementById('scout-sport')?.value || '';
   const grade = document.getElementById('scout-grade')?.value || '';
@@ -11698,7 +11785,7 @@ async function runKellySizer() {
 const _origShowPage = window.showPage;
 window.showPage = function(name) {
   _origShowPage(name);
-  if (name === 'scout')     { loadScoutProps(); loadScoutAccuracy(); }
+  if (name === 'scout')     { loadScoutProps(); loadScoutAccuracy(); loadSettledProps(); }
   if (name === 'placement') loadPlacement();
 };
 
