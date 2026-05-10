@@ -289,6 +289,8 @@ def get_user_signal_adjustment(
                 f"User weakness on {skey}: {perf.wr_pct:.0f}% WR over {perf.total_uses} picks — avoid ({w:.2f}x)"
             )
 
+    # Safety clamp: prevent runaway boosts/penalties from stacked signal weights
+    multiplier = max(0.3, min(1.7, multiplier))
     return round(multiplier, 4), notes
 
 

@@ -226,35 +226,23 @@ def _ensure_tables():
 # ─── TheOddsAPI helpers ───────────────────────────────────────────────────────
 
 def _get(endpoint: str, params: dict, retries: int = 3) -> dict | list | None:
+    from http_retry import get_with_retry
     params = dict(params)
     params["apiKey"] = _ODDS_API_KEY
     url = f"{_BASE_URL}{endpoint}"
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=20)
-            if r.status_code == 200:
-                remaining_str = r.headers.get("x-requests-remaining", "")
-                used_str      = r.headers.get("x-requests-last", "")
-                remaining = int(remaining_str) if remaining_str.isdigit() else None
-                used      = int(used_str)      if used_str.isdigit()      else None
-                print(f"[CreatorTier] {endpoint.split('?')[0][-60:]}  "
-                      f"cost={used} remaining={remaining}")
-                _log_credits(endpoint, used, remaining)
-                return r.json()
-            if r.status_code == 422:
-                print(f"[CreatorTier] 422 Unprocessable: {r.text[:200]}")
-                return None
-            if r.status_code == 429:
-                wait = 2 ** attempt * 5
-                print(f"[CreatorTier] 429 rate-limit — sleeping {wait}s")
-                time.sleep(wait)
-                continue
-            print(f"[CreatorTier] HTTP {r.status_code} for {url}: {r.text[:120]}")
-            return None
-        except requests.RequestException as exc:
-            print(f"[CreatorTier] Request error (attempt {attempt+1}): {exc}")
-            time.sleep(2)
-    return None
+    r = get_with_retry(url, params=params, timeout=20, max_attempts=retries, label="CreatorTier")
+    if r is None:
+        return None
+    if r.status_code == 422:
+        print(f"[CreatorTier] 422 Unprocessable: {r.text[:200]}")
+        return None
+    remaining_str = r.headers.get("x-requests-remaining", "")
+    used_str      = r.headers.get("x-requests-last", "")
+    remaining = int(remaining_str) if remaining_str.isdigit() else None
+    used      = int(used_str)      if used_str.isdigit()      else None
+    print(f"[CreatorTier] {endpoint.split('?')[0][-60:]}  cost={used} remaining={remaining}")
+    _log_credits(endpoint, used, remaining)
+    return r.json()
 
 
 def _log_credits(endpoint: str, used: int | None, remaining: int | None):

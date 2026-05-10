@@ -1646,12 +1646,31 @@ def generate_todays_picks(
         # The boost term naturally promotes same-sport CUSHION clusters:
         #   same-sport +100 → +50% eligible → higher lift → higher composite
         #   cross-sport     → +30% max      → lower lift  → lower composite
-        _c["_composite"] = (
+        _base_composite = (
             (_avg_wp  / 100) * 0.47 +
             (_raw_lqs / 100) * 0.28 +
             _norm_ev          * 0.19 +
             _norm_boost        * 0.06
         )
+        # User signal multiplier — average adjustment across all legs in this candidate.
+        # Each leg's multiplier is clamped to [0.3, 1.7] in get_user_signal_adjustment;
+        # we average rather than multiply across legs to prevent compounding.
+        _sig_mults = []
+        _sig_notes = []
+        try:
+            import user_signal_learning as _usl
+            for _leg in _c["legs"]:
+                _m, _n = _usl.get_user_signal_adjustment(_leg, db)
+                _sig_mults.append(_m)
+                _sig_notes.extend(_n)
+        except Exception:
+            pass
+        _sig_mult = sum(_sig_mults) / len(_sig_mults) if _sig_mults else 1.0
+        _sig_mult = max(0.3, min(1.7, _sig_mult))   # final pool-level clamp
+
+        _c["_composite"]    = _base_composite * _sig_mult
+        _c["_signal_mult"]  = round(_sig_mult, 4)
+        _c["_signal_notes"] = _sig_notes
         _c["_avg_lqs"] = _raw_lqs  # cache for depth-first selection below
         _c["_avg_wp"]  = _avg_wp   # cache for section_a sort key
     candidates.sort(key=lambda x: -x["_composite"])
@@ -2013,6 +2032,9 @@ def _format_pick(cand: dict, stake: float, db=None) -> dict:
                             and len(legs_out) >= 2,
         "is_single_sport":  len({_normalize_sport(l.get("sport") or "") for l in legs_out
                                   if l.get("sport")}) <= 1,
+        # User signal adjustment applied to composite score
+        "signal_multiplier": cand.get("_signal_mult", 1.0),
+        "signal_notes":      cand.get("_signal_notes", []),
         # Emergency patch tag: any pick with a recently-started leg gets a distinct source
         # so it can be excluded from clean prospective WR/P&L analysis in signal_analysis.
         "source": (
