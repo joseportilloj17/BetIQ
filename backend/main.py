@@ -6952,6 +6952,148 @@ def get_scout_props(
     }
 
 
+@app.get("/api/scout/compare")
+def scout_market_compare(
+    date:  Optional[str] = None,
+    sport: Optional[str] = None,
+    grade: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Compare today's scouted props against current market odds from fixtures.
+    For each prop, finds the closest market line and computes:
+      - market_line: the bookmaker's current line
+      - market_implied_prob: implied probability from best available odds
+      - edge_pp: our projected hit_probability - market_implied_prob (pp)
+    Only player props are matched (team market matching is todo).
+    """
+    import json as _json
+    from sqlalchemy import text
+    from datetime import datetime, timezone
+
+    scout_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Fetch scouted props
+    filters = ["sp.scout_date = :d", "sp.actual_hit IS NULL"]
+    params: dict = {"d": scout_date}
+    if sport:
+        filters.append("sp.sport = :sport")
+        params["sport"] = sport.upper()
+    if grade:
+        filters.append("sp.quality_grade = :grade")
+        params["grade"] = grade.upper()
+
+    props = db.execute(text(f"""
+        SELECT sp.id, sp.sport, sp.home_team, sp.away_team, sp.market_type,
+               sp.player_name, sp.side, sp.threshold, sp.hit_probability,
+               sp.quality_grade
+        FROM   scouted_props sp
+        WHERE  {" AND ".join(filters)}
+        ORDER  BY sp.hit_probability DESC
+        LIMIT  100
+    """), params).fetchall()
+
+    prop_cols = ["id", "sport", "home_team", "away_team", "market_type",
+                 "player_name", "side", "threshold", "hit_probability", "quality_grade"]
+
+    # Fetch fixtures with odds for today's games
+    fixtures = db.execute(text("""
+        SELECT id, home_team, away_team, bookmakers FROM fixtures
+        WHERE commence_time >= datetime('now', '-6 hours')
+        AND   commence_time <= datetime('now', '+30 hours')
+    """)).fetchall()
+
+    # Build a lookup: (home_team_lower, away_team_lower) -> bookmakers
+    def _name_key(s: str) -> str:
+        return (s or "").lower().strip()
+
+    fixture_map: dict = {}
+    for fx_id, home, away, bm_json in fixtures:
+        bm = bm_json if isinstance(bm_json, list) else _json.loads(bm_json or "[]")
+        fixture_map[(_name_key(home), _name_key(away))] = bm
+
+    def _implied_prob(american_odds: int) -> float:
+        """Convert American odds to no-vig implied probability."""
+        if american_odds > 0:
+            return 100.0 / (american_odds + 100.0)
+        return abs(american_odds) / (abs(american_odds) + 100.0)
+
+    def _find_market_line(bookmakers: list, market_key: str, team_or_player: str,
+                          side: str, threshold: float) -> tuple | None:
+        """
+        Search bookmaker markets for a matching line.
+        Returns (best_odds, implied_prob) or None.
+        """
+        for bm in bookmakers:
+            for mkt in bm.get("markets", []):
+                if mkt.get("key", "") != market_key:
+                    continue
+                for outcome in mkt.get("outcomes", []):
+                    o_name  = (outcome.get("name") or "").lower()
+                    o_point = outcome.get("point")
+                    o_price = outcome.get("price")
+                    # Match by team/player name fragment
+                    if team_or_player and team_or_player.lower() not in o_name:
+                        continue
+                    # Match threshold if relevant
+                    if threshold is not None and o_point is not None:
+                        if abs(float(o_point) - float(threshold)) > 1.0:
+                            continue
+                    if o_price is not None:
+                        return float(o_price), _implied_prob(int(o_price))
+        return None
+
+    # Market key mapping from our market_type to OddsAPI key
+    _MKT_MAP = {
+        "player_points":   "player_points",
+        "player_rebounds": "player_rebounds",
+        "player_assists":  "player_assists",
+        "player_pra":      "player_points_rebounds_assists",
+        "player_threes":   "player_threes",
+        "player_steals":   "player_steals",
+        "player_blocks":   "player_blocks",
+        "player_hits":     "batter_hits",
+        "player_strikeouts": "pitcher_strikeouts",
+        "player_total_bases": "batter_total_bases",
+        "player_shots":    "player_shots_on_goal",
+        "player_goals":    "player_goal_scorer",
+        "h2h":             "h2h",
+        "spread":          "spreads",
+        "totals":          "totals",
+    }
+
+    comparisons = []
+    for row in props:
+        d = dict(zip(prop_cols, row))
+        bm = fixture_map.get((_name_key(d["home_team"]), _name_key(d["away_team"])), [])
+
+        market_key = _MKT_MAP.get(d["market_type"], d["market_type"])
+        team_or_player = d.get("player_name") or ""
+        match = _find_market_line(bm, market_key, team_or_player, d["side"], d["threshold"])
+
+        d["market_odds"]         = match[0] if match else None
+        d["market_implied_prob"] = round(match[1], 4) if match else None
+        d["edge_pp"] = (
+            round((d["hit_probability"] - match[1]) * 100, 1)
+            if match else None
+        )
+        d["has_market_line"] = match is not None
+        comparisons.append(d)
+
+    # Sort by edge desc (nulls last)
+    comparisons.sort(key=lambda x: (x["edge_pp"] is None, -(x["edge_pp"] or 0)))
+
+    edges = [c for c in comparisons if c["edge_pp"] is not None]
+
+    return {
+        "scout_date":    scout_date,
+        "total":         len(comparisons),
+        "matched":       len(edges),
+        "avg_edge_pp":   round(sum(c["edge_pp"] for c in edges) / len(edges), 1) if edges else None,
+        "comparisons":   comparisons,
+    }
+
+
 @app.get("/api/scout/settled")
 def get_scout_settled(
     days:   int = 7,
