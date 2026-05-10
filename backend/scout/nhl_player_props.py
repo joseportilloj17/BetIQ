@@ -115,7 +115,13 @@ def _scout_player(
     game: GameInfo,
     team: str,
     scout_date: str,
+    goalie_factor: float = 1.0,
 ) -> List[ScoutedProp]:
+    """
+    goalie_factor: save%-based multiplier for opposing goalie quality.
+    >1.0 = weak goalie (project shots/goals up). <1.0 = elite goalie (project down).
+    Applied to player_shots, player_goals markets.
+    """
     results: List[ScoutedProp] = []
 
     # NHL API returns player IDs as integers
@@ -143,6 +149,8 @@ def _scout_player(
     is_home   = (team == game.home_team)
     home_road = "home" if is_home else "away"
 
+    _GOALIE_ADJUSTED = {"player_shots", "player_goals"}
+
     for market_type, (season_key, recent_key, sport_stat) in _STAT_MAP.items():
         season_avg = _safe_float(season_pg.get(season_key))
         if season_avg < _MIN_AVG.get(market_type, 0.05):
@@ -150,6 +158,11 @@ def _scout_player(
 
         recent_avg_val = _recent_avg(recent_games, recent_key, n=7) if recent_games else None
         projected_mean = blend_season_recent(season_avg, recent_avg_val)
+
+        # Apply goalie quality adjustment to shot/goal markets
+        if market_type in _GOALIE_ADJUSTED and goalie_factor != 1.0:
+            projected_mean = projected_mean * goalie_factor
+
         std            = std_from_average(projected_mean, "NHL", sport_stat)
 
         confidence_factors = [
@@ -157,6 +170,9 @@ def _scout_player(
             home_road,
         ]
         risk_factors = []
+        if goalie_factor != 1.0 and market_type in _GOALIE_ADJUSTED:
+            dir_label = "weak" if goalie_factor > 1.0 else "elite"
+            confidence_factors.append(f"Opp goalie ({dir_label} SV%): {goalie_factor:.2f}x adj")
         if recent_avg_val is not None:
             confidence_factors.append(f"L7 avg: {recent_avg_val:.2f}")
         else:
@@ -203,6 +219,30 @@ def _scout_player(
     return results
 
 
+# ── Goalie quality adjustment ──────────────────────────────────────────────────
+
+_NHL_LEAGUE_AVG_SV_PCT = 0.906   # ~2024-25 NHL league average save percentage
+
+def _goalie_factor(opp_team_abbr: str) -> float:
+    """
+    Return a shot/goal multiplier based on opposing goalie's save %.
+    Elite goalie (high SV%) → factor < 1.0 (project goals/shots lower).
+    Weak goalie (low SV%) → factor > 1.0 (project goals/shots higher).
+    Clamped to [0.82, 1.18].
+    """
+    try:
+        g = ds.get_nhl_goalie_stats(opp_team_abbr)
+        sv_pct = g.get("save_pct", _NHL_LEAGUE_AVG_SV_PCT)
+        if sv_pct <= 0:
+            return 1.0
+        # Factor: league avg SV / opponent SV → higher SV = lower factor
+        # We want: opponent allows more goals = factor > 1
+        factor = (1.0 - _NHL_LEAGUE_AVG_SV_PCT) / (1.0 - sv_pct) if sv_pct < 1.0 else 1.0
+        return max(0.82, min(1.18, factor))
+    except Exception:
+        return 1.0
+
+
 # ── Game-level entry point ─────────────────────────────────────────────────────
 
 def scout_game(game: GameInfo) -> List[ScoutedProp]:
@@ -210,9 +250,13 @@ def scout_game(game: GameInfo) -> List[ScoutedProp]:
     scout_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     results: List[ScoutedProp] = []
 
-    for team_id, team_name in [
-        (game.home_team_id, game.home_team),
-        (game.away_team_id, game.away_team),
+    # Pre-fetch goalie factors: home skaters face away goalie, away skaters face home goalie
+    home_goalie_factor = _goalie_factor(game.away_team_id)  # away team abbr
+    away_goalie_factor = _goalie_factor(game.home_team_id)  # home team abbr
+
+    for team_id, team_name, goalie_fac in [
+        (game.home_team_id, game.home_team, home_goalie_factor),
+        (game.away_team_id, game.away_team, away_goalie_factor),
     ]:
         roster = ds.get_nhl_team_roster(team_id)
         if not roster:
@@ -220,7 +264,8 @@ def scout_game(game: GameInfo) -> List[ScoutedProp]:
 
         for player in roster:
             try:
-                props = _scout_player(player, game, team_name, scout_date)
+                props = _scout_player(player, game, team_name, scout_date,
+                                      goalie_factor=goalie_fac)
                 results.extend(props)
             except Exception as exc:
                 name = (player.get("fullName")
