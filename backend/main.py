@@ -7124,6 +7124,67 @@ def get_scout_accuracy(
 
 import placement as _placement
 
+@app.get("/api/scout/export")
+def export_scout_props(
+    date:   Optional[str] = None,
+    sport:  Optional[str] = None,
+    grade:  Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Export today's (or a given date's) scouted props as a CSV download.
+    Filterable by sport and quality_grade.
+    """
+    import csv, io
+    from fastapi.responses import StreamingResponse
+    from sqlalchemy import text
+    from datetime import datetime, timezone
+
+    scout_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    filters = ["scout_date = :date"]
+    params: dict = {"date": scout_date}
+    if sport:
+        filters.append("sport = :sport")
+        params["sport"] = sport.upper()
+    if grade:
+        filters.append("quality_grade = :grade")
+        params["grade"] = grade.upper()
+
+    rows = db.execute(text(f"""
+        SELECT scout_date, sport, home_team, away_team, commence_time,
+               market_type, player_name, team, side, threshold,
+               projected_value, projected_low_95, projected_high_95,
+               projected_std_dev, hit_probability, quality_grade,
+               data_source, actual_hit, actual_outcome_value
+        FROM   scouted_props
+        WHERE  {" AND ".join(filters)}
+        ORDER  BY quality_grade, hit_probability DESC
+        LIMIT  500
+    """), params).fetchall()
+
+    cols = [
+        "scout_date", "sport", "home_team", "away_team", "commence_time",
+        "market_type", "player_name", "team", "side", "threshold",
+        "projected_value", "projected_low_95", "projected_high_95",
+        "projected_std_dev", "hit_probability", "quality_grade",
+        "data_source", "actual_hit", "actual_outcome_value",
+    ]
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=cols)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(dict(zip(cols, row)))
+    buf.seek(0)
+
+    fname = f"betiq_scout_{scout_date}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={fname}"},
+    )
+
+
 class PlacementSizeRequest(BaseModel):
     hit_probability: float
     quality_grade:   str

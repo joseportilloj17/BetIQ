@@ -1705,6 +1705,7 @@ Rockets +4.5  Alt Spread  -950"
     <div style="display:flex;gap:8px;align-items:center">
       <span id="scout-cal-badge" style="font-size:11px;padding:3px 8px;border-radius:12px;background:var(--surface2);color:var(--muted)">Calibration: —</span>
       <button class="btn btn-ghost btn-sm" onclick="loadScoutProps()">↻ Refresh</button>
+      <button class="btn btn-ghost btn-sm" onclick="exportScoutProps()" title="Download CSV">⬇ Export</button>
       <button class="btn btn-amber btn-sm" onclick="triggerScoutRun()">▶ Run Scout</button>
     </div>
   </div>
@@ -11529,6 +11530,15 @@ async function loadScoutAccuracy() {
   } catch(e) {
     console.error('Scout accuracy error:', e);
   }
+}
+
+function exportScoutProps() {
+  const sport = document.getElementById('scout-sport')?.value || '';
+  const grade = document.getElementById('scout-grade')?.value || '';
+  const params = new URLSearchParams();
+  if (sport) params.set('sport', sport);
+  if (grade) params.set('grade', grade);
+  window.location.href = '/api/scout/export?' + params;
 }
 
 async function triggerScoutRun() {
