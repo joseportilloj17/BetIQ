@@ -33,9 +33,7 @@ import requests
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-_ODDS_API_KEY = os.environ.get(
-    "ODDS_API_KEY", ""
-)
+_ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
 _BASE_URL = "https://api.the-odds-api.com/v4"
 _HIST_DB  = os.path.join(os.path.dirname(__file__), "..", "data", "historical.db")
 
