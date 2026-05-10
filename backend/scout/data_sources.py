@@ -522,6 +522,51 @@ def get_nhl_player_season_stats(player_id: str) -> dict:
     return {}
 
 
+def get_nhl_goalie_stats(team_abbr: str) -> dict:
+    """
+    Return the starting goalie's season save percentage and goals-against average
+    for a given team abbreviation.
+
+    Uses the roster endpoint to find goalies, then fetches the goalie with the
+    most games played as a proxy for the likely starter.
+
+    Returns:
+      {"save_pct": float, "gaa": float, "goalie_name": str, "games": int}
+      or {} if unavailable.
+    """
+    roster = get_nhl_team_roster(team_abbr)
+    best_goalie: dict = {}
+    best_gp = 0
+
+    for player in roster:
+        pos = str(player.get("positionCode", "")).upper()
+        if pos != "G":
+            continue
+        pid = str(player.get("id", player.get("playerId", "")))
+        if not pid:
+            continue
+        data = _nhl(f"{NHL_API}/player/{pid}/landing")
+        if not data:
+            continue
+        for s in reversed(data.get("seasonTotals", [])):
+            if s.get("leagueAbbrev") == "NHL" and s.get("gameTypeId") == 2:
+                gp = int(s.get("gamesPlayed") or 0)
+                if gp > best_gp:
+                    best_gp = gp
+                    name = (player.get("fullName")
+                            or (player.get("firstName", {}).get("default", "")
+                                + " " + player.get("lastName", {}).get("default", "")).strip())
+                    best_goalie = {
+                        "save_pct":   float(s.get("savePctg") or s.get("savePercentage") or 0),
+                        "gaa":        float(s.get("goalsAgainstAvg") or s.get("goalAgainstAverage") or 3.0),
+                        "goalie_name": name,
+                        "games":       gp,
+                    }
+                break  # most recent season for this goalie found
+
+    return best_goalie
+
+
 def get_nhl_team_standings(team_abbr: str) -> dict:
     """Return current season record/pts% for an NHL team."""
     data = _nhl(f"{NHL_API}/standings/now")
