@@ -6872,6 +6872,7 @@ def get_scout_props(
     market:  Optional[str] = None,
     search:  Optional[str] = None,
     limit:   int = 200,
+    offset:  int = 0,
     db: Session = Depends(get_db),
 ):
     """
@@ -6914,8 +6915,8 @@ def get_scout_props(
         FROM   scouted_props
         WHERE  {where}
         ORDER  BY hit_probability DESC
-        LIMIT  :limit
-    """), {**params, "limit": limit}).fetchall()
+        LIMIT  :limit OFFSET :offset
+    """), {**params, "limit": limit, "offset": offset}).fetchall()
 
     cols = [
         "id", "scout_date", "sport", "game_id", "home_team", "away_team",
@@ -6936,10 +6937,78 @@ def get_scout_props(
                 d[jf] = []
         props.append(d)
 
+    # Count total matching for pagination info
+    total_count_row = db.execute(text(f"""
+        SELECT COUNT(*) FROM scouted_props WHERE {where}
+    """), params).fetchone()
+    total_count = total_count_row[0] if total_count_row else len(props)
+
     return {
         "scout_date":  scout_date,
-        "total":       len(props),
+        "total":       total_count,
+        "returned":    len(props),
+        "offset":      offset,
         "props":       props,
+    }
+
+
+@app.get("/api/scout/settled")
+def get_scout_settled(
+    days:   int = 7,
+    sport:  Optional[str] = None,
+    grade:  Optional[str] = None,
+    limit:  int = 100,
+    db: Session = Depends(get_db),
+):
+    """
+    Return recently settled scouted props (actual_hit IS NOT NULL).
+    Shows projection performance: projected vs actual, hit/miss.
+    """
+    import json as _json
+    from sqlalchemy import text
+    from datetime import datetime, timezone, timedelta
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    filters = ["actual_hit IS NOT NULL", "scout_date >= :since"]
+    params: dict = {"since": since}
+    if sport:
+        filters.append("sport = :sport")
+        params["sport"] = sport.upper()
+    if grade:
+        filters.append("quality_grade = :grade")
+        params["grade"] = grade.upper()
+
+    where = " AND ".join(filters)
+
+    rows = db.execute(text(f"""
+        SELECT id, scout_date, sport, home_team, away_team,
+               market_type, player_name, team, side, threshold,
+               projected_value, hit_probability, quality_grade,
+               actual_hit, actual_outcome_value
+        FROM   scouted_props
+        WHERE  {where}
+        ORDER  BY scout_date DESC, hit_probability DESC
+        LIMIT  :limit
+    """), {**params, "limit": limit}).fetchall()
+
+    cols = [
+        "id", "scout_date", "sport", "home_team", "away_team",
+        "market_type", "player_name", "team", "side", "threshold",
+        "projected_value", "hit_probability", "quality_grade",
+        "actual_hit", "actual_outcome_value",
+    ]
+
+    props = [dict(zip(cols, r)) for r in rows]
+    hits  = sum(1 for p in props if p.get("actual_hit") == 1)
+
+    return {
+        "days":      days,
+        "since":     since,
+        "total":     len(props),
+        "hit_count": hits,
+        "hit_rate":  round(hits / len(props), 4) if props else None,
+        "props":     props,
     }
 
 
