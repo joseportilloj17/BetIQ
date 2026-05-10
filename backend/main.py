@@ -6784,3 +6784,155 @@ def _propagate_leg_signals(pick: UserPick, db: Session) -> None:
         sig.outcome = outcome
     db.flush()
     db.commit()
+
+
+# ─── Scout routes (Phase 5 — scouting + placement layer) ─────────────────────
+
+@app.get("/api/scout/props")
+def get_scout_props(
+    date:    Optional[str] = None,
+    sport:   Optional[str] = None,
+    grade:   Optional[str] = None,
+    market:  Optional[str] = None,
+    limit:   int = 200,
+    db: Session = Depends(get_db),
+):
+    """
+    Return scouted props for a given date (defaults to today).
+    Filterable by sport, quality_grade, and market_type.
+    """
+    import json as _json
+    from sqlalchemy import text
+    from datetime import datetime, timezone
+
+    scout_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    filters = ["scout_date = :date"]
+    params: dict = {"date": scout_date}
+    if sport:
+        filters.append("sport = :sport")
+        params["sport"] = sport.upper()
+    if grade:
+        filters.append("quality_grade = :grade")
+        params["grade"] = grade.upper()
+    if market:
+        filters.append("market_type = :market")
+        params["market"] = market
+
+    where = " AND ".join(filters)
+    rows = db.execute(text(f"""
+        SELECT id, scout_date, sport, game_id, home_team, away_team,
+               commence_time, market_type, player_name, player_id, team, side,
+               threshold, projected_value, projected_low_95, projected_high_95,
+               projected_std_dev, hit_probability, quality_grade,
+               confidence_factors, risk_factors,
+               actual_outcome_value, actual_hit, scout_accuracy,
+               data_source, projection_version, created_at
+        FROM   scouted_props
+        WHERE  {where}
+        ORDER  BY hit_probability DESC
+        LIMIT  :limit
+    """), {**params, "limit": limit}).fetchall()
+
+    cols = [
+        "id", "scout_date", "sport", "game_id", "home_team", "away_team",
+        "commence_time", "market_type", "player_name", "player_id", "team", "side",
+        "threshold", "projected_value", "projected_low_95", "projected_high_95",
+        "projected_std_dev", "hit_probability", "quality_grade",
+        "confidence_factors", "risk_factors",
+        "actual_outcome_value", "actual_hit", "scout_accuracy",
+        "data_source", "projection_version", "created_at",
+    ]
+    props = []
+    for row in rows:
+        d = dict(zip(cols, row))
+        for jf in ("confidence_factors", "risk_factors"):
+            try:
+                d[jf] = _json.loads(d[jf]) if d[jf] else []
+            except Exception:
+                d[jf] = []
+        props.append(d)
+
+    return {
+        "scout_date":  scout_date,
+        "total":       len(props),
+        "props":       props,
+    }
+
+
+@app.get("/api/scout/summary")
+def get_scout_summary(
+    date: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Grade/sport breakdown for scouted props on a date."""
+    from sqlalchemy import text
+    from datetime import datetime, timezone
+
+    scout_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    rows = db.execute(text("""
+        SELECT sport, quality_grade, COUNT(*) as n,
+               AVG(hit_probability) as avg_prob
+        FROM   scouted_props
+        WHERE  scout_date = :d
+        GROUP  BY sport, quality_grade
+        ORDER  BY sport, quality_grade
+    """), {"d": scout_date}).fetchall()
+
+    breakdown = []
+    for r in rows:
+        breakdown.append({
+            "sport":        r[0],
+            "grade":        r[1],
+            "count":        r[2],
+            "avg_hit_prob": round(float(r[3]) * 100, 1) if r[3] else None,
+        })
+
+    total_row = db.execute(text(
+        "SELECT COUNT(*) FROM scouted_props WHERE scout_date = :d"
+    ), {"d": scout_date}).fetchone()
+
+    last_scout = None
+    try:
+        import scheduler as sched
+        last_scout = sched.get_state().get("last_scout_run")
+    except Exception:
+        pass
+
+    return {
+        "scout_date":  scout_date,
+        "total_props": total_row[0] if total_row else 0,
+        "breakdown":   breakdown,
+        "last_scout_run": last_scout,
+    }
+
+
+@app.post("/api/scout/run")
+def trigger_scout_run(db: Session = Depends(get_db)):
+    """
+    Manually trigger the full scout pipeline.
+    Runs synchronously — may take 60-120 seconds.
+    """
+    from database import engine as _engine
+    import scout.runner as _runner
+    result = _runner.run_daily_scout(_engine, db)
+    return result
+
+
+@app.get("/api/scout/calibration")
+def get_scout_calibration(db: Session = Depends(get_db)):
+    """Latest scout calibration drift summary."""
+    from database import engine as _engine
+    import scout.calibration as sc
+    summary = sc.latest_scout_calibration_summary(_engine)
+    return summary or {"message": "No calibration data yet"}
+
+
+@app.post("/api/scout/calibration/run")
+def run_scout_calibration(db: Session = Depends(get_db)):
+    """Run scout calibration check now."""
+    from database import engine as _engine
+    import scout.calibration as sc
+    sc.initialize(_engine)
+    return sc.run_scout_calibration(_engine, db)

@@ -92,6 +92,9 @@ _scheduler_state = {
     # Daily calibration drift check (10:30 AM CT — after overnight scores settle + mock settle)
     "last_calibration_check":        None,
     "last_calibration_check_result": None,
+    # Daily scout run (9:00 AM CT — after fixture refresh + pitcher fetch)
+    "last_scout_run":        None,
+    "last_scout_run_result": None,
     # ── Watchdog verification flags (reset daily at midnight CT) ────────────────
     # True once the watchdog confirms the job actually produced results, not just ran.
     "watchdog_fixture_verified": False,   # fixtures loaded for today
@@ -324,6 +327,9 @@ _DAILY_ETL_HOUR_CT = 10
 _CALIBRATION_HOUR_CT   = 10
 _CALIBRATION_MINUTE_CT = 30
 
+# Hour (CT) for daily scout run (9:00 AM CT — after fixture refresh + pitcher fetch)
+_SCOUT_HOUR_CT = 9
+
 # Creator tier — targeted fetch schedule (credit-optimized)
 # Imminent-games snapshot: every 90 min, 8 AM–10 PM CT (overnight skip already in place)
 # 60-min → 90-min saves ~80 credits/day = ~2,080 over remaining billing cycle
@@ -538,6 +544,40 @@ def _should_run_calibration_check(now: datetime) -> bool:
         return False
     today_str = ct.strftime("%Y-%m-%d")
     return _scheduler_state.get("last_calibration_check") != today_str
+
+
+# ── Daily scout run (9:00 AM CT) ─────────────────────────────────────────────
+
+def _run_daily_scout() -> dict:
+    """
+    Run the scouting pipeline for all sports with games today.
+    Persists ScoutedProp rows to scouted_props table.
+    Returns summary dict with counts by sport and grade.
+    """
+    try:
+        import scout.runner as _runner
+        from database import SessionLocal as _SL, engine as _engine
+        db = _SL()
+        try:
+            result = _runner.run_daily_scout(_engine, db)
+        finally:
+            db.close()
+        total   = result.get("total_props", 0)
+        by_sport = result.get("by_sport", {})
+        print(f"[Scheduler] Scout run complete: {total} props — {by_sport}")
+        return result
+    except Exception as exc:
+        print(f"[Scheduler] Scout run error: {exc}")
+        return {"error": str(exc)}
+
+
+def _should_run_daily_scout(now: datetime) -> bool:
+    """True once daily at or after 9:00 AM CT."""
+    ct = _now_ct()
+    if ct.hour < _SCOUT_HOUR_CT:
+        return False
+    today_str = ct.strftime("%Y-%m-%d")
+    return _scheduler_state.get("last_scout_run") != today_str
 
 
 # ── Morning pre-generation sequence ──────────────────────────────────────────
@@ -1579,6 +1619,7 @@ def _loop(interval_mins: int, auto_retrain: bool):
         _dispatch("alt_lines_morning",   _should_run_alt_lines_morning,     _run_alt_lines_fetch,           "last_alt_lines_fetch_morning")
         _dispatch("alt_lines_afternoon", _should_run_alt_lines_afternoon,   _run_alt_lines_fetch,           "last_alt_lines_fetch_afternoon")
         _dispatch("calibration_check",   _should_run_calibration_check,    _run_calibration_check,         "last_calibration_check")
+        _dispatch("daily_scout",         _should_run_daily_scout,          _run_daily_scout,               "last_scout_run")
 
         # Imminent fetch — 2x/day at 7:15 AM and 2:30 PM CT
         try:
