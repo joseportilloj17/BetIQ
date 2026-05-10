@@ -230,16 +230,21 @@ def get_nba_team_season_stats(team_id: str) -> dict:
             normalised["losses"] = float(record[lk])
             break
 
-    # Fetch points per game from team stats endpoint if available
+    # Fetch points per game (offense) and points allowed (defense) from team stats
     stats_data = _espn(f"{ESPN_SITE_NBA}/teams/{team_id}/statistics")
     if stats_data:
         for cat in (stats_data.get("results") or [{}]):
             for stat in (cat.get("stats", {}).get("stats") or []):
-                if stat.get("name") in ("avgPoints", "pointsPerGame"):
-                    try:
-                        normalised["avg_points"] = float(stat["value"])
-                    except Exception:
-                        pass
+                name = stat.get("name", "")
+                try:
+                    val = float(stat["value"])
+                except Exception:
+                    continue
+                if name in ("avgPoints", "pointsPerGame"):
+                    normalised["avg_points"] = val
+                elif name in ("avgPointsAgainst", "opponentPointsPerGame",
+                              "avgDefensivePoints", "pointsAllowedPerGame"):
+                    normalised["avg_points_allowed"] = val
     return normalised
 
 
