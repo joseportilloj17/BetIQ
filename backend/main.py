@@ -7065,10 +7065,34 @@ def trigger_scout_run(db: Session = Depends(get_db)):
     """
     Manually trigger the full scout pipeline.
     Runs synchronously — may take 60-120 seconds.
+    Returns summary with per-sport counts and grade breakdown.
     """
     from database import engine as _engine
+    from sqlalchemy import text
     import scout.runner as _runner
+
     result = _runner.run_daily_scout(_engine, db)
+    scout_date = result.get("scout_date")
+
+    # Augment with grade breakdown
+    if scout_date:
+        try:
+            grade_rows = db.execute(text("""
+                SELECT quality_grade, COUNT(*) FROM scouted_props
+                WHERE scout_date = :d GROUP BY quality_grade
+            """), {"d": scout_date}).fetchall()
+            result["by_grade"] = {r[0]: r[1] for r in grade_rows}
+        except Exception:
+            pass
+
+    # Update scheduler state
+    try:
+        import scheduler as _sched
+        _sched.get_state()["last_scout_run"]        = scout_date
+        _sched.get_state()["last_scout_run_result"] = result
+    except Exception:
+        pass
+
     return result
 
 
