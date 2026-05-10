@@ -6870,12 +6870,14 @@ def get_scout_props(
     sport:   Optional[str] = None,
     grade:   Optional[str] = None,
     market:  Optional[str] = None,
+    search:  Optional[str] = None,
     limit:   int = 200,
     db: Session = Depends(get_db),
 ):
     """
     Return scouted props for a given date (defaults to today).
-    Filterable by sport, quality_grade, and market_type.
+    Filterable by sport, quality_grade, market_type, and free-text search
+    (matches player_name, team, home_team, or away_team).
     """
     import json as _json
     from sqlalchemy import text
@@ -6894,6 +6896,11 @@ def get_scout_props(
     if market:
         filters.append("market_type = :market")
         params["market"] = market
+    if search:
+        filters.append(
+            "(player_name LIKE :q OR team LIKE :q OR home_team LIKE :q OR away_team LIKE :q)"
+        )
+        params["q"] = f"%{search}%"
 
     where = " AND ".join(filters)
     rows = db.execute(text(f"""

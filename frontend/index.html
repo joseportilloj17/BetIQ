@@ -1712,7 +1712,7 @@ Rockets +4.5  Alt Spread  -950"
 
   <!-- Filters -->
   <div class="filter-row" style="margin-bottom:14px;flex-wrap:wrap;gap:8px">
-    <select id="scout-sport" onchange="loadScoutProps()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+    <select id="scout-sport" onchange="loadScoutProps(); loadScoutAccuracy();" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
       <option value="">All Sports</option>
       <option value="NBA">NBA</option>
       <option value="MLB">MLB</option>
@@ -1738,6 +1738,9 @@ Rockets +4.5  Alt Spread  -950"
       <option value="spread">Spread</option>
       <option value="totals">Total</option>
     </select>
+    <input type="text" id="scout-search" placeholder="Search player or team…"
+      oninput="loadScoutProps()"
+      style="flex:1;min-width:120px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
   </div>
 
   <!-- Summary badges -->
@@ -11288,6 +11291,7 @@ async function loadScoutProps() {
   const sport  = document.getElementById('scout-sport')?.value  || '';
   const grade  = document.getElementById('scout-grade')?.value  || '';
   const market = document.getElementById('scout-market')?.value || '';
+  const search = document.getElementById('scout-search')?.value.trim() || '';
 
   const body = document.getElementById('scout-table-body');
   if (body) body.innerHTML = '<tr><td colspan="8" style="padding:20px;text-align:center;color:var(--muted)">Loading…</td></tr>';
@@ -11296,6 +11300,7 @@ async function loadScoutProps() {
   if (sport)  params.set('sport',  sport);
   if (grade)  params.set('grade',  grade);
   if (market) params.set('market', market);
+  if (search) params.set('search', search);
   params.set('limit', 150);
 
   try {
