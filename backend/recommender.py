@@ -1853,6 +1853,18 @@ def generate_todays_picks(
     if _sa_depth_note:
         pool_assessment["section_a_note"] = _sa_depth_note
 
+    # Detect stale fixture odds — warn if newest fetched_at > 8h ago
+    _stale_odds = False
+    _fixture_age_h: float | None = None
+    try:
+        from scheduler import fixture_staleness_hours as _fsh
+        _fixture_age_h = _fsh()
+        _stale_odds = _fixture_age_h is not None and _fixture_age_h > 8.0
+        if _stale_odds:
+            print(f"[recommender] WARNING: generating picks from odds {_fixture_age_h:.1f}h old")
+    except Exception:
+        pass
+
     return {
         "anchor":          anchor_picks,
         "core":            core_picks,
@@ -1862,6 +1874,8 @@ def generate_todays_picks(
         "power_picks":     [],               # deprecated — priority loop handles 4-5 leg combos
         "section_a_empty": len(section_a_picks) == 0,
         "pool_assessment": pool_assessment,
+        "stale_odds_warning": _stale_odds,
+        "fixture_age_hours":  _fixture_age_h,
         "ale_summary": {
             "ale_switched":   n_ale_switched,
             "ale_fav_plus":   n_ale_fav_plus,
