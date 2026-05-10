@@ -5616,6 +5616,34 @@ def submit_user_pick(req: UserPickRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(pick)
 
+    # Enrich user pick legs with scout grade from scouted_props (best-effort)
+    try:
+        import placement as _plc
+        from sqlalchemy import text as _stext
+        _fresh = db.query(UserPickLeg).filter(UserPickLeg.user_pick_id == pick.id).all()
+        for _uleg in _fresh:
+            _leg_dict = {
+                "fixture_id":  _uleg.sport,       # UserPickLeg has no fixture_id; use sport fallback
+                "game_id":     None,
+                "market_type": _uleg.market_type,
+                "description": _uleg.description,
+                "player_name": _uleg.team,
+            }
+            _enriched = _plc.attach_scout_grade_to_leg(_leg_dict, db)
+            if _enriched.get("scout_grade"):
+                db.execute(_stext(
+                    "UPDATE user_pick_legs SET scout_grade=:g, scout_hit_prob=:hp, "
+                    "scouted_prop_id=:pid WHERE id=:lid"
+                ), {
+                    "g":   _enriched["scout_grade"],
+                    "hp":  _enriched.get("scout_hit_prob"),
+                    "pid": _enriched.get("scouted_prop_id"),
+                    "lid": _uleg.id,
+                })
+        db.commit()
+    except Exception as _scout_err:
+        print(f"[user-pick] scout enrich non-fatal: {_scout_err}")
+
     # Extract learning signals now that legs have IDs
     try:
         fresh_legs = db.query(UserPickLeg).filter(UserPickLeg.user_pick_id == pick.id).all()

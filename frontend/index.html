@@ -1842,13 +1842,14 @@ Rockets +4.5  Alt Spread  -950"
               <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Grade</th>
               <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Description</th>
               <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Market</th>
+              <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Projection</th>
               <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Hit %</th>
               <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Action</th>
               <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Kelly Stake</th>
             </tr>
           </thead>
           <tbody id="placement-table-body">
-            <tr><td colspan="6" style="padding:20px;text-align:center;color:var(--muted)">Loading…</td></tr>
+            <tr><td colspan="7" style="padding:20px;text-align:center;color:var(--muted)">Loading…</td></tr>
           </tbody>
         </table>
       </div>
@@ -11570,19 +11571,34 @@ async function loadPlacement() {
     const recs = recData.recommendations || [];
     if (tbody) {
       if (!recs.length) {
-        tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--muted)">No recommendations today. Run the scout first.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="7" style="padding:20px;text-align:center;color:var(--muted)">No recommendations today. Run the scout first.</td></tr>';
       } else {
         tbody.innerHTML = recs.map(r => {
           const action = r.action || 'SKIP';
           const actionCol = action.startsWith('PLAY') ? 'var(--green)' : 'var(--muted)';
           const hitPct = (r.hit_probability * 100).toFixed(1);
+          const hitCol = r.hit_probability >= 0.65 ? 'var(--green)' : r.hit_probability >= 0.55 ? 'var(--amber)' : 'var(--muted)';
+          // Projection CI display
+          const projVal = r.projected_value != null ? r.projected_value.toFixed(1) : '—';
+          const ciLow  = r.projected_low_95 != null ? r.projected_low_95.toFixed(1) : null;
+          const ciHigh = r.projected_high_95 != null ? r.projected_high_95.toFixed(1) : null;
+          const projStr = ciLow && ciHigh
+            ? `<span style="font-weight:600">${projVal}</span> <span style="font-size:10px;color:var(--muted)">[${ciLow}–${ciHigh}]</span>`
+            : `<span style="font-weight:600">${projVal}</span>`;
+          // Sport badge
+          const sportColors = {NBA:'#3b82f6',MLB:'#ef4444',NHL:'#22c55e'};
+          const sportBadge = `<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:${(sportColors[r.sport]||'#6b7280')}22;color:${sportColors[r.sport]||'var(--muted)'};font-weight:700">${r.sport||''}</span>`;
           return `<tr style="border-bottom:1px solid var(--border)" title="${r.reason||''}">
             <td style="padding:9px 14px">${_gradeChip(r.quality_grade)}</td>
-            <td style="padding:9px 14px;font-weight:600">${r.description || '—'}</td>
+            <td style="padding:9px 14px">
+              <div style="font-weight:600">${r.description || '—'}</div>
+              <div style="font-size:11px;color:var(--muted)">${sportBadge} ${r.matchup||''}</div>
+            </td>
             <td style="padding:9px 14px;font-size:12px;color:var(--muted)">${_mktLabel(r.market_type)}</td>
-            <td style="padding:9px 14px">${hitPct}%</td>
+            <td style="padding:9px 14px;font-size:12px">${projStr}</td>
+            <td style="padding:9px 14px;font-weight:600;color:${hitCol}">${hitPct}%</td>
             <td style="padding:9px 14px;font-weight:700;color:${actionCol}">${action}</td>
-            <td style="padding:9px 14px">$${r.kelly_stake?.toFixed(2) || '0.00'}</td>
+            <td style="padding:9px 14px;font-weight:600">$${r.kelly_stake?.toFixed(2) || '0.00'}</td>
           </tr>`;
         }).join('');
       }

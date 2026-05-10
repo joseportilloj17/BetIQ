@@ -114,7 +114,8 @@ def get_todays_recommendations(
     rows = db.execute(text(f"""
         SELECT id, sport, market_type, player_name, team, side,
                threshold, projected_value, hit_probability, quality_grade,
-               confidence_factors, risk_factors, home_team, away_team
+               confidence_factors, risk_factors, home_team, away_team,
+               projected_low_95, projected_high_95, projected_std_dev
         FROM   scouted_props
         WHERE  {where}
         ORDER  BY hit_probability DESC
@@ -125,7 +126,8 @@ def get_todays_recommendations(
     for row in rows:
         (prop_id, sport, market_type, player_name, team, side,
          threshold, projected_value, hit_prob, grade,
-         confidence_json, risk_json, home_team, away_team) = row
+         confidence_json, risk_json, home_team, away_team,
+         proj_low, proj_high, proj_std) = row
 
         grade_rank = grade_order.get(grade, 0)
         if grade_rank < min_rank:
@@ -169,6 +171,9 @@ def get_todays_recommendations(
             "side":             side,
             "threshold":        threshold,
             "projected_value":  projected_value,
+            "projected_low_95": round(proj_low, 2) if proj_low is not None else None,
+            "projected_high_95": round(proj_high, 2) if proj_high is not None else None,
+            "projected_std_dev": round(proj_std, 2) if proj_std is not None else None,
             "hit_probability":  round(hit_prob, 4),
             "quality_grade":    grade,
             "action":           action,
