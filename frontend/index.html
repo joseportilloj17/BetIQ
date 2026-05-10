@@ -1756,6 +1756,31 @@ Rockets +4.5  Alt Spread  -950"
     </table>
   </div>
 
+  <!-- Accuracy panel (shown when settled props exist) -->
+  <div id="scout-accuracy-panel" style="display:none;margin-top:20px">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+        <div class="card-title" style="margin:0">Historical Accuracy</div>
+        <select id="scout-acc-days" onchange="loadScoutAccuracy()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+          <option value="7">Last 7 days</option>
+          <option value="30" selected>Last 30 days</option>
+          <option value="90">Last 90 days</option>
+        </select>
+      </div>
+      <div id="scout-acc-overview" style="font-size:13px;color:var(--muted);margin-bottom:12px"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:6px">By Grade</div>
+          <div id="scout-acc-grade"></div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:6px">By Market</div>
+          <div id="scout-acc-market"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Detail modal -->
   <div id="scout-detail-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:2000;align-items:center;justify-content:center">
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;width:min(500px,95vw);max-height:88vh;overflow-y:auto;padding:24px">
@@ -3872,13 +3897,44 @@ function filterLegs() {
   document.getElementById('leg-count').textContent=`${filtered.length} / ${allLegs.length} legs`;
   renderLegPool(filtered);
 }
+// Cache of today's scouted props for leg pool annotation
+let _scoutPropsCache = null;
+async function _getScoutPropsCache() {
+  if (_scoutPropsCache) return _scoutPropsCache;
+  try {
+    const d = await fetch('/api/scout/props?limit=300').then(r => r.json());
+    _scoutPropsCache = d.props || [];
+  } catch(e) {
+    _scoutPropsCache = [];
+  }
+  return _scoutPropsCache;
+}
+function _matchScoutGrade(leg) {
+  const props = _scoutPropsCache || [];
+  if (!props.length) return null;
+  // Match on fixture_id + market type (approximate)
+  const mt = leg.market || '';
+  const fid = leg.fixture_id || '';
+  const found = props.find(p =>
+    (fid && p.game_id === fid && p.market_type === mt) ||
+    (leg.description && p.player_name && leg.description.toLowerCase().includes((p.player_name||'').toLowerCase()))
+  );
+  return found ? found.quality_grade : null;
+}
+
 function renderLegPool(legs) {
   if (!legs.length) { document.getElementById('leg-pool').innerHTML='<div class="loading">No legs match filters.</div>'; return; }
+  // Preload scout cache in background (non-blocking)
+  _getScoutPropsCache();
   document.getElementById('leg-pool').innerHTML=legs.map(l=>{
     const sel=selectedIds.has(l.leg_id)?'selected':'';
     const ec=l.ev>=0?'ev-pos':'ev-neg', es=l.ev>=0?'+':'';
     const gt=l.game_time?new Date(l.game_time).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'';
-    return `<div class="leg-row ${sel}" onclick="toggleLeg('${l.leg_id}')" data-leg-id="${l.leg_id}"><div class="leg-grade grade-${l.grade}">${l.grade}</div><div class="leg-info"><div class="leg-desc">${l.description}</div><div class="leg-meta">${l.game} · ${l.sport} · ${gt}</div></div><div class="leg-stats"><div class="leg-odds">${fmtOdds(l.odds)}</div><div class="leg-ev ${ec}">${es}${l.ev_pct}% EV</div></div></div>`;
+    const sg = _matchScoutGrade(l);
+    const scoutBadge = sg
+      ? `<span style="font-size:9px;padding:1px 5px;border-radius:8px;font-weight:700;background:${_GRADE_BG[sg]||'transparent'};color:${_GRADE_COLORS[sg]||'var(--muted)'};margin-left:4px">🔭${sg}</span>`
+      : '';
+    return `<div class="leg-row ${sel}" onclick="toggleLeg('${l.leg_id}')" data-leg-id="${l.leg_id}"><div class="leg-grade grade-${l.grade}">${l.grade}</div><div class="leg-info"><div class="leg-desc">${l.description}${scoutBadge}</div><div class="leg-meta">${l.game} · ${l.sport} · ${gt}</div></div><div class="leg-stats"><div class="leg-odds">${fmtOdds(l.odds)}</div><div class="leg-ev ${ec}">${es}${l.ev_pct}% EV</div></div></div>`;
   }).join('');
 }
 function toggleLeg(legId) {
@@ -11335,6 +11391,63 @@ function openScoutDetail(idx) {
   modal.style.display = 'flex';
 }
 
+async function loadScoutAccuracy() {
+  const days  = document.getElementById('scout-acc-days')?.value || 30;
+  const sport = document.getElementById('scout-sport')?.value || '';
+  const panel = document.getElementById('scout-accuracy-panel');
+
+  const params = new URLSearchParams({ days });
+  if (sport) params.set('sport', sport);
+
+  try {
+    const d = await fetch('/api/scout/accuracy?' + params).then(r => r.json());
+    if (!d || d.total_settled === 0) {
+      if (panel) panel.style.display = 'none';
+      return;
+    }
+    if (panel) panel.style.display = 'block';
+
+    // Overview
+    const ov = document.getElementById('scout-acc-overview');
+    if (ov) {
+      const hitPct = d.overall_hit_rate != null ? (d.overall_hit_rate * 100).toFixed(1) + '%' : '—';
+      ov.innerHTML = `<strong>${d.total_settled}</strong> settled props · Overall hit rate: <strong style="color:var(--green)">${hitPct}</strong>`;
+    }
+
+    // By grade
+    const gradeEl = document.getElementById('scout-acc-grade');
+    if (gradeEl) {
+      gradeEl.innerHTML = (d.by_grade || []).map(r => {
+        const actual   = r.hit_rate   != null ? (r.hit_rate   * 100).toFixed(1) + '%' : '—';
+        const expected = r.expected_rate != null ? (r.expected_rate * 100).toFixed(1) + '%' : '—';
+        const drift    = r.hit_rate != null && r.expected_rate != null
+          ? ((r.hit_rate - r.expected_rate) * 100).toFixed(1)
+          : null;
+        const driftColor = drift != null ? (parseFloat(drift) >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
+        return `<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border);font-size:12px">
+          <span>${_gradeChip(r.grade)} <span style="color:var(--muted)">(${r.n})</span></span>
+          <span>${actual} <span style="font-size:10px;color:var(--muted)">exp ${expected}</span> ${drift != null ? `<span style="color:${driftColor}">${drift>=0?'+':''}${drift}pp</span>` : ''}</span>
+        </div>`;
+      }).join('') || '<div style="color:var(--muted);font-size:12px">No data</div>';
+    }
+
+    // By market
+    const mktEl = document.getElementById('scout-acc-market');
+    if (mktEl) {
+      mktEl.innerHTML = (d.by_market || []).slice(0, 8).map(r => {
+        const actual = r.hit_rate != null ? (r.hit_rate * 100).toFixed(1) + '%' : '—';
+        const hitCol = r.hit_rate >= 0.60 ? 'var(--green)' : r.hit_rate >= 0.50 ? 'var(--muted)' : 'var(--red)';
+        return `<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border);font-size:12px">
+          <span style="color:var(--muted)">${_mktLabel(r.market_type)}</span>
+          <span style="color:${hitCol};font-weight:600">${actual} <span style="font-size:10px;color:var(--muted)">(${r.n})</span></span>
+        </div>`;
+      }).join('') || '<div style="color:var(--muted);font-size:12px">No data</div>';
+    }
+  } catch(e) {
+    console.error('Scout accuracy error:', e);
+  }
+}
+
 async function triggerScoutRun() {
   const btn = event?.target;
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Running…'; }
@@ -11458,7 +11571,7 @@ async function runKellySizer() {
 const _origShowPage = window.showPage;
 window.showPage = function(name) {
   _origShowPage(name);
-  if (name === 'scout')     loadScoutProps();
+  if (name === 'scout')     { loadScoutProps(); loadScoutAccuracy(); }
   if (name === 'placement') loadPlacement();
 };
 

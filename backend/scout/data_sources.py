@@ -108,48 +108,65 @@ def get_nba_games_today(date_str: str | None = None) -> list[GameInfo]:
 
 
 def get_nba_team_roster(team_id: str) -> list[dict]:
-    """Return list of {id, displayName, position} for a team."""
+    """Return full athlete dicts for a team (includes id, fullName, position)."""
     data = _espn(f"{ESPN_SITE_NBA}/teams/{team_id}/roster")
     if not data:
         return []
     players = []
     for group in data.get("athletes", []):
-        for a in (group if isinstance(group, list) else group.get("items", [])):
-            players.append({
-                "id":   a.get("id", ""),
-                "name": a.get("displayName") or a.get("fullName", ""),
-                "pos":  (a.get("position") or {}).get("abbreviation", ""),
-            })
+        items = group if isinstance(group, list) else group.get("items", [])
+        for a in items:
+            # Normalise so nba_player_props.py gets consistent keys
+            a.setdefault("fullName", a.get("displayName", ""))
+            players.append(a)
     return players
 
 
 def get_nba_player_season_stats(athlete_id: str) -> dict:
     """
     Fetch season averages for an NBA player from ESPN Core API.
-    Returns dict with keys: points, rebounds, assists, steals, blocks,
-    threePointFieldGoalsMade, minutesPerGame.
+    Returns normalised dict with keys: avg_points, avg_rebounds, avg_assists,
+    avg_steals, avg_blocks, avg_threes, avg_minutes (and raw ESPN keys too).
     """
     url = f"{ESPN_CORE_NBA}/athletes/{athlete_id}/statistics/0"
     data = _espn(url)
     if not data:
         return {}
-    stats = {}
+    raw: dict[str, float] = {}
     for cat in data.get("splits", {}).get("categories", []):
         for stat in cat.get("stats", []):
             name = stat.get("name", "")
             val  = stat.get("value")
             if val is not None:
                 try:
-                    stats[name] = float(val)
+                    raw[name] = float(val)
                 except (TypeError, ValueError):
                     pass
-    return stats
+
+    # Normalise to keys expected by nba_player_props.py
+    _key_map = {
+        "avg_points":   ("avgPoints",   "points"),
+        "avg_rebounds": ("avgRebounds", "rebounds"),
+        "avg_assists":  ("avgAssists",  "assists"),
+        "avg_steals":   ("avgSteals",   "steals"),
+        "avg_blocks":   ("avgBlocks",   "blocks"),
+        "avg_threes":   ("avgThreePointFieldGoalsMade", "threePointFieldGoalsMade"),
+        "avg_minutes":  ("avgMinutes",  "minutesPerGame"),
+    }
+    normalised = dict(raw)  # keep all raw keys for debugging
+    for norm_key, espn_keys in _key_map.items():
+        for ek in espn_keys:
+            if ek in raw:
+                normalised[norm_key] = raw[ek]
+                break
+    return normalised
 
 
 def get_nba_player_recent_games(athlete_id: str, n: int = 10) -> list[dict]:
     """
     Fetch last n NBA game logs for a player via ESPN Core API.
-    Returns list of stat dicts.
+    Returns list of normalised stat dicts with keys: points, rebounds,
+    assists, steals, blocks, threes, minutes.
     """
     url = f"{ESPN_CORE_NBA}/athletes/{athlete_id}/gamelog"
     data = _espn(url)
@@ -158,30 +175,72 @@ def get_nba_player_recent_games(athlete_id: str, n: int = 10) -> list[dict]:
     rows = []
     events = data.get("events", {})
     items  = events.get("items", []) if isinstance(events, dict) else []
-    for item in items[-n:]:
-        stats = {}
+    for item in items:
+        raw: dict[str, float] = {}
         for cat in item.get("categories", []):
             for s in cat.get("stats", []):
                 try:
-                    stats[s["name"]] = float(s["value"])
+                    raw[s["name"]] = float(s["value"])
                 except Exception:
                     pass
-        if stats:
-            rows.append(stats)
+        if not raw:
+            continue
+        # Normalise to simple keys used in _recent_avg()
+        normalised = dict(raw)
+        _glog_map = {
+            "points":   ("points",),
+            "rebounds": ("rebounds", "totalRebounds"),
+            "assists":  ("assists",),
+            "steals":   ("steals",),
+            "blocks":   ("blocks",),
+            "threes":   ("threePointFieldGoalsMade",),
+            "minutes":  ("minutes", "minutesPerGame"),
+        }
+        for norm_key, candidates in _glog_map.items():
+            for ck in candidates:
+                if ck in raw:
+                    normalised[norm_key] = raw[ck]
+                    break
+        rows.append(normalised)
     return rows[-n:]
 
 
 def get_nba_team_season_stats(team_id: str) -> dict:
-    """Return team season stats dict (offensive + defensive ratings, pace, record)."""
+    """
+    Return team season stats dict with normalised keys:
+    wins, losses, avg_points (for nba_team_markets.py).
+    """
     data = _espn(f"{ESPN_SITE_NBA}/teams/{team_id}")
     if not data:
         return {}
     team = data.get("team", {})
-    record = {}
+    record: dict = {}
     for r in (team.get("record", {}).get("items") or []):
         for s in r.get("stats", []):
             record[s.get("name", "")] = s.get("value")
-    return record
+
+    # Normalise record keys
+    normalised = dict(record)
+    for wk in ("wins", "win"):
+        if wk in record:
+            normalised["wins"] = float(record[wk])
+            break
+    for lk in ("losses", "loss"):
+        if lk in record:
+            normalised["losses"] = float(record[lk])
+            break
+
+    # Fetch points per game from team stats endpoint if available
+    stats_data = _espn(f"{ESPN_SITE_NBA}/teams/{team_id}/statistics")
+    if stats_data:
+        for cat in (stats_data.get("results") or [{}]):
+            for stat in (cat.get("stats", {}).get("stats") or []):
+                if stat.get("name") in ("avgPoints", "pointsPerGame"):
+                    try:
+                        normalised["avg_points"] = float(stat["value"])
+                    except Exception:
+                        pass
+    return normalised
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -376,18 +435,25 @@ def get_nhl_games_today(date_str: str | None = None) -> list[GameInfo]:
         for g in week.get("games", []):
             home = g.get("homeTeam", {})
             away = g.get("awayTeam", {})
+            home_name = (home.get("placeName", {}).get("default", "")
+                         + " " + home.get("commonName", {}).get("default", "")).strip()
+            away_name = (away.get("placeName", {}).get("default", "")
+                         + " " + away.get("commonName", {}).get("default", "")).strip()
+            # Use abbreviation as team_id so roster lookup works directly
+            home_abbr = home.get("abbrev", str(home.get("id", "")))
+            away_abbr = away.get("abbrev", str(away.get("id", "")))
             games.append(GameInfo(
                 game_id       = str(g.get("id", "")),
                 sport         = "NHL",
-                home_team     = home.get("placeName", {}).get("default", "") + " " + home.get("commonName", {}).get("default", ""),
-                away_team     = away.get("placeName", {}).get("default", "") + " " + away.get("commonName", {}).get("default", ""),
-                home_team_id  = str(home.get("id", "")),
-                away_team_id  = str(away.get("id", "")),
+                home_team     = home_name or home_abbr,
+                away_team     = away_name or away_abbr,
+                home_team_id  = home_abbr,   # abbreviation for roster API
+                away_team_id  = away_abbr,
                 commence_time = g.get("startTimeUTC", ""),
                 venue         = g.get("venue", {}).get("default", ""),
                 extra         = {
-                    "home_abbr": home.get("abbrev", ""),
-                    "away_abbr": away.get("abbrev", ""),
+                    "home_id":   str(home.get("id", "")),
+                    "away_id":   str(away.get("id", "")),
                     "game_type": g.get("gameType", ""),
                 }
             ))
@@ -395,18 +461,18 @@ def get_nhl_games_today(date_str: str | None = None) -> list[GameInfo]:
 
 
 def get_nhl_team_roster(team_abbr: str, season: str = "20252026") -> list[dict]:
-    """Return current roster for an NHL team."""
+    """Return current roster for an NHL team (full player dicts from NHL API)."""
     data = _nhl(f"{NHL_API}/roster/{team_abbr}/current")
     if not data:
         return []
     players = []
     for group in ["forwards", "defensemen", "goalies"]:
         for p in data.get(group, []):
-            players.append({
-                "id":   str(p.get("id", "")),
-                "name": f"{p.get('firstName', {}).get('default', '')} {p.get('lastName', {}).get('default', '')}".strip(),
-                "pos":  p.get("positionCode", ""),
-            })
+            # Add convenience fullName key expected by nhl_player_props.py
+            first = p.get("firstName", {}).get("default", "")
+            last  = p.get("lastName",  {}).get("default", "")
+            p.setdefault("fullName", f"{first} {last}".strip())
+            players.append(p)
     return players
 
 
@@ -457,17 +523,26 @@ def get_nhl_team_standings(team_abbr: str) -> dict:
     if not data:
         return {}
     for team in data.get("standings", []):
-        if team.get("teamAbbrev", {}).get("default", "") == team_abbr:
-            gp = max(int(team.get("gamesPlayed") or 1), 1)
-            wins = int(team.get("wins") or 0)
-            return {
-                "win_pct":    wins / gp,
-                "gp":         gp,
-                "wins":       wins,
-                "losses":     int(team.get("losses") or 0),
-                "otl":        int(team.get("otLosses") or 0),
-                "pts":        int(team.get("points") or 0),
-                "goals_for_per_g":     float(team.get("goalFor") or 0) / gp,
-                "goals_against_per_g": float(team.get("goalAgainst") or 0) / gp,
-            }
+        abbrev = (team.get("teamAbbrev") or {})
+        if isinstance(abbrev, dict):
+            abbrev = abbrev.get("default", "")
+        if abbrev != team_abbr:
+            continue
+        gp   = max(int(team.get("gamesPlayed") or 1), 1)
+        wins = int(team.get("wins") or 0)
+        gf   = float(team.get("goalFor") or 0)
+        pts  = int(team.get("points") or 0)
+        return {
+            # Raw NHL API keys (for _win_pct_from_standings)
+            "gamesPlayed": gp,
+            "wins":        wins,
+            "losses":      int(team.get("losses") or 0),
+            "otLosses":    int(team.get("otLosses") or 0),
+            "points":      pts,
+            "goalFor":     gf,
+            "goalAgainst": float(team.get("goalAgainst") or 0),
+            # Derived convenience keys
+            "pointPct":    pts / (gp * 2) if gp > 0 else 0.5,
+            "win_pct":     wins / gp,
+        }
     return {}

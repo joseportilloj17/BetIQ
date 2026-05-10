@@ -6986,6 +6986,97 @@ def run_scout_calibration(db: Session = Depends(get_db)):
     return sc.run_scout_calibration(_engine, db)
 
 
+@app.get("/api/scout/accuracy")
+def get_scout_accuracy(
+    days: int = 30,
+    sport: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Historical accuracy of scouted props — hit rate by grade, sport, and market.
+    Only includes settled props (actual_hit IS NOT NULL).
+    """
+    from sqlalchemy import text
+    from datetime import datetime, timezone, timedelta
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    sport_filter = ""
+    params: dict = {"since": since}
+    if sport:
+        sport_filter = "AND sport = :sport"
+        params["sport"] = sport.upper()
+
+    # By grade
+    by_grade = db.execute(text(f"""
+        SELECT quality_grade,
+               COUNT(*) AS n,
+               SUM(actual_hit) AS hits,
+               AVG(CAST(actual_hit AS REAL)) AS hit_rate,
+               AVG(hit_probability) AS expected_rate
+        FROM   scouted_props
+        WHERE  actual_hit IS NOT NULL
+        AND    scout_date >= :since
+        {sport_filter}
+        GROUP  BY quality_grade
+        ORDER  BY quality_grade
+    """), params).fetchall()
+
+    # By sport
+    by_sport = db.execute(text(f"""
+        SELECT sport,
+               COUNT(*) AS n,
+               SUM(actual_hit) AS hits,
+               AVG(CAST(actual_hit AS REAL)) AS hit_rate,
+               AVG(hit_probability) AS expected_rate
+        FROM   scouted_props
+        WHERE  actual_hit IS NOT NULL
+        AND    scout_date >= :since
+        {sport_filter}
+        GROUP  BY sport
+    """), params).fetchall()
+
+    # By market
+    by_market = db.execute(text(f"""
+        SELECT market_type,
+               COUNT(*) AS n,
+               AVG(CAST(actual_hit AS REAL)) AS hit_rate,
+               AVG(hit_probability) AS expected_rate
+        FROM   scouted_props
+        WHERE  actual_hit IS NOT NULL
+        AND    scout_date >= :since
+        {sport_filter}
+        GROUP  BY market_type
+        ORDER  BY n DESC
+        LIMIT  15
+    """), params).fetchall()
+
+    # Total settled
+    total_row = db.execute(text(f"""
+        SELECT COUNT(*), SUM(actual_hit)
+        FROM   scouted_props
+        WHERE  actual_hit IS NOT NULL
+        AND    scout_date >= :since
+        {sport_filter}
+    """), params).fetchone()
+
+    def _fmt_rows(rows, cols):
+        return [dict(zip(cols, r)) for r in rows]
+
+    total_n    = total_row[0] if total_row else 0
+    total_hits = total_row[1] if total_row else 0
+
+    return {
+        "days":        days,
+        "since":       since,
+        "total_settled": total_n,
+        "overall_hit_rate": round(total_hits / total_n, 4) if total_n else None,
+        "by_grade":  _fmt_rows(by_grade,  ["grade", "n", "hits", "hit_rate", "expected_rate"]),
+        "by_sport":  _fmt_rows(by_sport,  ["sport", "n", "hits", "hit_rate", "expected_rate"]),
+        "by_market": _fmt_rows(by_market, ["market_type", "n", "hit_rate", "expected_rate"]),
+    }
+
+
 # ─── Placement routes ─────────────────────────────────────────────────────────
 
 import placement as _placement

@@ -93,29 +93,35 @@ def _ensure_schema(engine) -> None:
             print(f"[scout.runner] schema init error: {exc2}")
 
 
-def _games_to_game_infos(games: list[dict], sport: str) -> List[GameInfo]:
-    """Convert raw game dicts (from data_sources) to GameInfo objects."""
+def _ensure_game_infos(games) -> List[GameInfo]:
+    """
+    Accept either List[GameInfo] (already parsed by data_sources) or
+    a list of raw dicts (legacy / test callers).  Returns List[GameInfo].
+    """
+    if not games:
+        return []
+    # If already GameInfo objects, pass through
+    if isinstance(games[0], GameInfo):
+        return games
+    # Fallback: raw dict → GameInfo (ESPN-style)
     infos = []
     for g in games:
         try:
-            # ESPN format
             home = g.get("home_team", {})
             away = g.get("away_team", {})
-            if not home or not away:
-                continue
             infos.append(GameInfo(
                 game_id       = str(g.get("id", g.get("game_id", ""))),
-                sport         = sport,
+                sport         = g.get("sport", ""),
                 home_team     = home.get("displayName") or home.get("name", ""),
                 away_team     = away.get("displayName") or away.get("name", ""),
                 home_team_id  = str(home.get("id", "")),
                 away_team_id  = str(away.get("id", "")),
                 commence_time = str(g.get("date", g.get("commence_time", ""))),
-                venue         = g.get("venue", {}).get("fullName") if g.get("venue") else None,
+                venue         = g.get("venue", {}).get("fullName") if isinstance(g.get("venue"), dict) else None,
                 extra         = {},
             ))
         except Exception as exc:
-            print(f"[scout.runner] game parse error ({sport}): {exc}")
+            print(f"[scout.runner] game parse error: {exc}")
     return infos
 
 
@@ -217,7 +223,7 @@ def run_daily_scout(engine, db) -> dict:
     # ── NBA ────────────────────────────────────────────────────────────────────
     try:
         nba_games_raw = ds.get_nba_games_today()
-        nba_games     = _games_to_game_infos(nba_games_raw, "NBA")
+        nba_games     = _ensure_game_infos(nba_games_raw)
         nba_count = 0
         for game in nba_games:
             try:
@@ -239,7 +245,7 @@ def run_daily_scout(engine, db) -> dict:
     # ── MLB ────────────────────────────────────────────────────────────────────
     try:
         mlb_games_raw = ds.get_mlb_games_today()
-        mlb_games     = _games_to_game_infos(mlb_games_raw, "MLB")
+        mlb_games     = _ensure_game_infos(mlb_games_raw)
         mlb_count = 0
         for game in mlb_games:
             try:
@@ -261,7 +267,7 @@ def run_daily_scout(engine, db) -> dict:
     # ── NHL ────────────────────────────────────────────────────────────────────
     try:
         nhl_games_raw = ds.get_nhl_games_today()
-        nhl_games     = _games_to_game_infos(nhl_games_raw, "NHL")
+        nhl_games     = _ensure_game_infos(nhl_games_raw)
         nhl_count = 0
         for game in nhl_games:
             try:
