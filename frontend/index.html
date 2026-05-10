@@ -11640,8 +11640,11 @@ async function triggerScoutRun() {
     const r = await fetch('/api/scout/run', { method: 'POST' });
     const d = await r.json();
     const total = d.total_props || 0;
-    alert(`Scout complete: ${total} props generated.\nSports: ${JSON.stringify(d.by_sport||{})}`);
-    loadScoutProps();
+    const sports = Object.entries(d.by_sport||{}).map(([s,n])=>`${s}: ${n}`).join(', ');
+    const grades = Object.entries(d.by_grade||{}).map(([g,n])=>`${g}: ${n}`).join(' | ');
+    const errs   = (d.errors||[]).length ? `\nErrors: ${d.errors.slice(0,2).join('; ')}` : '';
+    alert(`Scout complete: ${total} props\n${sports}\nGrades: ${grades}${errs}`);
+    loadScoutProps(); loadScoutAccuracy(); loadSettledProps();
   } catch(e) {
     alert('Scout run failed: ' + e.message);
   } finally {
