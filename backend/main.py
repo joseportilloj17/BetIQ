@@ -1890,9 +1890,11 @@ def scheduler_health():
 
     checks = {
         "fixture_refresh": {
-            "verified":       fx_ok,
-            "fixtures_today": _parse_int(fx_det),
-            "detail":         fx_det,
+            "verified":          fx_ok,
+            "fixtures_today":    _parse_int(fx_det),
+            "detail":            fx_det,
+            "fixture_age_hours": sched.fixture_staleness_hours(),
+            "fixtures_stale":    (lambda age: age is not None and age > 8.0)(sched.fixture_staleness_hours()),
         },
         "pitcher_data": {
             "verified":        pit_ok,
@@ -2034,10 +2036,14 @@ def health_daily_summary(db: Session = Depends(get_db)):
     pk_ok,  _ = sched._verify_picks_published()
     mb_ok,  _ = sched._verify_mock_generated()
     st_ok,  _ = sched._verify_settle_recent()
+    fixture_age_h = sched.fixture_staleness_hours()
+
+    _STALE_HOURS = 8.0   # fixtures older than this are flagged
+    fixtures_stale = fixture_age_h is not None and fixture_age_h > _STALE_HOURS
 
     sched_status = (
         "critical" if not all([fx_ok, pk_ok, mb_ok])
-        else "degraded" if not st_ok
+        else "degraded" if (not st_ok or fixtures_stale)
         else "healthy"
     )
 
@@ -2119,11 +2125,14 @@ def health_daily_summary(db: Session = Depends(get_db)):
         "timestamp_ct":      now_ct.strftime("%Y-%m-%d %H:%M CT"),
         "overall":           overall,
         "scheduler": {
-            "status":          sched_status,
-            "fixtures_ok":     fx_ok,
-            "picks_ok":        pk_ok,
-            "mocks_ok":        mb_ok,
-            "settlement_ok":   st_ok,
+            "status":              sched_status,
+            "fixtures_ok":         fx_ok,
+            "picks_ok":            pk_ok,
+            "mocks_ok":            mb_ok,
+            "settlement_ok":       st_ok,
+            "fixture_age_hours":   fixture_age_h,
+            "fixtures_stale":      fixtures_stale,
+            "fixture_last_result": state.get("last_fixture_refresh_result"),
         },
         "calibration":       drift,
         "migration_health":  migration_health,

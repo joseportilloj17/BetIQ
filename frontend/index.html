@@ -2618,7 +2618,14 @@ async function loadSchedulerHealth(silent = false) {
 
   const overall = data.overall || 'unknown';
   const dotColor = overall === 'healthy' ? 'var(--green)' : overall === 'degraded' ? 'var(--amber)' : 'var(--red)';
-  const labelText = overall === 'healthy' ? 'System healthy' : overall === 'degraded' ? 'Recovering…' : 'Attention needed';
+  // Include stale odds in label if applicable
+  const _fixtureAge = data.checks?.fixture_refresh?.fixture_age_hours ?? null;
+  const _fixturesStale = data.checks?.fixture_refresh?.fixtures_stale ?? false;
+  const labelText = _fixturesStale
+    ? `Stale odds (${_fixtureAge != null ? _fixtureAge.toFixed(1)+'h' : '?'})`
+    : overall === 'healthy' ? 'System healthy'
+    : overall === 'degraded' ? 'Recovering…'
+    : 'Attention needed';
 
   if (dot)   dot.style.background = dotColor;
   if (label) label.textContent    = labelText;
@@ -2668,6 +2675,10 @@ async function loadSchedulerHealth(silent = false) {
       <span style="font-weight:400;color:var(--muted);margin-left:6px">${data.timestamp_ct || ''}</span>
     </div>
     ${_row(_icon(fx.verified),  `Fixtures: ${fx.verified ? fx.fixtures_today + ' loaded' : 'missing — watchdog retrying'}`)}
+    ${fx.fixture_age_hours != null ? _row(
+        fx.fixtures_stale ? '⚠️' : '✅',
+        `Odds age: ${fx.fixture_age_hours.toFixed(1)}h${fx.fixtures_stale ? ' — STALE (>8h)' : ''}`
+      ) : ''}
     ${_row(_icon(pit.verified), `Pitchers: ${pit.verified ? pit.teams_with_starters + ' starters' : 'no data — watchdog retrying'}`)}
     ${_row(_icon(pk.verified),  `Picks: ${pk.verified ? pk.picks_count + ' picks published' : 'cache empty — watchdog regenerating'}`)}
     ${_row(_icon(mb.verified),  `Mock bets: ${mb.verified ? mb.bets_today + ' for today' : 'low count — watchdog regenerating'}`)}
@@ -4364,6 +4375,19 @@ function _renderRecommendations(data, patterns) {
     document.getElementById('picks-container').innerHTML =
       `<div class="card" style="color:var(--muted);text-align:center;padding:24px">${data.error}</div>`;
     return;
+  }
+
+  // ── Stale odds warning banner ────────────────────────────────────────────
+  const _picksCont = document.getElementById('picks-container');
+  const _existingStale = document.getElementById('stale-odds-banner');
+  if (_existingStale) _existingStale.remove();
+  if (data.stale_odds_warning) {
+    const _age = data.fixture_age_hours != null ? `${data.fixture_age_hours.toFixed(1)}h` : 'unknown';
+    const _staleBanner = document.createElement('div');
+    _staleBanner.id = 'stale-odds-banner';
+    _staleBanner.style.cssText = 'background:#7c3a0020;border:1px solid #f59e0b;border-radius:8px;padding:10px 16px;margin-bottom:16px;display:flex;align-items:center;gap:10px;font-size:13px;color:#f59e0b';
+    _staleBanner.innerHTML = `<span style="font-size:16px">⚠️</span><span><strong>Stale odds</strong> — fixture data is ${_age} old. Refresh failed or hasn't run yet today. Picks are based on yesterday's lines.</span>`;
+    _picksCont && _picksCont.insertBefore(_staleBanner, _picksCont.firstChild);
   }
 
   // ── Tiered fallback mode (Section A is empty) ────────────────────────────

@@ -547,6 +547,9 @@ def _run_daily_fixture_refresh() -> dict:
     Refresh today's fixture odds from TheOddsAPI for all active sports.
     Runs at 6 AM UTC — one hour before mock bet generation — so picks are
     built from fresh odds rather than yesterday's stale lines.
+
+    On API failure, the DB fixtures remain as a stale fallback.
+    Staleness age is logged so health checks can surface it.
     """
     try:
         from database import SessionLocal, init_db
@@ -557,13 +560,24 @@ def _run_daily_fixture_refresh() -> dict:
             result = fetch_all_fixtures(db)
         finally:
             db.close()
-        print(f"[Scheduler] Fixture refresh: new={result.get('new',0)} "
-              f"updated={result.get('updated',0)} "
-              f"sports={result.get('sports_fetched',0)}")
+        new     = result.get("new", 0)
+        updated = result.get("updated", 0)
+        print(f"[Scheduler] Fixture refresh: new={new} updated={updated} "
+              f"sports={result.get('sports_fetched', 0)}")
+        if new == 0 and updated == 0:
+            age = fixture_staleness_hours()
+            result["using_cached"] = True
+            result["cached_age_hours"] = age
+            print(f"[Scheduler] WARNING: Fixture refresh returned 0 events — "
+                  f"using cached fixtures ({age:.1f}h old)" if age else
+                  "[Scheduler] WARNING: Fixture refresh returned 0 events and no cached fixtures found")
         return result
     except Exception as exc:
-        print(f"[Scheduler] Fixture refresh error: {exc}")
-        return {"error": str(exc)}
+        age = fixture_staleness_hours()
+        print(f"[Scheduler] Fixture refresh error: {exc}. "
+              f"Falling back to cached fixtures ({age:.1f}h old)." if age else
+              f"[Scheduler] Fixture refresh error: {exc}. No cached fixtures available.")
+        return {"error": str(exc), "using_cached": True, "cached_age_hours": age}
 
 
 def _run_daily_mlb_pitcher_fetch() -> dict:
@@ -1179,6 +1193,27 @@ def _verify_fixtures_today() -> tuple[bool, str]:
         return ok, f"{n}_fixtures"
     except Exception as e:
         return False, f"error:{e}"
+
+
+def fixture_staleness_hours() -> float | None:
+    """
+    Return how many hours ago fixtures were last fetched, or None on error.
+    Used by the health endpoint and recommender to detect stale odds.
+    """
+    try:
+        import sqlite3 as _sq
+        from datetime import datetime as _dt2, timezone as _tz
+        _BETS_DB = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
+        con = _sq.connect(_BETS_DB)
+        row = con.execute("SELECT MAX(fetched_at) FROM fixtures").fetchone()
+        con.close()
+        if not row or not row[0]:
+            return None
+        last = _dt2.fromisoformat(str(row[0])).replace(tzinfo=_tz.utc)
+        age  = (_dt2.now(_tz.utc) - last).total_seconds() / 3600
+        return round(age, 2)
+    except Exception:
+        return None
 
 
 def _verify_pitcher_today() -> tuple[bool, str]:
