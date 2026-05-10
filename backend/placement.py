@@ -228,6 +228,18 @@ def size_single_bet(
     }
 
 
+def _extract_player_name(description: str) -> str:
+    """
+    Extract likely player name from a leg description like
+    'LeBron James OVER 25.5 Points' → 'LeBron James'.
+    Strips trailing keywords and odds/numbers.
+    """
+    import re
+    # Remove anything after OVER/UNDER/+/-/@ and numbers
+    cleaned = re.split(r'\s+(?:OVER|UNDER|O|U|@|\+|-|\d)', description, maxsplit=1)[0]
+    return cleaned.strip()
+
+
 def attach_scout_grade_to_leg(leg: dict, db: Session) -> dict:
     """
     Look up scouted_props for today matching this leg's description/fixture,
@@ -236,15 +248,21 @@ def attach_scout_grade_to_leg(leg: dict, db: Session) -> dict:
 
     Matching strategy:
       1. game_id + market_type match (exact)
-      2. player_name + market_type (fuzzy fallback)
+      2. Explicit player_name field + market_type
+      3. Extracted player name from description + market_type (last-name partial match)
     If no match found, scout_grade=None.
     """
     scout_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    fixture_id  = leg.get("fixture_id", "")
-    market_type = leg.get("market_type", "")
-    player_name = leg.get("player_name", leg.get("description", ""))
-    sport       = leg.get("sport", "")
+    fixture_id   = leg.get("fixture_id", "") or leg.get("game_id", "")
+    market_type  = leg.get("market_type", "")
+    player_name  = leg.get("player_name", "") or ""
+    description  = leg.get("description", "") or ""
+    sport        = leg.get("sport", "")
+
+    # If player_name field is empty, try to extract from description
+    if not player_name and description:
+        player_name = _extract_player_name(description)
 
     try:
         # Try exact game_id + market_type match first
@@ -258,15 +276,40 @@ def attach_scout_grade_to_leg(leg: dict, db: Session) -> dict:
                 LIMIT  1
             """), {"d": scout_date, "gid": fixture_id, "mt": market_type}).fetchone()
 
-        # Fall back to player name match
+        # Try player name exact match + market_type
         if not row and player_name:
+            row = db.execute(text("""
+                SELECT quality_grade, hit_probability, id
+                FROM   scouted_props
+                WHERE  scout_date = :d AND player_name = :pn AND market_type = :mt
+                ORDER  BY hit_probability DESC
+                LIMIT  1
+            """), {"d": scout_date, "pn": player_name, "mt": market_type}).fetchone()
+
+        # Try partial match on extracted player name (last name fallback)
+        if not row and player_name and len(player_name) >= 4:
+            # Use last word as last name if multi-word name
+            words = player_name.split()
+            name_fragment = words[-1] if len(words) > 1 else player_name
             row = db.execute(text("""
                 SELECT quality_grade, hit_probability, id
                 FROM   scouted_props
                 WHERE  scout_date = :d AND player_name LIKE :pn AND market_type = :mt
                 ORDER  BY hit_probability DESC
                 LIMIT  1
-            """), {"d": scout_date, "pn": f"%{player_name}%", "mt": market_type}).fetchone()
+            """), {"d": scout_date, "pn": f"%{name_fragment}%", "mt": market_type}).fetchone()
+
+        # Final fallback: match just on description fragment (any market)
+        if not row and description and len(description) >= 5:
+            frag = _extract_player_name(description)
+            if frag and len(frag) >= 4:
+                row = db.execute(text("""
+                    SELECT quality_grade, hit_probability, id
+                    FROM   scouted_props
+                    WHERE  scout_date = :d AND player_name LIKE :pn
+                    ORDER  BY hit_probability DESC
+                    LIMIT  1
+                """), {"d": scout_date, "pn": f"%{frag.split()[-1]}%"}).fetchone()
 
         if row:
             leg["scout_grade"]    = row[0]
