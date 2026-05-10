@@ -1670,7 +1670,22 @@ def generate_mock_bets(
             _desc = leg.get("description", "")
             _mkt  = leg.get("market_type") or leg.get("market")
             _open = _lookup_snap_odds(_fid, _desc, _mkt, _HIST_DB_PATH)
-            db.add(MockBetLeg(
+
+            # Enrich leg with scout grade from scouted_props
+            _scout_grade    = leg.get("scout_grade")
+            _scout_hit_prob = leg.get("scout_hit_prob")
+            _scout_prop_id  = leg.get("scouted_prop_id")
+            if _scout_grade is None:
+                try:
+                    import placement as _plc
+                    _enriched       = _plc.attach_scout_grade_to_leg(dict(leg), db)
+                    _scout_grade    = _enriched.get("scout_grade")
+                    _scout_hit_prob = _enriched.get("scout_hit_prob")
+                    _scout_prop_id  = _enriched.get("scouted_prop_id")
+                except Exception:
+                    pass
+
+            leg_obj = MockBetLeg(
                 mock_bet_id        = mock_id,
                 leg_index          = i,
                 description        = _desc,
@@ -1690,7 +1705,21 @@ def generate_mock_bets(
                 ale_switched       = bool(leg.get("ale_switched", False)),
                 ale_los_improvement = leg.get("ale_los_improvement"),
                 qualification_tier  = leg.get("qualification_tier"),
-            ))
+            )
+            db.add(leg_obj)
+            db.flush()  # get leg_obj.id so we can update scout columns
+
+            # Write scout columns via raw SQL (columns added by safe_add_column, not in ORM)
+            if _scout_grade is not None:
+                try:
+                    from sqlalchemy import text as _text
+                    db.execute(_text(
+                        "UPDATE mock_bet_legs SET scout_grade=:g, scout_hit_prob=:hp, "
+                        "scouted_prop_id=:pid WHERE id=:lid"
+                    ), {"g": _scout_grade, "hp": _scout_hit_prob,
+                        "pid": _scout_prop_id, "lid": leg_obj.id})
+                except Exception:
+                    pass
         generated += 1
 
     forced_count = sum(1 for p in picks if p.get("is_forced_generation"))

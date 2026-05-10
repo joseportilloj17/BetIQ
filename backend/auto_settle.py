@@ -749,10 +749,26 @@ def run_auto_settle(
     # After bets settle, mark scouted_props.actual_hit where game outcomes are known.
     # Runs as a best-effort pass — failure never blocks the settle cycle.
     if settled_count > 0:
+        scout_settled = 0
         try:
-            _settle_scout_props(db, days_back=days_back)
+            scout_settled = _settle_scout_props(db, days_back=days_back)
         except Exception as _sp_err:
             print(f"[AutoSettle] Scout prop settlement error (non-fatal): {_sp_err}")
+
+        # Run calibration drift check whenever at least one prop was settled
+        if scout_settled > 0:
+            try:
+                from scout.calibration import run_scout_calibration
+                from database import engine as _db_engine
+                _cal_result = run_scout_calibration(_db_engine, db)
+                _level = _cal_result.get("alert_level", "ok")
+                _drift = _cal_result.get("worst_drift_pp", 0)
+                if _level in ("alert", "critical"):
+                    print(f"[AutoSettle] Scout calibration {_level.upper()}: worst drift {_drift}pp")
+                else:
+                    print(f"[AutoSettle] Scout calibration OK — {_cal_result.get('slices_checked', 0)} buckets, worst drift {_drift}pp")
+            except Exception as _cal_err:
+                print(f"[AutoSettle] Scout calibration error (non-fatal): {_cal_err}")
 
     # Auto-retrain — launched as a background subprocess so the server never blocks
     retrained = False
