@@ -1926,6 +1926,37 @@ def start(interval_mins: int = 30, auto_retrain: bool = True, daemon: bool = Tru
     _startup_thread.start()
     print("[Scheduler] StartupSettle thread launched (fires in 30s)")
 
+    # Startup scout: run after 9 AM CT if scout hasn't run today.
+    # Fires 60s after start so DB and modules are fully ready.
+    def _startup_scout():
+        time.sleep(60)
+        if _stop_event.is_set():
+            return
+        ct = _now_ct()
+        if ct.hour < _SCOUT_HOUR_CT:
+            print(f"[StartupScout] Before {_SCOUT_HOUR_CT}:00 CT — skipping until scheduled time")
+            return
+        if not _should_run_daily_scout(ct):
+            print("[StartupScout] Scout already ran today — skipping")
+            return
+        print("[StartupScout] Running post-startup scout (not yet run today)")
+        try:
+            result = _run_daily_scout()
+            total = result.get("total_props", 0)
+            print(f"[StartupScout] Done — {total} props generated")
+            _scheduler_state["last_scout_run"]        = _now_ct().strftime("%Y-%m-%d")
+            _scheduler_state["last_scout_run_result"] = result
+        except Exception as _e:
+            print(f"[StartupScout] ERROR: {_e}")
+
+    _startup_scout_thread = threading.Thread(
+        target=_startup_scout,
+        daemon=True,
+        name="StartupScout",
+    )
+    _startup_scout_thread.start()
+    print("[Scheduler] StartupScout thread launched (fires in 60s)")
+
 
 def stop():
     """Signal the scheduler to stop after the current sleep."""
