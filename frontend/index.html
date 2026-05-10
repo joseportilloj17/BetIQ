@@ -408,6 +408,13 @@
             <option value="B">Grade B+</option>
             <option value="C">Grade C+</option>
           </select>
+          <select id="pb-scout-filter" onchange="filterLegs()">
+            <option value="">Any scout</option>
+            <option value="A">Scout A</option>
+            <option value="B">Scout B+</option>
+            <option value="C">Scout C+</option>
+            <option value="scout_only">Scouted only</option>
+          </select>
           <input type="text" id="pb-search" placeholder="Search team…" oninput="filterLegs()" style="flex:1;min-width:100px">
         </div>
         <div class="leg-pool" id="leg-pool"><div class="loading">Loading legs…</div></div>
@@ -1768,6 +1775,12 @@ Rockets +4.5  Alt Spread  -950"
         </select>
       </div>
       <div id="scout-acc-overview" style="font-size:13px;color:var(--muted);margin-bottom:12px"></div>
+      <!-- Trend chart -->
+      <div style="margin-bottom:16px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:6px">Daily Hit Rate Trend</div>
+        <canvas id="scout-acc-trend" height="80" style="width:100%;max-height:80px"></canvas>
+        <div id="scout-acc-trend-empty" style="font-size:12px;color:var(--muted);display:none">Not enough settled props yet</div>
+      </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
         <div>
           <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:6px">By Grade</div>
@@ -3880,18 +3893,26 @@ function switchParlayTab(tab) {
 }
 async function loadParlayLegs() {
   document.getElementById('leg-pool').innerHTML='<div class="loading">Fetching live lines…</div>';
-  const data = await apiFetch('/api/parlay/legs');
+  const [data] = await Promise.all([apiFetch('/api/parlay/legs'), _getScoutPropsCache()]);
   if (!data||!data.legs) { document.getElementById('leg-pool').innerHTML='<div class="loading">No legs. Fetch odds first.</div>'; return; }
   allLegs=data.legs; document.getElementById('leg-count').textContent=`${allLegs.length} legs`; filterLegs();
 }
 function filterLegs() {
   const sport=document.getElementById('pb-sport-filter').value, market=document.getElementById('pb-market-filter').value;
   const grade=document.getElementById('pb-grade-filter').value, search=(document.getElementById('pb-search').value||'').toLowerCase();
+  const scoutF=document.getElementById('pb-scout-filter').value;
   const GO={A:0,B:1,C:2,D:3,F:4}; const minG=grade?GO[grade]:99;
+  const scoutGO={A:0,B:1,C:2,D:3};
   const filtered=allLegs.filter(l=>{
     if(sport&&l.sport!==sport) return false; if(market&&l.market!==market) return false;
     if(grade&&GO[l.grade]>minG) return false;
     if(search&&!l.game.toLowerCase().includes(search)&&!l.pick.toLowerCase().includes(search)) return false;
+    // Scout grade filter: match using cached scout props
+    if(scoutF) {
+      const sg=_matchScoutGrade(l);
+      if(scoutF==='scout_only') { if(!sg) return false; }
+      else { if(!sg||scoutGO[sg]>scoutGO[scoutF]) return false; }
+    }
     return true;
   });
   document.getElementById('leg-count').textContent=`${filtered.length} / ${allLegs.length} legs`;
@@ -11442,6 +11463,61 @@ async function loadScoutAccuracy() {
           <span style="color:${hitCol};font-weight:600">${actual} <span style="font-size:10px;color:var(--muted)">(${r.n})</span></span>
         </div>`;
       }).join('') || '<div style="color:var(--muted);font-size:12px">No data</div>';
+    }
+
+    // Daily trend sparkline (SVG)
+    const trendCanvas = document.getElementById('scout-acc-trend');
+    const trendEmpty  = document.getElementById('scout-acc-trend-empty');
+    const byDay = (d.by_day || []).filter(r => r.n >= 5);
+    if (trendCanvas) {
+      if (byDay.length < 2) {
+        trendCanvas.style.display = 'none';
+        if (trendEmpty) trendEmpty.style.display = '';
+      } else {
+        trendCanvas.style.display = '';
+        if (trendEmpty) trendEmpty.style.display = 'none';
+        // Draw on canvas
+        const W = trendCanvas.offsetWidth || 600, H = 80;
+        trendCanvas.width = W; trendCanvas.height = H;
+        const ctx = trendCanvas.getContext('2d');
+        ctx.clearRect(0, 0, W, H);
+        const rates = byDay.map(r => r.hit_rate || 0);
+        const minR = Math.min(...rates, 0.35), maxR = Math.max(...rates, 0.75);
+        const range = maxR - minR || 0.1;
+        const pad = 8;
+        const xStep = (W - pad * 2) / (byDay.length - 1);
+        const yOf = v => H - pad - ((v - minR) / range) * (H - pad * 2);
+        // 50% reference line
+        const y50 = yOf(0.5);
+        ctx.setLineDash([3, 3]);
+        ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, y50); ctx.lineTo(W, y50); ctx.stroke();
+        ctx.setLineDash([]);
+        // Fill area
+        ctx.beginPath();
+        ctx.moveTo(pad, yOf(rates[0]));
+        byDay.forEach((r, i) => ctx.lineTo(pad + i * xStep, yOf(r.hit_rate || 0)));
+        ctx.lineTo(pad + (byDay.length - 1) * xStep, H);
+        ctx.lineTo(pad, H);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(34,197,94,0.12)';
+        ctx.fill();
+        // Line
+        ctx.beginPath();
+        ctx.moveTo(pad, yOf(rates[0]));
+        byDay.forEach((r, i) => ctx.lineTo(pad + i * xStep, yOf(r.hit_rate || 0)));
+        ctx.strokeStyle = 'rgba(34,197,94,0.9)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        // Dots
+        byDay.forEach((r, i) => {
+          ctx.beginPath();
+          ctx.arc(pad + i * xStep, yOf(r.hit_rate || 0), 3, 0, Math.PI * 2);
+          ctx.fillStyle = (r.hit_rate || 0) >= 0.5 ? '#22c55e' : '#ef4444';
+          ctx.fill();
+        });
+      }
     }
   } catch(e) {
     console.error('Scout accuracy error:', e);

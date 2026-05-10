@@ -7066,6 +7066,20 @@ def get_scout_accuracy(
     total_n    = total_row[0] if total_row else 0
     total_hits = total_row[1] if total_row else 0
 
+    # Daily trend (last 30 days of settled props)
+    by_day = db.execute(text(f"""
+        SELECT scout_date,
+               COUNT(*) AS n,
+               SUM(actual_hit) AS hits,
+               AVG(CAST(actual_hit AS REAL)) AS hit_rate
+        FROM   scouted_props
+        WHERE  actual_hit IS NOT NULL
+        AND    scout_date >= :since
+        {sport_filter}
+        GROUP  BY scout_date
+        ORDER  BY scout_date
+    """), params).fetchall()
+
     return {
         "days":        days,
         "since":       since,
@@ -7074,6 +7088,7 @@ def get_scout_accuracy(
         "by_grade":  _fmt_rows(by_grade,  ["grade", "n", "hits", "hit_rate", "expected_rate"]),
         "by_sport":  _fmt_rows(by_sport,  ["sport", "n", "hits", "hit_rate", "expected_rate"]),
         "by_market": _fmt_rows(by_market, ["market_type", "n", "hit_rate", "expected_rate"]),
+        "by_day":    _fmt_rows(by_day,    ["date", "n", "hits", "hit_rate"]),
     }
 
 
