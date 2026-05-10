@@ -263,6 +263,21 @@ def startup():
 
     _threading.Thread(target=_run_watchdog_startup, daemon=True, name="StartupWatchdog").start()
 
+    # Scout schema: add scouted_prop_id + scout_grade to mock_bet_legs and user_pick_legs
+    try:
+        import safe_migrate as _sm
+        from database import engine as _engine
+        _sm.initialize(_engine)
+        _sm.safe_add_column(_engine, "mock_bet_legs",  "scouted_prop_id",    "INTEGER")
+        _sm.safe_add_column(_engine, "mock_bet_legs",  "scout_grade",        "TEXT")
+        _sm.safe_add_column(_engine, "mock_bet_legs",  "scout_hit_prob",     "REAL")
+        _sm.safe_add_column(_engine, "user_pick_legs", "scouted_prop_id",    "INTEGER")
+        _sm.safe_add_column(_engine, "user_pick_legs", "scout_grade",        "TEXT")
+        _sm.safe_add_column(_engine, "user_pick_legs", "scout_hit_prob",     "REAL")
+        print("[Startup] Scout schema migrations applied")
+    except Exception as _sc_err:
+        print(f"[Startup] Scout schema migration error (non-fatal): {_sc_err}")
+
 @app.on_event("shutdown")
 def shutdown():
     sched.stop()
@@ -6936,3 +6951,53 @@ def run_scout_calibration(db: Session = Depends(get_db)):
     import scout.calibration as sc
     sc.initialize(_engine)
     return sc.run_scout_calibration(_engine, db)
+
+
+# ─── Placement routes ─────────────────────────────────────────────────────────
+
+import placement as _placement
+
+class PlacementSizeRequest(BaseModel):
+    hit_probability: float
+    quality_grade:   str
+    decimal_odds:    float
+    bankroll:        Optional[float] = None
+
+@app.get("/api/placement/recommendations")
+def placement_recommendations(
+    sport:     Optional[str] = None,
+    min_grade: str = "B",
+    limit:     int = 30,
+    db: Session = Depends(get_db),
+):
+    """
+    Grade-weighted placement recommendations for today's scouted props.
+    Includes Kelly sizing, action (PLAY/SKIP), and multiplier.
+    """
+    sport_filter = [sport.upper()] if sport else None
+    return _placement.get_todays_recommendations(
+        db,
+        sport_filter = sport_filter,
+        min_grade    = min_grade,
+        limit        = limit,
+    )
+
+
+@app.post("/api/placement/size")
+def placement_size(req: PlacementSizeRequest, db: Session = Depends(get_db)):
+    """Kelly sizing for a single scouted prop given grade + odds."""
+    return _placement.size_single_bet(
+        hit_probability = req.hit_probability,
+        quality_grade   = req.quality_grade,
+        decimal_odds    = req.decimal_odds,
+        bankroll        = req.bankroll,
+    )
+
+
+@app.get("/api/placement/parlay-suggestions")
+def placement_parlay_suggestions(
+    max_legs: int = 3,
+    db: Session = Depends(get_db),
+):
+    """Top A-grade props as a suggested parlay, with combined hit probability."""
+    return _placement.get_parlay_suggestions(db, max_legs=max_legs)

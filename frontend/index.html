@@ -347,6 +347,9 @@
   <div class="nav-item" onclick="showPage('livebets')" style="color:var(--amber);font-weight:600">💸 Live Bets</div>
   <div class="nav-item" onclick="showPage('theses')" style="color:var(--teal)">🎯 Theses</div>
   <div class="nav-item" onclick="showPage('abtest')" style="color:var(--purple,#a855f7);font-weight:600">⚔️ A/B Test</div>
+  <div class="nav-section">Scout</div>
+  <div class="nav-item" onclick="showPage('scout')" style="color:var(--teal);font-weight:600">🔭 Prop Scout</div>
+  <div class="nav-item" onclick="showPage('placement')" style="color:var(--teal)">📐 Placement</div>
   <div class="nav-section">Model</div>
   <div class="nav-item" onclick="showPage('model')">🧠 Train / Backtest</div>
   <div class="nav-item" onclick="showPage('risk')">⚖️ Risk Profile</div>
@@ -1683,6 +1686,171 @@ Rockets +4.5  Alt Spread  -950"
     <div><div class="page-title">Risk Profile</div><div class="page-sub">Behavioral analysis of your betting patterns</div></div>
   </div>
   <div id="risk-content"><div class="loading">Loading…</div></div>
+</div>
+
+<!-- ── Prop Scout ── -->
+<div class="page" id="page-scout">
+  <div class="page-header">
+    <div>
+      <div class="page-title">🔭 Prop Scout</div>
+      <div class="page-sub">Model-projected player props and team markets — graded A/B/C/D by hit probability</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span id="scout-cal-badge" style="font-size:11px;padding:3px 8px;border-radius:12px;background:var(--surface2);color:var(--muted)">Calibration: —</span>
+      <button class="btn btn-ghost btn-sm" onclick="loadScoutProps()">↻ Refresh</button>
+      <button class="btn btn-amber btn-sm" onclick="triggerScoutRun()">▶ Run Scout</button>
+    </div>
+  </div>
+
+  <!-- Filters -->
+  <div class="filter-row" style="margin-bottom:14px;flex-wrap:wrap;gap:8px">
+    <select id="scout-sport" onchange="loadScoutProps()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+      <option value="">All Sports</option>
+      <option value="NBA">NBA</option>
+      <option value="MLB">MLB</option>
+      <option value="NHL">NHL</option>
+    </select>
+    <select id="scout-grade" onchange="loadScoutProps()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+      <option value="">All Grades</option>
+      <option value="A">A only</option>
+      <option value="B">B only</option>
+      <option value="C">C only</option>
+    </select>
+    <select id="scout-market" onchange="loadScoutProps()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+      <option value="">All Markets</option>
+      <option value="player_points">Points</option>
+      <option value="player_rebounds">Rebounds</option>
+      <option value="player_assists">Assists</option>
+      <option value="player_pra">PRA</option>
+      <option value="player_threes">3-Pointers</option>
+      <option value="player_shots">Shots</option>
+      <option value="player_strikeouts">Strikeouts</option>
+      <option value="player_hits">Hits</option>
+      <option value="h2h">Moneyline</option>
+      <option value="spread">Spread</option>
+      <option value="totals">Total</option>
+    </select>
+  </div>
+
+  <!-- Summary badges -->
+  <div id="scout-summary-badges" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px"></div>
+
+  <!-- Props table -->
+  <div class="card" style="padding:0;overflow:hidden">
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead>
+        <tr style="border-bottom:1px solid var(--border);text-align:left">
+          <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Sport</th>
+          <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Player / Team</th>
+          <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Market</th>
+          <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Line</th>
+          <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Projection</th>
+          <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Hit %</th>
+          <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Grade</th>
+          <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Matchup</th>
+        </tr>
+      </thead>
+      <tbody id="scout-table-body">
+        <tr><td colspan="8" style="padding:20px;text-align:center;color:var(--muted)">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Detail modal -->
+  <div id="scout-detail-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:2000;align-items:center;justify-content:center">
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;width:min(500px,95vw);max-height:88vh;overflow-y:auto;padding:24px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <div style="font-size:15px;font-weight:700" id="scout-modal-title">Prop Detail</div>
+        <button onclick="document.getElementById('scout-detail-modal').style.display='none'" style="background:none;border:none;color:var(--muted);font-size:18px;cursor:pointer">✕</button>
+      </div>
+      <div id="scout-modal-body"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Placement ── -->
+<div class="page" id="page-placement">
+  <div class="page-header">
+    <div>
+      <div class="page-title">📐 Placement</div>
+      <div class="page-sub">Grade-weighted Kelly sizing and A-grade parlay suggestions from today's scout</div>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="loadPlacement()">↻ Refresh</button>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 320px;gap:16px">
+
+    <!-- Left: recommendations table -->
+    <div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+        <select id="placement-grade" onchange="loadPlacement()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+          <option value="B">B+ grades</option>
+          <option value="A">A only</option>
+          <option value="C">C+ grades</option>
+        </select>
+        <select id="placement-sport" onchange="loadPlacement()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+          <option value="">All Sports</option>
+          <option value="NBA">NBA</option>
+          <option value="MLB">MLB</option>
+          <option value="NHL">NHL</option>
+        </select>
+        <span id="placement-bankroll-label" style="font-size:12px;color:var(--muted);margin-left:auto"></span>
+      </div>
+
+      <div class="card" style="padding:0;overflow:hidden">
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          <thead>
+            <tr style="border-bottom:1px solid var(--border);text-align:left">
+              <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Grade</th>
+              <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Description</th>
+              <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Market</th>
+              <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Hit %</th>
+              <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Action</th>
+              <th style="padding:10px 14px;color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase">Kelly Stake</th>
+            </tr>
+          </thead>
+          <tbody id="placement-table-body">
+            <tr><td colspan="6" style="padding:20px;text-align:center;color:var(--muted)">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Right: parlay suggestion -->
+    <div>
+      <div class="card">
+        <div class="card-title">A-Grade Parlay</div>
+        <div id="placement-parlay-content" style="font-size:13px">
+          <div class="loading" style="padding:20px 0">Loading…</div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <div class="card-title">Kelly Sizer</div>
+        <div style="display:flex;flex-direction:column;gap:10px">
+          <div>
+            <label style="font-size:11px;color:var(--muted)">Hit probability (0–1)</label>
+            <input type="number" id="sizer-prob" min="0.01" max="0.99" step="0.01" value="0.65"
+              style="width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:8px;font-size:13px;margin-top:4px">
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--muted)">Grade</label>
+            <select id="sizer-grade" style="width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:8px;font-size:13px;margin-top:4px">
+              <option value="A">A</option>
+              <option value="B" selected>B</option>
+              <option value="C">C</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:11px;color:var(--muted)">Decimal odds</label>
+            <input type="number" id="sizer-odds" min="1.01" step="0.01" value="1.91"
+              style="width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:8px;font-size:13px;margin-top:4px">
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="runKellySizer()">Calculate</button>
+          <div id="sizer-result" style="font-size:13px;padding:10px;background:var(--surface2);border-radius:8px;display:none"></div>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- ── Live Bets ── -->
@@ -10981,6 +11149,294 @@ async function _qeSubmit() {
 window.addEventListener('click', e => {
   if (e.target.id === 'quick-modal') closeQuickModal();
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PROP SCOUT
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _GRADE_COLORS = { A:'var(--green)', B:'var(--teal)', C:'var(--amber)', D:'var(--muted)' };
+const _GRADE_BG     = { A:'rgba(34,197,94,.12)', B:'rgba(20,184,166,.12)', C:'rgba(251,191,36,.12)', D:'rgba(100,116,139,.08)' };
+
+function _gradeChip(g) {
+  const c = _GRADE_COLORS[g] || 'var(--muted)';
+  const bg= _GRADE_BG[g]    || 'transparent';
+  return `<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;color:${c};background:${bg}">${g}</span>`;
+}
+
+function _mktLabel(mt) {
+  const map = {
+    player_points:'Points', player_rebounds:'Rebounds', player_assists:'Assists',
+    player_pra:'PRA', player_threes:'3-PT', player_steals:'Steals',
+    player_blocks:'Blocks', player_shots:'Shots', player_goals:'Goals',
+    player_strikeouts:'Ks', player_hits:'Hits', player_total_bases:'TB',
+    player_rbi:'RBI', player_home_runs:'HR', player_earned_runs:'ER',
+    h2h:'ML', spread:'Spread', totals:'Total',
+  };
+  return map[mt] || mt;
+}
+
+async function loadScoutProps() {
+  const sport  = document.getElementById('scout-sport')?.value  || '';
+  const grade  = document.getElementById('scout-grade')?.value  || '';
+  const market = document.getElementById('scout-market')?.value || '';
+
+  const body = document.getElementById('scout-table-body');
+  if (body) body.innerHTML = '<tr><td colspan="8" style="padding:20px;text-align:center;color:var(--muted)">Loading…</td></tr>';
+
+  const params = new URLSearchParams();
+  if (sport)  params.set('sport',  sport);
+  if (grade)  params.set('grade',  grade);
+  if (market) params.set('market', market);
+  params.set('limit', 150);
+
+  try {
+    const [propsResp, summaryResp, calResp] = await Promise.all([
+      fetch('/api/scout/props?' + params),
+      fetch('/api/scout/summary'),
+      fetch('/api/scout/calibration'),
+    ]);
+    const propsData   = await propsResp.json();
+    const summaryData = await summaryResp.json();
+    const calData     = await calResp.json().catch(() => null);
+
+    // Calibration badge
+    const calBadge = document.getElementById('scout-cal-badge');
+    if (calBadge && calData && !calData.message) {
+      const lvl = calData.alert_level || 'ok';
+      const col = lvl === 'critical' ? 'var(--red)' : lvl === 'alert' ? 'var(--amber)' : 'var(--green)';
+      calBadge.style.color = col;
+      const drift = calData.worst_drift_pp != null ? `${calData.worst_drift_pp.toFixed(1)}pp drift` : '';
+      calBadge.textContent = `Calibration: ${lvl.toUpperCase()}${drift ? ' · '+drift : ''}`;
+    }
+
+    // Summary badges
+    const badgesEl = document.getElementById('scout-summary-badges');
+    if (badgesEl) {
+      const byGrade = {};
+      (summaryData.breakdown || []).forEach(b => {
+        byGrade[b.grade] = (byGrade[b.grade] || 0) + b.count;
+      });
+      const total = summaryData.total_props || 0;
+      badgesEl.innerHTML = `
+        <span style="font-size:12px;color:var(--muted)">${total} props scouted today</span>
+        ${ ['A','B','C','D'].map(g => byGrade[g]
+          ? `<span style="font-size:12px;padding:3px 8px;border-radius:10px;background:${_GRADE_BG[g]};color:${_GRADE_COLORS[g]}">${g}: ${byGrade[g]}</span>`
+          : '').join('') }
+        ${summaryData.last_scout_run
+          ? `<span style="font-size:11px;color:var(--muted)">Last run: ${summaryData.last_scout_run.slice(0,10)}</span>`
+          : '<span style="font-size:11px;color:var(--amber)">⚠ Scout not run today</span>'}
+      `;
+    }
+
+    // Table
+    const props = propsData.props || [];
+    if (!body) return;
+    if (!props.length) {
+      body.innerHTML = '<tr><td colspan="8" style="padding:20px;text-align:center;color:var(--muted)">No props found. Run the scout or adjust filters.</td></tr>';
+      return;
+    }
+
+    body.innerHTML = props.map((p, i) => {
+      const hitPct  = (p.hit_probability * 100).toFixed(1);
+      const side    = (p.side || '').toUpperCase();
+      const thr     = p.threshold != null ? p.threshold : '—';
+      const sideStr = p.threshold != null ? `${side} ${thr}` : side;
+      const proj    = p.projected_value != null ? p.projected_value.toFixed(2) : '—';
+      const ci      = p.projected_low_95 != null
+        ? `<span style="font-size:10px;color:var(--muted)">[${p.projected_low_95.toFixed(1)}–${p.projected_high_95.toFixed(1)}]</span>`
+        : '';
+      const name    = p.player_name || p.team || '—';
+      const matchup = `${p.away_team} @ ${p.home_team}`;
+      return `<tr style="border-bottom:1px solid var(--border);cursor:pointer" onclick="openScoutDetail(${i})" data-scout-idx="${i}">
+        <td style="padding:9px 14px"><span style="font-size:11px;font-weight:600;color:var(--muted)">${p.sport}</span></td>
+        <td style="padding:9px 14px;font-weight:600">${name}</td>
+        <td style="padding:9px 14px"><span style="font-size:12px;color:var(--muted)">${_mktLabel(p.market_type)}</span></td>
+        <td style="padding:9px 14px">${sideStr}</td>
+        <td style="padding:9px 14px">${proj} ${ci}</td>
+        <td style="padding:9px 14px;font-weight:700;color:${parseFloat(hitPct)>=65?'var(--green)':parseFloat(hitPct)>=55?'var(--teal)':'var(--text)'}">${hitPct}%</td>
+        <td style="padding:9px 14px">${_gradeChip(p.quality_grade)}</td>
+        <td style="padding:9px 14px;font-size:12px;color:var(--muted)">${matchup}</td>
+      </tr>`;
+    }).join('');
+
+    // Store for modal
+    window._scoutProps = props;
+
+  } catch(e) {
+    if (body) body.innerHTML = `<tr><td colspan="8" style="padding:20px;text-align:center;color:var(--red)">Error loading scout data: ${e.message}</td></tr>`;
+  }
+}
+
+function openScoutDetail(idx) {
+  const p = (window._scoutProps || [])[idx];
+  if (!p) return;
+  const modal = document.getElementById('scout-detail-modal');
+  const title = document.getElementById('scout-modal-title');
+  const mbody = document.getElementById('scout-modal-body');
+  if (!modal) return;
+
+  const name    = p.player_name || p.team || (p.away_team + ' @ ' + p.home_team);
+  const hitPct  = (p.hit_probability * 100).toFixed(1);
+  const thr     = p.threshold != null ? p.threshold : '—';
+  const side    = (p.side || '').toUpperCase();
+  const conf    = (p.confidence || p.confidence_factors || []).join(' · ') || '—';
+  const risks   = (p.risks || p.risk_factors || []).join(' · ') || 'None';
+
+  title.textContent = name + ' — ' + _mktLabel(p.market_type);
+  mbody.innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px">
+      ${[ ['Sport', p.sport], ['Matchup', p.away_team+' @ '+p.home_team],
+          ['Market', _mktLabel(p.market_type)], ['Side / Line', side+' '+thr],
+          ['Projection', p.projected_value?.toFixed(2)+' ±'+p.projected_std_dev?.toFixed(2)],
+          ['95% CI', '['+p.projected_low_95?.toFixed(1)+' – '+p.projected_high_95?.toFixed(1)+']'],
+          ['Hit Prob', hitPct+'%'], ['Grade', p.quality_grade],
+          ['Source', p.data_source], ['Version', p.projection_version],
+        ].map(([k,v]) => `<div><div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">${k}</div><div style="font-weight:600;margin-top:2px">${v||'—'}</div></div>`).join('')}
+    </div>
+    <div style="margin-bottom:10px">
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:4px">Confidence Factors</div>
+      <div style="font-size:13px">${conf}</div>
+    </div>
+    <div>
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;margin-bottom:4px">Risk Factors</div>
+      <div style="font-size:13px;color:${risks==='None'?'var(--muted)':'var(--amber)'}">${risks}</div>
+    </div>
+    ${p.actual_hit != null
+      ? `<div style="margin-top:12px;padding:10px;background:${p.actual_hit?'rgba(34,197,94,.1)':'rgba(239,68,68,.1)'};border-radius:8px;font-size:13px">
+           Settled: <strong>${p.actual_hit ? '✅ HIT' : '❌ MISS'}</strong>
+           ${p.actual_outcome_value != null ? ` (actual: ${p.actual_outcome_value})` : ''}
+         </div>`
+      : ''}
+  `;
+  modal.style.display = 'flex';
+}
+
+async function triggerScoutRun() {
+  const btn = event?.target;
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Running…'; }
+  try {
+    const r = await fetch('/api/scout/run', { method: 'POST' });
+    const d = await r.json();
+    const total = d.total_props || 0;
+    alert(`Scout complete: ${total} props generated.\nSports: ${JSON.stringify(d.by_sport||{})}`);
+    loadScoutProps();
+  } catch(e) {
+    alert('Scout run failed: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Run Scout'; }
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLACEMENT
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function loadPlacement() {
+  const grade  = document.getElementById('placement-grade')?.value  || 'B';
+  const sport  = document.getElementById('placement-sport')?.value  || '';
+  const tbody  = document.getElementById('placement-table-body');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--muted)">Loading…</td></tr>';
+
+  const params = new URLSearchParams({ min_grade: grade });
+  if (sport) params.set('sport', sport);
+
+  try {
+    const [recResp, parlayResp] = await Promise.all([
+      fetch('/api/placement/recommendations?' + params),
+      fetch('/api/placement/parlay-suggestions?max_legs=3'),
+    ]);
+    const recData    = await recResp.json();
+    const parlayData = await parlayResp.json();
+
+    // Bankroll label
+    const bl = document.getElementById('placement-bankroll-label');
+    if (bl && recData.bankroll) bl.textContent = `Bankroll: $${recData.bankroll.toFixed(2)}`;
+
+    // Recommendations table
+    const recs = recData.recommendations || [];
+    if (tbody) {
+      if (!recs.length) {
+        tbody.innerHTML = '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--muted)">No recommendations today. Run the scout first.</td></tr>';
+      } else {
+        tbody.innerHTML = recs.map(r => {
+          const action = r.action || 'SKIP';
+          const actionCol = action.startsWith('PLAY') ? 'var(--green)' : 'var(--muted)';
+          const hitPct = (r.hit_probability * 100).toFixed(1);
+          return `<tr style="border-bottom:1px solid var(--border)" title="${r.reason||''}">
+            <td style="padding:9px 14px">${_gradeChip(r.quality_grade)}</td>
+            <td style="padding:9px 14px;font-weight:600">${r.description || '—'}</td>
+            <td style="padding:9px 14px;font-size:12px;color:var(--muted)">${_mktLabel(r.market_type)}</td>
+            <td style="padding:9px 14px">${hitPct}%</td>
+            <td style="padding:9px 14px;font-weight:700;color:${actionCol}">${action}</td>
+            <td style="padding:9px 14px">$${r.kelly_stake?.toFixed(2) || '0.00'}</td>
+          </tr>`;
+        }).join('');
+      }
+    }
+
+    // Parlay suggestion
+    const parlayEl = document.getElementById('placement-parlay-content');
+    if (parlayEl) {
+      const legs = parlayData.legs || [];
+      if (!legs.length) {
+        parlayEl.innerHTML = '<div style="color:var(--muted);padding:8px 0">No A-grade props today.</div>';
+      } else {
+        const combinedPct = ((parlayData.combined_prob || 0) * 100).toFixed(1);
+        parlayEl.innerHTML = `
+          <div style="font-size:11px;color:var(--muted);margin-bottom:10px">${legs.length}-leg A-grade parlay · Combined: <strong style="color:var(--green)">${combinedPct}%</strong></div>
+          ${legs.map(lg => `
+            <div style="padding:8px 10px;margin-bottom:6px;background:var(--surface2);border-radius:8px">
+              <div style="font-weight:600;font-size:13px">${lg.description || lg.matchup}</div>
+              <div style="font-size:12px;color:var(--muted)">${_mktLabel(lg.market_type)} · ${(lg.side||'').toUpperCase()} ${lg.threshold||''} · ${(lg.hit_prob*100).toFixed(1)}%</div>
+            </div>
+          `).join('')}
+        `;
+      }
+    }
+
+  } catch(e) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--red)">Error: ${e.message}</td></tr>`;
+  }
+}
+
+async function runKellySizer() {
+  const prob  = parseFloat(document.getElementById('sizer-prob')?.value || 0.65);
+  const grade = document.getElementById('sizer-grade')?.value || 'B';
+  const odds  = parseFloat(document.getElementById('sizer-odds')?.value || 1.91);
+  const result= document.getElementById('sizer-result');
+  if (!result) return;
+
+  result.style.display = 'block';
+  result.textContent   = 'Calculating…';
+  try {
+    const r = await fetch('/api/placement/size', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ hit_probability: prob, quality_grade: grade, decimal_odds: odds }),
+    });
+    const d = await r.json();
+    const mult = d.scout_multiplier || 1.0;
+    result.innerHTML = `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+        <div><div style="font-size:10px;color:var(--muted)">Kelly stake</div><div style="font-weight:700;font-size:16px;color:var(--green)">$${d.recommended_stake?.toFixed(2)}</div></div>
+        <div><div style="font-size:10px;color:var(--muted)">Kelly fraction</div><div style="font-weight:600">${(d.kelly_fraction*100).toFixed(0)}%</div></div>
+        <div><div style="font-size:10px;color:var(--muted)">Scout mult.</div><div style="font-weight:600">${mult.toFixed(2)}x</div></div>
+        <div><div style="font-size:10px;color:var(--muted)">Bankroll</div><div style="font-weight:600">$${d.bankroll?.toFixed(2)}</div></div>
+      </div>
+    `;
+  } catch(e) {
+    result.textContent = 'Error: ' + e.message;
+  }
+}
+
+// Auto-load scout + placement when navigating to pages
+const _origShowPage = window.showPage;
+window.showPage = function(name) {
+  _origShowPage(name);
+  if (name === 'scout')     loadScoutProps();
+  if (name === 'placement') loadPlacement();
+};
 
 </script>
 
