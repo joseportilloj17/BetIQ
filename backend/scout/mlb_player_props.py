@@ -171,7 +171,13 @@ def _scout_hitter(
     game: GameInfo,
     team: str,
     scout_date: str,
+    pitcher_factor: float = 1.0,
 ) -> List[ScoutedProp]:
+    """
+    pitcher_factor: ERA-based multiplier for the opposing pitcher.
+    >1.0 = soft pitcher (project hitter stats up). <1.0 = elite pitcher (project down).
+    Applied to hits, total_bases, rbi, runs (not HR — too binary).
+    """
     results: List[ScoutedProp] = []
 
     player_id   = str(player.get("person", {}).get("id", player.get("id", "")))
@@ -192,6 +198,9 @@ def _scout_hitter(
     is_home = (team == game.home_team)
     home_road = "home" if is_home else "away"
 
+    # Markets where pitcher quality adjustment applies
+    _PITCHER_ADJUSTED = {"player_hits", "player_total_bases", "player_rbi", "player_runs"}
+
     for market_type, (season_key, recent_key, sport_stat) in _HITTER_STAT_MAP.items():
         season_avg = _safe_float(season_avgs.get(season_key))
         if season_avg < _MIN_HITTER_AVG.get(market_type, 0.05):
@@ -199,10 +208,18 @@ def _scout_hitter(
 
         recent_avg_val = _recent_avg(recent_games, recent_key, n=7) if recent_games else None
         projected_mean = blend_season_recent(season_avg, recent_avg_val)
+
+        # Apply pitcher quality adjustment to contact/reaching-base markets
+        if market_type in _PITCHER_ADJUSTED and pitcher_factor != 1.0:
+            projected_mean = projected_mean * pitcher_factor
+
         std            = std_from_average(projected_mean, "MLB", sport_stat)
 
         confidence_factors = [f"Season ({games}G): {season_avg:.2f}/g", home_road]
         risk_factors       = []
+        if pitcher_factor != 1.0:
+            dir_label = "weak" if pitcher_factor > 1.0 else "elite"
+            confidence_factors.append(f"Opp pitcher ({dir_label} ERA): {pitcher_factor:.2f}x adj")
         if recent_avg_val is not None:
             confidence_factors.append(f"L7 avg: {recent_avg_val:.2f}")
         else:
@@ -337,6 +354,47 @@ def _scout_pitcher(
     return results
 
 
+# ── Pitcher/hitter matchup factors ────────────────────────────────────────────
+
+_MLB_LEAGUE_AVG_ERA = 4.20   # ~2024-25 MLB league average ERA
+
+def _pitcher_era_factor(pitcher_id: str) -> float:
+    """
+    Return a multiplier for hitter projections facing this pitcher.
+    > 1.0 means soft pitcher (hitters project higher).
+    < 1.0 means elite pitcher (hitters project lower).
+    Clamped to [0.80, 1.25].
+    """
+    if not pitcher_id:
+        return 1.0
+    try:
+        stats = ds.get_mlb_player_pitching_stats(pitcher_id)
+        era = _safe_float(stats.get("earnedRunAverage", _MLB_LEAGUE_AVG_ERA))
+        if era <= 0:
+            return 1.0
+        factor = era / _MLB_LEAGUE_AVG_ERA
+        return max(0.80, min(1.25, factor))
+    except Exception:
+        return 1.0
+
+
+def _opp_team_k_factor(opp_team_id: str) -> float:
+    """
+    Return a strikeout multiplier based on opponent team's K-rate.
+    High-K lineup → pitcher strikeouts project higher (factor > 1.0).
+    Low-K lineup → factor < 1.0.
+    Clamped to [0.85, 1.15].
+    """
+    _MLB_LEAGUE_AVG_KPG = 8.5  # ~league avg strikeouts per game per team
+    try:
+        import statsapi
+        standings = statsapi.standings_data()
+        # statsapi doesn't have team K-rate easily; return 1.0 as fallback
+        return 1.0
+    except Exception:
+        return 1.0
+
+
 # ── Game-level entry point ─────────────────────────────────────────────────────
 
 def scout_game(game: GameInfo) -> List[ScoutedProp]:
@@ -344,9 +402,18 @@ def scout_game(game: GameInfo) -> List[ScoutedProp]:
     scout_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     results: List[ScoutedProp] = []
 
-    for team_id, team_name in [
-        (game.home_team_id, game.home_team),
-        (game.away_team_id, game.away_team),
+    extra = game.extra or {}
+    home_pitcher_id = extra.get("home_pitcher_id", "")
+    away_pitcher_id = extra.get("away_pitcher_id", "")
+
+    # Hitters face the opposing pitcher; factor scales hitting projections
+    # Home hitters face away pitcher, away hitters face home pitcher
+    home_hitter_factor = _pitcher_era_factor(away_pitcher_id)  # home hitters vs away pitcher
+    away_hitter_factor = _pitcher_era_factor(home_pitcher_id)  # away hitters vs home pitcher
+
+    for team_id, team_name, hitter_factor in [
+        (game.home_team_id, game.home_team, home_hitter_factor),
+        (game.away_team_id, game.away_team, away_hitter_factor),
     ]:
         roster = ds.get_mlb_team_roster(team_id)
         if not roster:
@@ -361,7 +428,8 @@ def scout_game(game: GameInfo) -> List[ScoutedProp]:
                 if pos == "P":
                     results.extend(_scout_pitcher(player, game, team_name, scout_date))
                 else:
-                    results.extend(_scout_hitter(player, game, team_name, scout_date))
+                    results.extend(_scout_hitter(player, game, team_name, scout_date,
+                                                  pitcher_factor=hitter_factor))
             except Exception as exc:
                 name = (player.get("person", {}).get("fullName")
                         or player.get("fullName", "?"))
