@@ -550,6 +550,90 @@ def _new_settled_sport(db: Session, sport: str, since) -> int:
     return count
 
 
+def _settle_scout_props(db: Session, days_back: int = 3) -> int:
+    """
+    Mark actual_hit on scouted_props rows where the outcome is now known.
+
+    Strategy:
+      - Find scouted_props where actual_hit IS NULL and scout_date >= today - days_back
+      - For each row, look up a settled mock_bet_leg that matches game_id + market_type
+        (or falls back to matching team names + market_type)
+      - If found and leg_result = WIN → actual_hit = 1 (for OVER/home side)
+                                  LOSS → actual_hit = 0
+      - Updates actual_outcome_value from resolved_home/away scores where available
+
+    Returns count of props settled.
+    """
+    from sqlalchemy import text
+    from datetime import date, timedelta
+
+    cutoff = (date.today() - timedelta(days=days_back)).isoformat()
+    settled = 0
+
+    try:
+        # Fetch unsettled scouted props within window
+        rows = db.execute(text("""
+            SELECT id, game_id, market_type, side, threshold, sport, scout_date
+            FROM   scouted_props
+            WHERE  actual_hit IS NULL
+            AND    scout_date >= :cutoff
+        """), {"cutoff": cutoff}).fetchall()
+
+        for (prop_id, game_id, market_type, side, threshold, sport, scout_date) in rows:
+            # Try to find a settled mock_bet_leg for this game/market
+            leg_row = None
+
+            # Match on fixture_id (= game_id) + market_type
+            if game_id:
+                leg_row = db.execute(text("""
+                    SELECT mbl.leg_result,
+                           mbl.resolved_home_score, mbl.resolved_away_score
+                    FROM   mock_bet_legs mbl
+                    JOIN   mock_bets mb ON mb.id = mbl.mock_bet_id
+                    WHERE  mbl.fixture_id  = :gid
+                    AND    mbl.market_type = :mt
+                    AND    mbl.leg_result  IS NOT NULL
+                    AND    mbl.leg_result  != 'PENDING'
+                    ORDER  BY mb.created_at DESC
+                    LIMIT  1
+                """), {"gid": game_id, "mt": market_type}).fetchone()
+
+            if not leg_row:
+                continue   # no settled game data yet
+
+            leg_result, home_score, away_score = leg_row
+
+            # Determine hit: WIN → 1, LOSS → 0, PUSH → skip
+            if leg_result == "PUSH":
+                continue
+            actual_hit = 1 if leg_result == "WIN" else 0
+
+            # Infer actual outcome value from scores where meaningful
+            actual_value = None
+            if home_score is not None and away_score is not None:
+                if market_type == "totals":
+                    actual_value = home_score + away_score
+                elif market_type in ("h2h", "spread"):
+                    actual_value = home_score - away_score if side == "home" else away_score - home_score
+
+            db.execute(text("""
+                UPDATE scouted_props
+                SET    actual_hit           = :hit,
+                       actual_outcome_value = :val
+                WHERE  id = :pid
+            """), {"hit": actual_hit, "val": actual_value, "pid": prop_id})
+            settled += 1
+
+        db.commit()
+        if settled:
+            print(f"[AutoSettle] Settled {settled} scouted props")
+        return settled
+
+    except Exception as exc:
+        print(f"[AutoSettle] _settle_scout_props error: {exc}")
+        return 0
+
+
 def run_auto_settle(
     db: Session,
     days_back: int = 3,
@@ -660,6 +744,15 @@ def run_auto_settle(
                   f"{_pep_result.get('deleted_stale', 0)} stale removed")
         except Exception as _pep_err:
             print(f"[AutoSettle] Personal edge profile refresh error (non-fatal): {_pep_err}")
+
+    # ── Scout prop settlement ─────────────────────────────────────────────────
+    # After bets settle, mark scouted_props.actual_hit where game outcomes are known.
+    # Runs as a best-effort pass — failure never blocks the settle cycle.
+    if settled_count > 0:
+        try:
+            _settle_scout_props(db, days_back=days_back)
+        except Exception as _sp_err:
+            print(f"[AutoSettle] Scout prop settlement error (non-fatal): {_sp_err}")
 
     # Auto-retrain — launched as a background subprocess so the server never blocks
     retrained = False

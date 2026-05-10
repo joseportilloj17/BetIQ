@@ -2851,6 +2851,15 @@ async function loadSchedulerHealth(silent = false) {
     ${_row(_icon(pk.verified),  `Picks: ${pk.verified ? pk.picks_count + ' picks published' : 'cache empty — watchdog regenerating'}`)}
     ${_row(_icon(mb.verified),  `Mock bets: ${mb.verified ? mb.bets_today + ' for today' : 'low count — watchdog regenerating'}`)}
     ${_row(_icon(!st.overdue),  `Settlement: ${settleStr}`)}
+    ${(() => {
+      const scout = data.checks?.scout;
+      if (!scout) return '';
+      const scoutIcon = scout.ran_today ? '✅' : '⏳';
+      const scoutProps = scout.props_today || 0;
+      const scoutCal   = scout.calibration || '—';
+      const calColor   = scoutCal === 'critical' ? 'var(--red)' : scoutCal === 'alert' ? 'var(--amber)' : 'inherit';
+      return _row(scoutIcon, `Scout: ${scout.ran_today ? scoutProps+' props today' : 'not run yet'} · Cal: <span style="color:${calColor}">${scoutCal}</span>`);
+    })()}
     ${rtRow}
     ${rtLogHtml}
     <div style="margin-top:6px;color:var(--muted);font-size:10px">
@@ -5492,12 +5501,19 @@ function renderSlipQuality(data) {
 
     const altLabel = leg._is_alt ? ' <span style="font-size:9px;color:var(--amber);font-weight:600">(alt)</span>' : '';
 
+    // Scout grade badge (shown when scout ran today and matched this leg)
+    const scoutG   = leg.scout_grade;
+    const scoutPct = leg.scout_hit_prob != null ? (leg.scout_hit_prob * 100).toFixed(0) + '%' : null;
+    const scoutBadge = scoutG
+      ? `<span title="Scout grade: ${scoutG} (${scoutPct||'?'} hit prob)" style="margin-left:6px;display:inline-block;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:700;background:${_GRADE_BG[scoutG]||'transparent'};color:${_GRADE_COLORS[scoutG]||'var(--muted)'}">🔭${scoutG}</span>`
+      : '';
+
     return `
       <div style="padding:12px;background:var(--surface2);border-radius:8px;border-left:3px solid ${gc}">
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
           <div style="width:30px;height:30px;border-radius:50%;background:${gc};display:flex;align-items:center;justify-content:center;font-weight:700;color:#000;flex-shrink:0;font-size:12px">${leg.lqs_grade||'?'}</div>
           <div style="flex:1;min-width:0">
-            <div style="font-size:13px;font-weight:600">${leg.team||'?'}${pt}${altLabel}</div>
+            <div style="font-size:13px;font-weight:600">${leg.team||'?'}${pt}${altLabel}${scoutBadge}</div>
             <div style="font-size:11px;color:var(--muted)">${leg.market||''} · ${am} · LQS <strong style="color:${gc}">${leg.lqs}</strong></div>
           </div>
           <div style="font-size:22px;font-weight:700;color:${gc}">${leg.lqs}</div>
@@ -6360,12 +6376,19 @@ function renderPickCard(p, idx, stake, betClassArg) {
     const sportBadge = l.sport
       ? `<span style="font-size:9px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--muted);white-space:nowrap">${l.sport}</span>`
       : '';
+    // Scout grade badge — shown when the leg has been matched to a scouted prop
+    const _sg = l.scout_grade;
+    const _sp = l.scout_hit_prob != null ? (l.scout_hit_prob * 100).toFixed(0) + '%' : null;
+    const scoutLegBadge = _sg
+      ? `<span title="Scout: Grade ${_sg}${_sp ? ', '+_sp+' hit prob' : ''}" style="font-size:9px;padding:1px 5px;border-radius:8px;font-weight:700;background:${_GRADE_BG[_sg]||'transparent'};color:${_GRADE_COLORS[_sg]||'var(--muted)'};white-space:nowrap">🔭${_sg}</span>`
+      : '';
     return `<div class="pick-leg-row" data-leg-id="${l.leg_id}" style="${leftAccent}">
       <div style="flex:1;min-width:0">
         <div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap">
           <span style="font-size:12px;font-weight:600;color:var(--text)">✦ ${teamLabel}</span>
           ${lineLabel ? `<span style="font-size:12px;font-weight:700;color:var(--amber)">${lineLabel}</span>` : ''}
           ${sportBadge}
+          ${scoutLegBadge}
           ${modelLabel ? `<span style="font-size:10px;color:var(--muted)">${modelLabel}</span>` : ''}
           ${l.ale_switched
             ? `<span style="font-size:10px;color:#f59e0b;background:rgba(245,158,11,0.12);border-radius:3px;padding:1px 4px;font-weight:600">ALE↑</span>`
@@ -6440,6 +6463,7 @@ function renderPickCard(p, idx, stake, betClassArg) {
       <div class="pick-stat"><div class="pick-stat-label">EV/$10</div><div class="pick-stat-value" style="color:${evColor}">${evSign}$${typeof evDisplay==='number'?evDisplay.toFixed(2):evDisplay}</div></div>
       <div class="pick-stat"><div class="pick-stat-label">Kelly $500</div><div class="pick-stat-value" style="color:var(--green)">$${typeof kellyDisp==='number'?kellyDisp.toFixed(2):kellyDisp}</div></div>
       ${p.avg_lqs != null ? `<div class="pick-stat"><div class="pick-stat-label">Leg Quality</div><div class="pick-stat-value" style="color:${_lqsColor(p.avg_lqs)}">${p.avg_lqs}/100 (${p.avg_lqs>=80?'A':p.avg_lqs>=65?'B':p.avg_lqs>=50?'C':'D'})</div></div>` : ''}
+      ${(p.scout_multiplier != null && p.scout_multiplier !== 1.0) ? `<div class="pick-stat"><div class="pick-stat-label">Scout mult.</div><div class="pick-stat-value" style="color:${p.scout_multiplier>=1.2?'var(--green)':p.scout_multiplier<=0.8?'var(--amber)':'var(--muted)'}">${p.scout_multiplier.toFixed(2)}×</div></div>` : ''}
     </div>
 
     <div class="pick-legs">

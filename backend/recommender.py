@@ -1668,8 +1668,26 @@ def generate_todays_picks(
         _sig_mult = sum(_sig_mults) / len(_sig_mults) if _sig_mults else 1.0
         _sig_mult = max(0.3, min(1.7, _sig_mult))   # final pool-level clamp
 
-        _c["_composite"]    = _base_composite * _sig_mult
+        # Scout grade multiplier — attach scout grade to each leg, then average
+        # across legs (A→1.5×, B→1.2×, C→1.0×, D→0.5×). Falls back to 1.0 if
+        # scouted_props table is empty or scout hasn't run today.
+        _scout_mults = []
+        try:
+            import placement as _plc
+            for _leg in _c["legs"]:
+                _leg_enriched = _plc.attach_scout_grade_to_leg(dict(_leg), db)
+                _leg["scout_grade"]     = _leg_enriched.get("scout_grade")
+                _leg["scout_hit_prob"]  = _leg_enriched.get("scout_hit_prob")
+                _leg["scouted_prop_id"] = _leg_enriched.get("scouted_prop_id")
+                _scout_mults.append(_leg_enriched.get("scout_multiplier", 1.0))
+        except Exception:
+            pass
+        _scout_mult = sum(_scout_mults) / len(_scout_mults) if _scout_mults else 1.0
+        _scout_mult = max(0.5, min(1.5, _scout_mult))   # clamp: never decimates or over-boosts
+
+        _c["_composite"]    = _base_composite * _sig_mult * _scout_mult
         _c["_signal_mult"]  = round(_sig_mult, 4)
+        _c["_scout_mult"]   = round(_scout_mult, 4)
         _c["_signal_notes"] = _sig_notes
         _c["_avg_lqs"] = _raw_lqs  # cache for depth-first selection below
         _c["_avg_wp"]  = _avg_wp   # cache for section_a sort key
@@ -2049,6 +2067,8 @@ def _format_pick(cand: dict, stake: float, db=None) -> dict:
         # User signal adjustment applied to composite score
         "signal_multiplier": cand.get("_signal_mult", 1.0),
         "signal_notes":      cand.get("_signal_notes", []),
+        # Scout grade multiplier applied to composite score
+        "scout_multiplier":  cand.get("_scout_mult", 1.0),
         # Emergency patch tag: any pick with a recently-started leg gets a distinct source
         # so it can be excluded from clean prospective WR/P&L analysis in signal_analysis.
         "source": (

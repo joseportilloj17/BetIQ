@@ -1853,6 +1853,37 @@ def scheduler_status():
     return sched.get_state()
 
 
+def _scout_health(state: dict, today_ct_str: str, db) -> dict:
+    """Compute scout pipeline health for the health endpoint."""
+    ran_today = (state.get("last_scout_run") or "")[:10] == today_ct_str
+    last_result = state.get("last_scout_run_result") or {}
+    props_today = 0
+    cal_level   = "unknown"
+    try:
+        from sqlalchemy import text
+        row = db.execute(text(
+            "SELECT COUNT(*) FROM scouted_props WHERE scout_date = :d"
+        ), {"d": today_ct_str}).fetchone()
+        props_today = row[0] if row else 0
+    except Exception:
+        pass
+    try:
+        import scout.calibration as _sc
+        from database import engine as _engine
+        summary = _sc.latest_scout_calibration_summary(_engine)
+        cal_level = (summary or {}).get("alert_level", "no_data")
+    except Exception:
+        pass
+    return {
+        "ran_today":       ran_today,
+        "props_today":     props_today,
+        "by_sport":        last_result.get("by_sport", {}),
+        "errors":          last_result.get("errors", []),
+        "calibration":     cal_level,
+        "last_run_date":   state.get("last_scout_run"),
+    }
+
+
 @app.get("/api/scheduler/health")
 def scheduler_health():
     """
@@ -1937,6 +1968,8 @@ def scheduler_health():
         "alt_lines_morning":   _pm_status("last_alt_lines_fetch_morning"),
         "alt_lines_afternoon": _pm_status("last_alt_lines_fetch_afternoon"),
         "mock_generate_pm":    _pm_status("last_mock_generate_pm"),
+        # Scout pipeline — informational
+        "scout": _scout_health(state, today_ct_str, db),
     }
 
     # Derive overall status
