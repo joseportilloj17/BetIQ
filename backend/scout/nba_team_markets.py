@@ -276,13 +276,24 @@ def scout_game(game: GameInfo) -> List[ScoutedProp]:
         away_ppg = _expected_team_score(away_stats)
         confidence_factors.append(f"{game.away_team} win%: {away_wp:.3f}")
 
-    # Expected margin (positive = home wins by that margin)
-    home_off = home_ppg
-    away_off = away_ppg
-    expected_margin = (home_off - away_off) + 3.0  # +3 home court pts
+    # Adjusted expected scores using opponent points-allowed if available
+    # Score estimate = avg(team_off_ppg, opp_def_ppg_allowed)
+    home_def_allowed = _safe_float(away_stats.get("avg_points_allowed", 0))
+    away_def_allowed = _safe_float(home_stats.get("avg_points_allowed", 0))
 
-    expected_total = home_ppg + away_ppg
-    confidence_factors.append(f"Expected total: {expected_total:.1f}")
+    if home_def_allowed > 80:  # sanity check
+        home_score_est = (home_ppg + home_def_allowed) / 2.0
+    else:
+        home_score_est = home_ppg
+
+    if away_def_allowed > 80:
+        away_score_est = (away_ppg + away_def_allowed) / 2.0
+    else:
+        away_score_est = away_ppg
+
+    expected_margin = (home_score_est - away_score_est) + 3.0  # +3 home court
+    expected_total  = home_score_est + away_score_est
+    confidence_factors.append(f"Exp total: {expected_total:.1f} ({game.home_team} {home_score_est:.0f} / {game.away_team} {away_score_est:.0f})")
 
     # Build markets
     results.extend(_build_h2h(game, home_wp, away_wp, scout_date, confidence_factors, risk_factors))
