@@ -1,5 +1,7 @@
 # BetIQ
 
+**https://github.com/joseportilloj17/BetIQ**
+
 Personal sports betting analytics platform. Tracks real bets, runs an ML model, generates daily picks, and compares your handicapping against the model over time.
 
 ---
