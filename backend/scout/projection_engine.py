@@ -122,6 +122,45 @@ def clamp_probability(p: float) -> float:
 
 # ── Sanity checks ─────────────────────────────────────────────────────────────
 
+def detect_streak(
+    recent_games: list[dict],
+    stat_key: str,
+    season_avg: float,
+    n: int = 3,
+) -> tuple[str | None, float]:
+    """
+    Detect hot/cold streak from last N games.
+    Returns (streak_label, recent_n_avg) where:
+      streak_label = 'HOT' | 'COLD' | None
+    Threshold: if L{n} avg >= 130% of season avg → HOT
+               if L{n} avg <= 70% of season avg → COLD
+    """
+    if not recent_games or season_avg <= 0:
+        return None, 0.0
+
+    vals = []
+    for g in recent_games[:n]:
+        v = g.get(stat_key)
+        try:
+            f = float(v)
+            if f >= 0:
+                vals.append(f)
+        except (TypeError, ValueError):
+            pass
+
+    if not vals:
+        return None, 0.0
+
+    recent_avg = sum(vals) / len(vals)
+    ratio = recent_avg / season_avg
+
+    if ratio >= 1.30:
+        return "HOT", recent_avg
+    if ratio <= 0.70:
+        return "COLD", recent_avg
+    return None, recent_avg
+
+
 def validate_projection(
     projected_value: float,
     season_avg: float,

@@ -23,6 +23,7 @@ from scout.projection_engine import (
     blend_season_recent,
     clamp_probability,
     compute_ci_95,
+    detect_streak,
     grade_from_probability,
     project_over_under,
     std_from_average,
@@ -217,6 +218,13 @@ def _scout_hitter(
 
         confidence_factors = [f"Season ({games}G): {season_avg:.2f}/g", home_road]
         risk_factors       = []
+        # Streak detection (L3)
+        streak_label, l3_avg = detect_streak(recent_games, recent_key, season_avg, n=3)
+        if streak_label == "HOT":
+            confidence_factors.append(f"HOT streak: L3 avg {l3_avg:.2f}")
+        elif streak_label == "COLD":
+            risk_factors.append(f"COLD streak: L3 avg {l3_avg:.2f}")
+
         if pitcher_factor != 1.0:
             dir_label = "weak" if pitcher_factor > 1.0 else "elite"
             confidence_factors.append(f"Opp pitcher ({dir_label} ERA): {pitcher_factor:.2f}x adj")
