@@ -78,25 +78,28 @@ ALL_SPORT_KEYS = [
 
 
 def _get(endpoint: str, params: dict) -> dict | list | None:
+    from http_retry import get_with_retry
     params["apiKey"] = ODDS_API_KEY
-    try:
-        r = requests.get(f"{BASE_URL}{endpoint}", params=params, timeout=10)
-        r.raise_for_status()
-        # Log to credits_log so all API spend is visible (previously unlogged)
-        try:
-            rem_str  = r.headers.get("x-requests-remaining", "")
-            used_str = r.headers.get("x-requests-last", "")
-            rem  = int(rem_str)  if rem_str.isdigit()  else None
-            used = int(used_str) if used_str.isdigit() else None
-            if used is not None or rem is not None:
-                from creator_tier import _log_credits
-                _log_credits(endpoint, used, rem)
-        except Exception:
-            pass  # never block a response for logging failure
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        print(f"[OddsAPI] Error: {e}")
+    r = get_with_retry(
+        f"{BASE_URL}{endpoint}",
+        params=params,
+        timeout=10,
+        label="OddsAPI",
+    )
+    if r is None:
         return None
+    # Log to credits_log so all API spend is visible (previously unlogged)
+    try:
+        rem_str  = r.headers.get("x-requests-remaining", "")
+        used_str = r.headers.get("x-requests-last", "")
+        rem  = int(rem_str)  if rem_str.isdigit()  else None
+        used = int(used_str) if used_str.isdigit() else None
+        if used is not None or rem is not None:
+            from creator_tier import _log_credits
+            _log_credits(endpoint, used, rem)
+    except Exception:
+        pass  # never block a response for logging failure
+    return r.json()
 
 
 # ─── Sports list ──────────────────────────────────────────────────────────────

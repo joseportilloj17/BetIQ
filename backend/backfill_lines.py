@@ -75,22 +75,11 @@ _DELAY_ODDS       = 0.20   # seconds between odds requests
 
 def _espn_get(url: str, params: Optional[dict] = None, retries: int = 3) -> Optional[dict]:
     """GET with retry/backoff. Returns None on persistent failure."""
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=15)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code == 429:
-                wait = 2 ** attempt * 2
-                log.warning("ESPN 429 rate-limit — sleeping %ds", wait)
-                time.sleep(wait)
-                continue
-            log.debug("ESPN %d for %s", r.status_code, url[-80:])
-            return None
-        except requests.RequestException as exc:
-            log.warning("ESPN request error (attempt %d): %s", attempt + 1, exc)
-            time.sleep(1)
-    return None
+    from http_retry import get_with_retry
+    r = get_with_retry(url, params=params, timeout=15, max_attempts=retries, label="ESPN")
+    if r is None:
+        return None
+    return r.json()
 
 
 def _build_date_event_map(game_dates: list[str]) -> dict[tuple[str, str], str]:
