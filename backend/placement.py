@@ -187,11 +187,20 @@ def get_todays_recommendations(
         if len(recommendations) >= limit:
             break
 
+    play_recs = [r for r in recommendations if r["action"].startswith("PLAY")]
+    total_kelly = sum(r["kelly_stake"] for r in play_recs)
+    combined_prob = 1.0
+    for r in play_recs[:4]:  # top 4 plays parlay probability
+        combined_prob *= r["hit_probability"]
+
     return {
-        "scout_date":       scout_date,
-        "bankroll":         bankroll,
-        "total":            len(recommendations),
-        "recommendations":  recommendations,
+        "scout_date":         scout_date,
+        "bankroll":           bankroll,
+        "total":              len(recommendations),
+        "play_count":         len(play_recs),
+        "total_kelly_stake":  round(total_kelly, 2),
+        "top4_parlay_prob":   round(combined_prob, 4) if len(play_recs) >= 2 else None,
+        "recommendations":    recommendations,
     }
 
 

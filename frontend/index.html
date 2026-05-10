@@ -1834,6 +1834,12 @@ Rockets +4.5  Alt Spread  -950"
         </select>
         <span id="placement-bankroll-label" style="font-size:12px;color:var(--muted);margin-left:auto"></span>
       </div>
+      <!-- Summary stat bar -->
+      <div id="placement-summary-bar" style="display:none;gap:16px;margin-bottom:10px;padding:10px 14px;background:var(--surface2);border-radius:8px;font-size:12px">
+        <span id="plsb-plays" style="color:var(--green);font-weight:700"></span>
+        <span id="plsb-kelly" style="color:var(--muted)"></span>
+        <span id="plsb-parlay" style="color:var(--muted)"></span>
+      </div>
 
       <div class="card" style="padding:0;overflow:hidden">
         <table style="width:100%;border-collapse:collapse;font-size:13px">
@@ -11566,6 +11572,20 @@ async function loadPlacement() {
     // Bankroll label
     const bl = document.getElementById('placement-bankroll-label');
     if (bl && recData.bankroll) bl.textContent = `Bankroll: $${recData.bankroll.toFixed(2)}`;
+
+    // Summary stat bar
+    const sumBar = document.getElementById('placement-summary-bar');
+    if (sumBar && recData.play_count != null) {
+      sumBar.style.display = 'flex';
+      document.getElementById('plsb-plays').textContent = `${recData.play_count} PLAY recs`;
+      document.getElementById('plsb-kelly').textContent = `Total Kelly: $${recData.total_kelly_stake?.toFixed(2) || '0.00'}`;
+      if (recData.top4_parlay_prob != null) {
+        const pp = (recData.top4_parlay_prob * 100).toFixed(1);
+        document.getElementById('plsb-parlay').textContent = `Top-4 parlay prob: ${pp}%`;
+      } else {
+        document.getElementById('plsb-parlay').textContent = '';
+      }
+    }
 
     // Recommendations table
     const recs = recData.recommendations || [];
