@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Environment & secrets
+.env
+.env.*
+config.py
+backend/config.py
+verify_keys.py
+backend/verify_keys.py
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# Logs
+logs/
+*.log
+nohup.out
+out.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Process files
+.betiq.pid
+.caffeinate.pid
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Temp / backups
+/tmp/
+*.bak
