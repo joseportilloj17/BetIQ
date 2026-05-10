@@ -22,6 +22,7 @@ from scout.projection_engine import (
     blend_season_recent,
     clamp_probability,
     compute_ci_95,
+    detect_streak,
     grade_from_probability,
     project_over_under,
     std_from_average,
@@ -199,6 +200,13 @@ def _scout_player(
         avg_min = _safe_float(season_stats.get("avg_minutes", 0))
         confidence_factors = [f"Season avg: {season_avg:.1f}", home_road_note]
         risk_factors       = []
+
+        # Hot/cold streak detection (L3 games)
+        streak_label, l3_avg = detect_streak(recent_games, recent_key, season_avg, n=3)
+        if streak_label == "HOT":
+            confidence_factors.append(f"HOT streak: L3 avg {l3_avg:.1f}")
+        elif streak_label == "COLD":
+            risk_factors.append(f"COLD streak: L3 avg {l3_avg:.1f}")
 
         if def_factor != 1.0:
             dir_label = "easier" if def_factor > 1.0 else "harder"
