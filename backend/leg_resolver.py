@@ -1114,16 +1114,29 @@ def resolve_all_legs(
 
             mkt = parsed["market_type"]
 
-            # ── Trust stored market_type for Player Props ─────────────────────
-            # The stored leg.market_type was set by the FanDuel importer which
-            # had access to the "(Player Prop)" column in the original data.
-            # If re-parsing the bare description text reclassifies it (e.g.
-            # "Under 8.5 Assists" → Total), restore the correct label so we
-            # don't accidentally route props through game-score resolution.
+            # ── Trust stored market_type over re-parsed value ─────────────────
+            # The stored leg.market_type was set at import time (FanDuel/Pikkit)
+            # and is more reliable than re-parsing bare description text.
+            # Two cases:
+            #   1. Stored = "Player Prop" but parser returned something else →
+            #      restore Player Prop to avoid mis-routing through game scores.
+            #   2. Parser returned "Other" but stored is a known resolvable type
+            #      (Moneyline/Spread/Total/Run Line/Puck Line) → use stored type.
+            #      This fixes Pikkit format where "{team} Moneyline {away} @ {home}"
+            #      strips the keyword during parsing leaving only the team name for
+            #      _classify_extended, which then returns "Other".
+            _STORED_RESOLVABLE = {"Moneyline", "Spread", "Total", "Run Line", "Puck Line"}
             stored_mkt = (leg.market_type or "").strip()
             if stored_mkt == "Player Prop" and mkt != "Player Prop":
                 mkt = "Player Prop"
                 parsed["market_type"] = "Player Prop"
+            elif mkt in ("Other", "") and stored_mkt in _STORED_RESOLVABLE:
+                mkt = stored_mkt
+                parsed["market_type"] = stored_mkt
+                # For Run Line / Puck Line normalise to "Spread" for _resolve_from_game
+                if stored_mkt in ("Run Line", "Puck Line"):
+                    parsed["market_type"] = "Spread"
+                    mkt = "Spread"
 
             # ── Pitcher strikeout prop ────────────────────────────────────────
             if mkt == "Player Prop" and parsed.get("stat_type") == "strikeouts":
