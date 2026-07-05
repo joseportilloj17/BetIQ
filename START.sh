@@ -99,7 +99,7 @@ if [ -f "$LOG_FILE" ]; then
     tail -5000 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
 fi
 
-nohup "$SCRIPT_DIR/.venv/bin/python" -m uvicorn main:app --port 8000 \
+nohup "$SCRIPT_DIR/.venv/bin/python" -m uvicorn main:app --host 0.0.0.0 --port 8000 \
     >> "$LOG_FILE" 2>&1 &
 
 SERVER_PID=$!

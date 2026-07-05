@@ -71,6 +71,28 @@ _picks_cache: dict = {}   # {"2026-04-24": {result_dict}}
 _DATA_DIR   = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data"))
 _CACHE_FILE = os.path.join(_DATA_DIR, "picks_cache.json")
 
+def _extract_screenshot_timestamp(image_path: str):
+    """
+    Extract EXIF DateTimeOriginal/Digitized from screenshot.
+    iPhone EXIF is in local time. Returns datetime or None.
+    PNG screenshots from iOS often lack EXIF — handled gracefully.
+    """
+    try:
+        from PIL import Image
+        img = Image.open(image_path)
+        # JPEG has _getexif(); PNG typically does not
+        exif_data = getattr(img, '_getexif', lambda: None)()
+        if not exif_data:
+            return None
+        for tag_id in [36867, 36868, 306]:  # DateTimeOriginal, DateTimeDigitized, DateTime
+            if tag_id in exif_data:
+                dt_str = exif_data[tag_id]
+                return datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+        return None
+    except Exception:
+        return None
+
+
 def _cache_key() -> str:
     from datetime import datetime as _dt
     return _dt.now(_CACHE_TZ).strftime("%Y-%m-%d")
@@ -174,6 +196,344 @@ import os as _os
 _FRONTEND = _os.path.join(_os.path.dirname(__file__), "..", "frontend")
 _FRONTEND = _os.path.abspath(_FRONTEND)
 
+@app.get("/admin", response_class=HTMLResponse)
+def serve_admin():
+    """Mobile-friendly admin panel for common operations."""
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BetIQ Admin</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f1117; color: #e2e8f0;
+    min-height: 100vh; padding: 24px 16px;
+  }
+  h1 { font-size: 1.4rem; font-weight: 700; margin-bottom: 6px; color: #f8fafc; }
+  .subtitle { font-size: 0.85rem; color: #64748b; margin-bottom: 20px; }
+
+  /* ── Section headers ── */
+  .section-title {
+    font-size: 0.7rem; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .08em; color: #64748b;
+    margin: 24px 0 10px;
+  }
+
+  /* ── Action buttons ── */
+  .btn {
+    display: block; width: 100%; padding: 18px 20px;
+    margin-bottom: 14px; border: none; border-radius: 12px;
+    font-size: 1rem; font-weight: 600; cursor: pointer;
+    text-align: left; transition: opacity .15s, transform .1s;
+    position: relative;
+  }
+  .btn:active { transform: scale(0.98); opacity: 0.85; }
+  .btn-label { display: block; font-size: 1rem; }
+  .btn-sub   { display: block; font-size: 0.75rem; font-weight: 400; opacity: 0.7; margin-top: 3px; }
+  .btn-settle   { background: #1e40af; color: #fff; }
+  .btn-picks    { background: #065f46; color: #fff; }
+  .btn-cal      { background: #6b21a8; color: #fff; }
+  .btn-injuries { background: #92400e; color: #fff; }
+  .btn-validate { background: #1e3a5f; color: #fff; }
+  .btn-upload   { background: #0e7490; color: #fff; }
+  .btn .spinner {
+    display: none; position: absolute; right: 20px; top: 50%;
+    transform: translateY(-50%);
+    width: 20px; height: 20px; border: 3px solid rgba(255,255,255,0.3);
+    border-top-color: #fff; border-radius: 50%;
+    animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: translateY(-50%) rotate(360deg); } }
+  .btn.loading .spinner { display: block; }
+  .btn.loading { opacity: 0.7; pointer-events: none; }
+
+  /* ── Result box ── */
+  .result-box {
+    margin-top: 8px; padding: 16px; border-radius: 10px;
+    background: #1e2433; border: 1px solid #2d3748;
+    font-size: 0.82rem; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-word;
+    display: none;
+  }
+  .result-box.success { border-color: #22c55e; }
+  .result-box.error   { border-color: #ef4444; }
+  .result-label { font-size: 0.7rem; color: #64748b; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .05em; }
+
+  /* ── Status cards ── */
+  .status-grid {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 10px; margin-bottom: 4px;
+  }
+  .stat-card {
+    background: #1e2433; border: 1px solid #2d3748;
+    border-radius: 10px; padding: 14px 12px;
+  }
+  .stat-label { font-size: 0.68rem; color: #64748b; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+  .stat-value { font-size: 1.1rem; font-weight: 700; color: #f8fafc; }
+  .stat-value.loading-val { color: #475569; font-size: 0.85rem; }
+
+  /* ── Screenshot upload ── */
+  .upload-zone {
+    background: #1e2433; border: 2px dashed #334155;
+    border-radius: 12px; padding: 20px 16px;
+    text-align: center; margin-bottom: 14px;
+  }
+  .upload-zone label {
+    display: block; cursor: pointer;
+    font-size: 0.9rem; color: #94a3b8; margin-bottom: 10px;
+  }
+  .upload-zone input[type=file] { display: none; }
+  #file-name { font-size: 0.8rem; color: #22c55e; margin-top: 6px; min-height: 18px; }
+
+  .ts-block {
+    background: #1e2433; border: 1px solid #2d3748;
+    border-radius: 10px; padding: 14px 12px; margin-top: 10px; display: none;
+  }
+  .ts-block .ts-display { font-size: 0.85rem; color: #94a3b8; margin-bottom: 10px; }
+  .ts-block label { font-size: 0.7rem; color: #64748b; text-transform: uppercase; letter-spacing: .05em; display: block; margin-bottom: 4px; }
+  .ts-block input[type=datetime-local] {
+    width: 100%; background: #0f1117; border: 1px solid #334155;
+    border-radius: 8px; color: #e2e8f0; padding: 10px 12px;
+    font-size: 0.9rem;
+  }
+</style>
+</head>
+<body>
+<h1>BetIQ Admin</h1>
+<p class="subtitle">Tap a button to run an operation.</p>
+
+<!-- ── Status section ── -->
+<div class="section-title">Server Status</div>
+<div class="status-grid">
+  <div class="stat-card">
+    <div class="stat-label">Total Settled</div>
+    <div class="stat-value loading-val" id="stat-settled">…</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Win Rate</div>
+    <div class="stat-value loading-val" id="stat-wr">…</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Today's Picks</div>
+    <div class="stat-value loading-val" id="stat-picks">…</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Pending Bets</div>
+    <div class="stat-value loading-val" id="stat-pending">…</div>
+  </div>
+</div>
+<div class="stat-card" style="margin-bottom:4px">
+  <div class="stat-label">Server Time</div>
+  <div class="stat-value loading-val" id="stat-uptime">…</div>
+</div>
+
+<!-- ── Action buttons ── -->
+<div class="section-title">Actions</div>
+
+<button class="btn btn-settle" onclick="run(this, 'POST', '/api/mock-bets/settle', 'Run Settlement', 'result')">
+  <span class="btn-label">Run Settlement</span>
+  <span class="btn-sub">Settle all pending mock bets</span>
+  <span class="spinner"></span>
+</button>
+
+<button class="btn btn-picks" onclick="run(this, 'POST', '/api/recommend/today', 'Generate PM Picks', 'result')">
+  <span class="btn-label">Generate PM Picks</span>
+  <span class="btn-sub">Refresh today&rsquo;s recommendations</span>
+  <span class="spinner"></span>
+</button>
+
+<button class="btn btn-cal" onclick="run(this, 'POST', '/api/scout/calibration/run', 'Refresh Calibration', 'result')">
+  <span class="btn-label">Refresh Calibration</span>
+  <span class="btn-sub">Run scout calibration check</span>
+  <span class="spinner"></span>
+</button>
+
+<button class="btn btn-injuries" onclick="run(this, 'POST', '/api/health/refresh-injuries', 'Refresh Injuries', 'result')">
+  <span class="btn-label">Refresh Injuries</span>
+  <span class="btn-sub">Pull latest injury reports</span>
+  <span class="spinner"></span>
+</button>
+
+<button class="btn btn-validate" onclick="run(this, 'POST', '/api/validation/run', 'Run Validations', 'result')">
+  <span class="btn-label">Run Validations</span>
+  <span class="btn-sub">Model + signal validation suite</span>
+  <span class="spinner"></span>
+</button>
+
+<div class="result-box" id="result">
+  <div class="result-label" id="result-label"></div>
+  <div id="result-body"></div>
+</div>
+
+<!-- ── Screenshot upload ── -->
+<div class="section-title">Upload Bet Slip Screenshot</div>
+<div class="upload-zone">
+  <label for="slip-file">
+    Tap to choose a screenshot (camera or photo roll)
+  </label>
+  <input type="file" id="slip-file" accept="image/*" capture="environment"
+         onchange="onFileChosen(this)">
+  <div id="file-name"></div>
+</div>
+
+<button class="btn btn-upload" id="upload-btn" onclick="uploadScreenshot(this)" disabled style="opacity:0.4">
+  <span class="btn-label">Parse Screenshot</span>
+  <span class="btn-sub">Upload to /api/fanduel/parse-screenshot</span>
+  <span class="spinner"></span>
+</button>
+
+<div class="ts-block" id="ts-block">
+  <div class="ts-display" id="ts-display"></div>
+  <label for="ts-override">Override timestamp</label>
+  <input type="datetime-local" id="ts-override">
+</div>
+
+<div class="result-box" id="upload-result">
+  <div class="result-label" id="upload-result-label"></div>
+  <div id="upload-result-body"></div>
+</div>
+
+<script>
+// ── Status loader ──────────────────────────────────────────────────────────
+async function loadStatus() {
+  try {
+    const [perfRes, picksRes, healthRes] = await Promise.allSettled([
+      fetch('/api/mock-bets/performance'),
+      fetch('/api/recommend/today'),
+      fetch('/api/health'),
+    ]);
+
+    if (perfRes.status === 'fulfilled' && perfRes.value.ok) {
+      const d = await perfRes.value.json();
+      const s = document.getElementById('stat-settled');
+      const w = document.getElementById('stat-wr');
+      const p = document.getElementById('stat-pending');
+      s.textContent = d.total_settled ?? '—';
+      s.className = 'stat-value';
+      const wr = d.win_rate != null ? (d.win_rate * 100).toFixed(1) + '%' : '—';
+      w.textContent = wr;
+      w.className = 'stat-value';
+      p.textContent = d.total_pending ?? '—';
+      p.className = 'stat-value';
+    }
+
+    if (picksRes.status === 'fulfilled' && picksRes.value.ok) {
+      const d = await picksRes.value.json();
+      const el = document.getElementById('stat-picks');
+      const picks = d.picks ?? d.recommendations ?? d.bets ?? [];
+      const cnt = Array.isArray(picks) ? picks.length : (d.count ?? '—');
+      el.textContent = cnt;
+      el.className = 'stat-value';
+    }
+
+    if (healthRes.status === 'fulfilled' && healthRes.value.ok) {
+      const d = await healthRes.value.json();
+      const el = document.getElementById('stat-uptime');
+      el.textContent = d.time ?? d.uptime ?? d.status ?? '—';
+      el.className = 'stat-value';
+    }
+  } catch(e) { /* non-fatal */ }
+}
+loadStatus();
+
+// ── Generic action runner ──────────────────────────────────────────────────
+async function run(btn, method, url, label, resultId) {
+  btn.classList.add('loading');
+  const el = document.getElementById(resultId);
+  const lb = document.getElementById(resultId + '-label');
+  const rb = document.getElementById(resultId + '-body');
+  el.style.display = 'block';
+  el.className = 'result-box';
+  lb.textContent = label + ' — running…';
+  rb.textContent = '';
+  try {
+    const res = await fetch(url, { method, headers: { 'Content-Type': 'application/json' } });
+    const text = await res.text();
+    let pretty = text;
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+    lb.textContent = label + (res.ok ? ' — OK ' + res.status : ' — ERROR ' + res.status);
+    rb.textContent = pretty;
+    el.className = 'result-box ' + (res.ok ? 'success' : 'error');
+  } catch (e) {
+    lb.textContent = label + ' — FAILED';
+    rb.textContent = e.toString();
+    el.className = 'result-box error';
+  } finally {
+    btn.classList.remove('loading');
+  }
+}
+
+// ── Screenshot upload ──────────────────────────────────────────────────────
+function onFileChosen(input) {
+  const fn = document.getElementById('file-name');
+  const btn = document.getElementById('upload-btn');
+  if (input.files && input.files[0]) {
+    fn.textContent = input.files[0].name;
+    btn.disabled = false;
+    btn.style.opacity = '1';
+  } else {
+    fn.textContent = '';
+    btn.disabled = true;
+    btn.style.opacity = '0.4';
+  }
+  // Hide previous results when new file chosen
+  document.getElementById('ts-block').style.display = 'none';
+  document.getElementById('upload-result').style.display = 'none';
+}
+
+async function uploadScreenshot(btn) {
+  const fileInput = document.getElementById('slip-file');
+  if (!fileInput.files || !fileInput.files[0]) return;
+
+  btn.classList.add('loading');
+  const el = document.getElementById('upload-result');
+  const lb = document.getElementById('upload-result-label');
+  const rb = document.getElementById('upload-result-body');
+  el.style.display = 'block';
+  el.className = 'result-box';
+  lb.textContent = 'Parse Screenshot — uploading…';
+  rb.textContent = '';
+  document.getElementById('ts-block').style.display = 'none';
+
+  try {
+    const form = new FormData();
+    form.append('image', fileInput.files[0]);
+
+    const res = await fetch('/api/fanduel/parse-screenshot', { method: 'POST', body: form });
+    const text = await res.text();
+    let data = null;
+    let pretty = text;
+    try { data = JSON.parse(text); pretty = JSON.stringify(data, null, 2); } catch {}
+
+    lb.textContent = 'Parse Screenshot — ' + (res.ok ? 'OK ' + res.status : 'ERROR ' + res.status);
+    rb.textContent = pretty;
+    el.className = 'result-box ' + (res.ok ? 'success' : 'error');
+
+    // Show timestamp block if response has timestamp info
+    if (data && data.timestamp_display) {
+      const tsBlock = document.getElementById('ts-block');
+      document.getElementById('ts-display').textContent = data.timestamp_display;
+      const tsInput = document.getElementById('ts-override');
+      tsInput.value = data.timestamp_iso || '';
+      tsBlock.style.display = 'block';
+    }
+  } catch (e) {
+    lb.textContent = 'Parse Screenshot — FAILED';
+    rb.textContent = e.toString();
+    el.className = 'result-box error';
+  } finally {
+    btn.classList.remove('loading');
+  }
+}
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
 @app.get("/", response_class=HTMLResponse)
 def serve_ui():
     """Serve the BetIQ dashboard."""
@@ -214,6 +574,40 @@ def startup():
     except Exception as _pep_err:
         print(f"[Startup] personal_edge_profile init error (non-fatal): {_pep_err}")
     _load_disk_cache()   # restore today's picks if server restarted
+
+    # ── Sub-model boot health check ──────────────────────────────────────────
+    # Attempt to load every expected sub-model.  Log CRITICAL if any fails so
+    # a broken pickle is never silently swallowed (broke 2026-06-09..06-13).
+    _submodel_status = {}
+    _sm_checks = {
+        "mlb_ats":    ("MLB",    ml._load_ats_submodel),
+        "mlb_totals": ("MLB",    ml._load_totals_submodel),
+    }
+    for _sm_name, (_sm_sport, _sm_loader) in _sm_checks.items():
+        try:
+            _sm_result = _sm_loader(_sm_sport)
+            if _sm_result is None:
+                _submodel_status[_sm_name] = "MISSING"
+                print(f"CRITICAL [Startup] Sub-model '{_sm_name}' returned None "
+                      f"-- all {_sm_sport} legs will fall back to combined_v1")
+            else:
+                _sm_clf, _sm_sc, _sm_imp, _sm_cols = _sm_result
+                _submodel_status[_sm_name] = f"OK ({len(_sm_cols)} features, {type(_sm_clf).__name__})"
+                print(f"[Startup] Sub-model '{_sm_name}' loaded: "
+                      f"{type(_sm_clf).__name__}, {len(_sm_cols)} features")
+        except Exception as _sm_err:
+            _submodel_status[_sm_name] = f"ERROR: {_sm_err}"
+            print(f"CRITICAL [Startup] Sub-model '{_sm_name}' failed to load: {_sm_err}")
+    # Also check global model
+    try:
+        _g_clf, _g_sc, _g_imp, _g_cols = ml.load_model()
+        _submodel_status["global"] = f"OK ({len(_g_cols)} features)"
+        print(f"[Startup] Global model loaded: {len(_g_cols)} features")
+    except Exception as _g_err:
+        _submodel_status["global"] = f"ERROR: {_g_err}"
+        print(f"CRITICAL [Startup] Global model failed to load: {_g_err}")
+    app.state.submodel_status = _submodel_status
+
     # Auto-import seed CSV if DB is empty
     seed = os.path.join(os.path.dirname(__file__), "..", "data", "transactions.csv")
     if os.path.exists(seed):
@@ -263,6 +657,39 @@ def startup():
 
     _threading.Thread(target=_run_watchdog_startup, daemon=True, name="StartupWatchdog").start()
 
+    # Scheduler thread watchdog: every 5 minutes, check if the scheduler loop
+    # is still alive.  If it hasn't run a cycle in > 35 minutes, auto-restart.
+    # This guards against silent thread crashes (e.g. uncaught exception in
+    # SettlementCron self-heal, unexpected disk I/O error bubbling out).
+    def _scheduler_health_watchdog():
+        import time as _time
+        _time.sleep(120)   # let startup settle before first check
+        while True:
+            _time.sleep(300)   # check every 5 minutes
+            try:
+                last = sched._scheduler_state.get("last_run")
+                running = sched._scheduler_state.get("running", False)
+                if not running:
+                    continue  # scheduler intentionally stopped
+                if last is None:
+                    continue  # scheduler just started, no cycle yet
+                from datetime import datetime as _dt, timezone as _tz
+                elapsed = (_dt.now(_tz.utc) - _dt.fromisoformat(last)).total_seconds()
+                interval = sched._scheduler_state.get("interval_mins", 30) * 60
+                # Overdue threshold: 1.5x the interval (e.g. 45 min for 30-min interval)
+                threshold = interval * 1.5
+                if elapsed > threshold:
+                    print(f"[SchedulerWatchdog] ⚠️  Scheduler overdue "
+                          f"({elapsed/60:.0f}m since last cycle, threshold {threshold/60:.0f}m) — restarting")
+                    sched.stop()
+                    _time.sleep(2)
+                    sched.start(interval_mins=30, auto_retrain=True, daemon=True)
+                    print("[SchedulerWatchdog] ✅ Scheduler restarted")
+            except Exception as _we:
+                print(f"[SchedulerWatchdog] check error: {_we}")
+
+    _threading.Thread(target=_scheduler_health_watchdog, daemon=True, name="SchedulerWatchdog").start()
+
     # Scout schema: add scouted_prop_id + scout_grade to mock_bet_legs and user_pick_legs
     try:
         import safe_migrate as _sm
@@ -271,9 +698,11 @@ def startup():
         _sm.safe_add_column(_engine, "mock_bet_legs",  "scouted_prop_id",    "INTEGER")
         _sm.safe_add_column(_engine, "mock_bet_legs",  "scout_grade",        "TEXT")
         _sm.safe_add_column(_engine, "mock_bet_legs",  "scout_hit_prob",     "REAL")
+        _sm.safe_add_column(_engine, "mock_bet_legs",  "model_n_features",   "INTEGER")
         _sm.safe_add_column(_engine, "user_pick_legs", "scouted_prop_id",    "INTEGER")
         _sm.safe_add_column(_engine, "user_pick_legs", "scout_grade",        "TEXT")
         _sm.safe_add_column(_engine, "user_pick_legs", "scout_hit_prob",     "REAL")
+        _sm.safe_add_column(_engine, "user_picks",     "placed_mock_bet_id", "VARCHAR")
         print("[Startup] Scout schema migrations applied")
     except Exception as _sc_err:
         print(f"[Startup] Scout schema migration error (non-fatal): {_sc_err}")
@@ -674,10 +1103,11 @@ def list_submodels():
 
 
 class GameATSRequest(BaseModel):
-    sport:      str           # "NHL" or "MLB"
-    home_team:  str
-    away_team:  str
-    game_date:  str | None = None   # YYYY-MM-DD; defaults to today
+    sport:        str             # "NHL" or "MLB"
+    home_team:    str
+    away_team:    str
+    game_date:    str | None   = None   # YYYY-MM-DD; defaults to today
+    spread_value: float | None = None   # e.g. -1.5, +2.5; defaults to standard run line
 
 
 @app.post("/api/model/predict-game")
@@ -716,10 +1146,11 @@ def predict_game(req: GameATSRequest):
 
     # ── 3. Score the game (reads historical.db feature matrix, no training) ──
     prob = ml.predict_game_ats(
-        sport      = sport,
-        home_team  = req.home_team,
-        away_team  = req.away_team,
-        game_date  = req.game_date,
+        sport        = sport,
+        home_team    = req.home_team,
+        away_team    = req.away_team,
+        game_date    = req.game_date,
+        spread_value = req.spread_value,
     )
     if prob is None:
         raise HTTPException(
@@ -764,8 +1195,83 @@ def model_stats(db: Session = Depends(get_db)):
     return ml.get_model_stats(db)
 
 
+@app.get("/api/health/clv-summary")
+def health_clv_summary(days: int = Query(30, ge=7, le=90), db: Session = Depends(get_db)):
+    """
+    Closing Line Value summary for the last `days` days.
+
+    CLV sign convention (American odds):
+      clv_cents = close_odds − open_odds
+      clv_cents < 0  →  open_odds > close_odds  →  POSITIVE CLV (beat the close)
+      clv_cents > 0  →  open_odds < close_odds  →  NEGATIVE CLV (line moved against us)
+
+    Closing line proxy = latest alt_lines snapshot before game start,
+    populated from the existing morning + afternoon odds fetch
+    (zero additional credit cost).
+    """
+    return mb_module.get_clv_summary(db, days=days)
+
+
+@app.post("/api/admin/backfill-clv-opening")
+def admin_backfill_clv_opening(db: Session = Depends(get_db)):
+    """
+    One-time backfill of open_odds for all legs that have fixture_id
+    but no open_odds stored.  Safe to call repeatedly (idempotent).
+    Uses alt_lines (afternoon fetch data) as opening proxy.
+    """
+    return mb_module.backfill_clv_opening(db)
+
+
+@app.get("/api/health/model-status")
+def health_model_status(db: Session = Depends(get_db)):
+    """
+    Current model version, training metadata, live 7-day holdout performance,
+    next scheduled retrain time, and version history (last 10 retrains).
+    """
+    import weekly_retrain as _wr
+    return _wr.get_model_status(db)
+
+
+@app.post("/api/model/rollback")
+def model_rollback(
+    target_version: int = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Roll back to a previous model version.
+
+    ?target_version=N rolls back to model_vN.pkl.
+    Omit the parameter to roll back to the most recent prior version.
+
+    Restores model.pkl / scaler.pkl / imputer.pkl from the versioned backup
+    and marks the restored version as 'active' in model_versions.
+    """
+    import weekly_retrain as _wr
+    return _wr.rollback_model(db, target_version_n=target_version)
+
+
+@app.post("/api/model/approve-candidate")
+def approve_candidate(db: Session = Depends(get_db)):
+    """
+    Approve the held candidate model and deploy it as active.
+    Weekly retrain now produces candidates on hold — this endpoint
+    is the human gate that triggers deployment.
+    """
+    import weekly_retrain as _wr
+    return _wr.approve_candidate(db)
+
+
+@app.post("/api/model/reject-candidate")
+def reject_candidate(db: Session = Depends(get_db)):
+    """
+    Reject the held candidate model. Current model stays active.
+    """
+    import weekly_retrain as _wr
+    return _wr.reject_candidate(db)
+
+
 @app.get("/api/model/progress")
-def model_progress():
+def model_progress(db: Session = Depends(get_db)):
     """
     Return model performance snapshots from model_performance_log.
 
@@ -782,36 +1288,30 @@ def model_progress():
     Written by signal_analysis.py — this endpoint is read-only.
     """
     import json as _json
-    import sqlite3 as _sql3
-    from database import DB_PATH
+    from sqlalchemy import text as _mp_text
 
-    con = _sql3.connect(DB_PATH)
-    con.row_factory = _sql3.Row
-    cur = con.cursor()
-
-    cur.execute("""
+    # Check if table exists
+    tbl = db.execute(_mp_text("""
         SELECT name FROM sqlite_master
         WHERE type='table' AND name='model_performance_log'
-    """)
-    if not cur.fetchone():
-        con.close()
+    """)).fetchone()
+    if not tbl:
         return {"current_week": None, "history": []}
 
-    cur.execute("""
+    raw_result = db.execute(_mp_text("""
         SELECT * FROM model_performance_log
         ORDER BY week_ending DESC
         LIMIT 52
-    """)
+    """)).fetchall()
     raw_rows = []
-    for r in cur.fetchall():
-        row = dict(r)
+    for r in raw_result:
+        row = dict(r._mapping)
         if row.get("sport_breakdown"):
             try:
                 row["sport_breakdown"] = _json.loads(row["sport_breakdown"])
             except Exception:
                 row["sport_breakdown"] = {}
         raw_rows.append(row)
-    con.close()
 
     def _shape(r: dict) -> dict:
         return {
@@ -1582,6 +2082,40 @@ def cash_out_performance(
     }
 
 
+# ─── Cashout live monitor (Phase 6C) ────────────────────────────────────────
+
+@app.get("/api/cashout/live")
+def cashout_live_dashboard():
+    """
+    Live cashout dashboard for open LIVE bets.
+    Returns per-bet fair value, spread position, and recommendation band.
+    No FanDuel integration — this is a fair-value estimator only.
+    Compare BetIQ's fair value to the offer in the FD app.
+    """
+    try:
+        dashboard = co_engine.get_cashout_dashboard()
+        return {
+            "open_bets":   len(dashboard),
+            "bets":        dashboard,
+            "poll_status": sched.get_state().get("last_cashout_poll_result"),
+            "last_poll":   sched.get_state().get("last_cashout_poll"),
+        }
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return {"error": str(exc), "open_bets": 0, "bets": []}
+
+
+@app.post("/api/cashout/poll")
+def cashout_poll_now():
+    """Force an immediate live-odds poll for cashout monitoring."""
+    try:
+        result = co_engine.poll_live_odds()
+        return result
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 # ─── Fixtures / odds routes ───────────────────────────────────────────────────
 
 @app.get("/api/fixtures")
@@ -1885,7 +2419,7 @@ def _scout_health(state: dict, today_ct_str: str, db) -> dict:
 
 
 @app.get("/api/scheduler/health")
-def scheduler_health():
+def scheduler_health(db: Session = Depends(get_db)):
     """
     Watchdog health check — returns verification state for all 5 critical jobs.
     overall: 'healthy' | 'degraded' | 'critical'
@@ -2132,8 +2666,8 @@ def health_daily_summary(db: Session = Depends(get_db)):
             "SELECT COUNT(*) FROM user_picks WHERE status = 'PENDING'"
         )).scalar() or 0,
         "fixtures_today":      db.execute(__import__("sqlalchemy").text(
-            "SELECT COUNT(*) FROM fixtures WHERE date(commence_time) = date('now')"
-        )).scalar() or 0,
+            "SELECT COUNT(*) FROM fixtures WHERE game_date_ct = :today"
+        ), {"today": datetime.now(_CACHE_TZ).strftime("%Y-%m-%d")}).scalar() or 0,
         "unresolved_legs":     db.execute(__import__("sqlalchemy").text(
             """SELECT COUNT(*) FROM user_pick_legs upl
                JOIN user_picks up ON up.id = upl.user_pick_id
@@ -2160,14 +2694,358 @@ def health_daily_summary(db: Session = Depends(get_db)):
     except Exception as _ee:
         recent_errors = [{"error": str(_ee)}]
 
+    # ── Boost framework tracking ──────────────────────────────────────────────
+    import mock_bets as _mb
+    _sqla_text = __import__("sqlalchemy").text
+    _STRAT_B_DRIFT_WR   = 0.60   # WR below this triggers tighten
+    _STRAT_B_MIN_SAMPLE = 30     # minimum settled picks before evaluating
+
+    try:
+        # Today's picks (game_date = today CT) — new-format strategy labels only
+        _today_str = now_ct.strftime("%Y-%m-%d")
+        _new_strats = "('amplify_positive_ev','rescue_high_wr_chalk','no_boost')"
+        _today_rows = db.execute(_sqla_text(f"""
+            SELECT
+                boost_strategy,
+                COUNT(*) as n,
+                AVG(CASE WHEN boost_strategy IN ('amplify_positive_ev','rescue_high_wr_chalk')
+                         THEN base_ev_per_10 END)     as avg_base_ev,
+                AVG(CASE WHEN boost_strategy IN ('amplify_positive_ev','rescue_high_wr_chalk')
+                         THEN boosted_ev_per_10 END)  as avg_boosted_ev
+            FROM mock_bets
+            WHERE game_date = :today
+              AND source NOT IN ('forced_generation','exploration','retroactive_mock')
+              AND boost_strategy IN {_new_strats}
+            GROUP BY boost_strategy
+        """), {"today": _today_str}).fetchall()
+
+        _td: dict[str, dict] = {}
+        for _r in _today_rows:
+            _td[_r[0] or "no_boost"] = {
+                "n": _r[1], "avg_base_ev": _r[2], "avg_boosted_ev": _r[3]
+            }
+
+        _td_total  = sum(v["n"] for v in _td.values())
+        _td_a      = _td.get("amplify_positive_ev", {})
+        _td_b      = _td.get("rescue_high_wr_chalk", {})
+        _td_none   = _td.get("no_boost", {})
+        _td_boosted = (_td_a.get("n", 0) or 0) + (_td_b.get("n", 0) or 0)
+
+        today_boost = {
+            "total_picks":   _td_total,
+            "boosted_picks": _td_boosted,
+            "boost_rate":    round(_td_boosted / _td_total, 3) if _td_total else 0.0,
+            "strategy_a":    _td_a.get("n", 0) or 0,
+            "strategy_b":    _td_b.get("n", 0) or 0,
+            "no_boost":      _td_none.get("n", 0) or 0,
+            "avg_base_ev_a":    round(_td_a.get("avg_base_ev") or 0, 3),
+            "avg_boosted_ev_a": round(_td_a.get("avg_boosted_ev") or 0, 3),
+            "avg_base_ev_b":    round(_td_b.get("avg_base_ev") or 0, 3),
+            "avg_boosted_ev_b": round(_td_b.get("avg_boosted_ev") or 0, 3),
+        }
+
+        # 30-day settled performance by strategy — new-format labels only
+        _30d_rows = db.execute(_sqla_text(f"""
+            SELECT
+                boost_strategy,
+                COUNT(*) as picks,
+                SUM(CASE WHEN status = 'SETTLED_WIN' THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN status IN ('SETTLED_WIN','SETTLED_LOSS') THEN 1 ELSE 0 END) as settled,
+                SUM(COALESCE(actual_profit, 0)) as total_profit,
+                SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as total_stake
+            FROM mock_bets
+            WHERE generated_at >= date('now', '-30 days')
+              AND status IN ('SETTLED_WIN','SETTLED_LOSS')
+              AND source NOT IN ('forced_generation','exploration','retroactive_mock')
+              AND boost_strategy IN {_new_strats}
+            GROUP BY boost_strategy
+        """)).fetchall()
+
+        def _row_metrics(rows, key: str) -> dict:
+            for _r in rows:
+                if (_r[0] or "no_boost") == key:
+                    _settled = _r[3] or 0
+                    _wins    = _r[2] or 0
+                    _stake   = _r[5] or 0
+                    _profit  = _r[4] or 0
+                    return {
+                        "picks":  _r[1] or 0,
+                        "wr":     round(_wins / _settled, 3) if _settled else None,
+                        "roi":    round(_profit / _stake, 3) if _stake else None,
+                        "wins":   _wins,
+                        "settled": _settled,
+                    }
+            return {"picks": 0, "wr": None, "roi": None}
+
+        _l30_a    = _row_metrics(_30d_rows, "amplify_positive_ev")
+        _l30_b    = _row_metrics(_30d_rows, "rescue_high_wr_chalk")
+        _l30_none = _row_metrics(_30d_rows, "no_boost")
+
+        last_30 = {
+            "strategy_a_picks":   _l30_a["picks"],
+            "strategy_a_wr":      _l30_a["wr"],
+            "strategy_a_roi":     _l30_a["roi"],
+            "strategy_b_picks":   _l30_b["picks"],
+            "strategy_b_wr":      _l30_b["wr"],
+            "strategy_b_roi":     _l30_b["roi"],
+            "no_boost_picks":     _l30_none["picks"],
+            "no_boost_wr":        _l30_none["wr"],
+            "no_boost_roi":       _l30_none["roi"],
+        }
+
+        # ── Calibration status + auto-tighten ────────────────────────────────
+        _b_settled = _l30_b.get("settled") or _l30_b["picks"]
+        _b_wr      = _l30_b["wr"]
+        _cfg       = _mb._BOOST_STRATEGY_CONFIG
+
+        if _b_settled < _STRAT_B_MIN_SAMPLE:
+            _calib_status = "strategy_b_validating"
+        elif _b_wr is not None and _b_wr < _STRAT_B_DRIFT_WR:
+            _calib_status = "strategy_b_drift"
+            # Auto-tighten if not already tightened to 70%
+            if not _cfg.get("tightened") or _cfg.get("strat_b_min_wp", 65.0) < 70.0:
+                _mb.tighten_strat_b_threshold(
+                    new_wp=70.0,
+                    reason=(
+                        f"30d Strategy B WR={_b_wr:.1%} < 60% on {_b_settled} picks "
+                        f"— tightened from {_cfg.get('strat_b_min_wp', 65.0):.0f}% to 70%"
+                    ),
+                )
+        else:
+            _calib_status = "well_calibrated"
+            # If previously tightened but WR recovered, log (manual reset required)
+            if _cfg.get("tightened"):
+                _calib_status = "well_calibrated_tightened"  # still tight, but WR recovered
+
+        boost_framework: dict = {
+            "today":              today_boost,
+            "last_30_days":       last_30,
+            "calibration_status": _calib_status,
+            "strat_b_min_wp_active": _cfg.get("strat_b_min_wp", 65.0),
+            "strat_b_tightened":     _cfg.get("tightened", False),
+            "strat_b_tightened_at":  _cfg.get("tightened_at"),
+            "strat_b_tighten_reason":_cfg.get("tighten_reason"),
+        }
+    except Exception as _bfe:
+        boost_framework = {"error": str(_bfe)}
+
+    # ── Exploration status (tiered diagnostic system) ─────────────────────────
+    try:
+        import mock_bets as _mb_exp
+        _sqla_text2 = __import__("sqlalchemy").text
+
+        # Today's counts by tier
+        _exp_today = db.execute(_sqla_text2("""
+            SELECT exploration_tier, COUNT(*) as n
+            FROM mock_bets
+            WHERE source = 'exploration'
+              AND game_date = :today
+              AND exploration_tier IS NOT NULL
+            GROUP BY exploration_tier
+        """), {"today": now_ct.strftime("%Y-%m-%d")}).fetchall()
+        _exp_today_dict = {r[0]: r[1] for r in _exp_today}
+
+        # 30-day counts by tier
+        _exp_30d = db.execute(_sqla_text2("""
+            SELECT exploration_tier, COUNT(*) as n,
+              SUM(CASE WHEN status IN ('SETTLED_WIN','SETTLED_LOSS') THEN 1 ELSE 0 END) as settled
+            FROM mock_bets
+            WHERE source = 'exploration'
+              AND generated_at >= date('now', '-30 days')
+              AND exploration_tier IS NOT NULL
+            GROUP BY exploration_tier
+        """)).fetchall()
+        _exp_30d_dict = {r[0]: {"n": r[1], "settled": r[2]} for r in _exp_30d}
+
+        # Per-market verdicts from calibration function (last 30 days)
+        _calib = _mb_exp.get_exploration_calibration(days=30)
+
+        # Expansion markets needing action
+        _expansion_markets = [
+            {"market": f"{e['sport']} {e['market_type']}", "n": e["n_legs"],
+             "actual_wr": e["actual_wr"], "verdict": e["verdict"]}
+            for e in _calib.get("expansion", [])
+        ]
+        _boundary_probed = [
+            f"{e['sport']} {e['market_type']}"
+            for e in _calib.get("boundary_testing", [])
+        ]
+
+        exploration_status = {
+            "validation_tier": {
+                "legs_today":   _exp_today_dict.get("validation", 0),
+                "legs_30d":     (_exp_30d_dict.get("validation") or {}).get("n", 0),
+                "settled_30d":  (_exp_30d_dict.get("validation") or {}).get("settled", 0),
+                "calibration_markets": [
+                    {"market": f"{e['sport']} {e['market_type']}", "n": e["n_legs"],
+                     "actual_wr": e["actual_wr"], "avg_model_wp": e["avg_model_wp"],
+                     "verdict": e["verdict"]}
+                    for e in _calib.get("validation", [])
+                ],
+            },
+            "expansion_tier": {
+                "legs_today":              _exp_today_dict.get("expansion", 0),
+                "legs_30d":                (_exp_30d_dict.get("expansion") or {}).get("n", 0),
+                "markets_under_test":      _expansion_markets,
+                "markets_ready_to_promote": [m for m in _expansion_markets if m["verdict"] == "promote"],
+                "markets_to_demote":       [m for m in _expansion_markets if m["verdict"] == "demote"],
+            },
+            "boundary_testing_tier": {
+                "legs_today":              _exp_today_dict.get("boundary_testing", 0),
+                "legs_30d":                (_exp_30d_dict.get("boundary_testing") or {}).get("n", 0),
+                "broken_zones_probed":     _boundary_probed,
+                "zones_showing_recovery":  [
+                    f"{e['sport']} {e['market_type']}"
+                    for e in _calib.get("boundary_testing", [])
+                    if e["verdict"] in ("consider_expand", "slight_improvement")
+                ],
+            },
+        }
+    except Exception as _expe:
+        exploration_status = {"error": str(_expe)}
+
+    # ── Brier score summary ───────────────────────────────────────────────────
+    try:
+        _bs7  = mb_module.get_brier_scores(db, days=7)
+        _bs30 = mb_module.get_brier_scores(db, days=30)
+        _leg_today  = _bs7["overall"].get("per_leg_brier")
+        _leg_30d    = _bs30["overall"].get("per_leg_brier")
+        _par_today  = _bs7["overall"].get("parlay_brier")
+        _trend_7d   = _bs7["overall"].get("trend_7d")
+
+        def _brier_tier(b):
+            if b is None:
+                return "unknown"
+            if b <= 0.15:
+                return "elite"
+            if b <= 0.18:
+                return "excellent"
+            if b <= 0.22:
+                return "good"
+            if b <= 0.25:
+                return "mediocre"
+            return "poor"
+
+        def _trend_label(t):
+            if t is None:
+                return "stable"
+            if t < -0.01:
+                return "improving"
+            if t > 0.01:
+                return "degrading"
+            return "stable"
+
+        _brier_summary = {
+            "per_leg_today":   _leg_today,
+            "per_leg_7d_avg":  _leg_today,
+            "parlay_today":    _par_today,
+            "trend":           _trend_label(_trend_7d),
+            "target":          0.22,
+            "elite_target":    0.15,
+            "current_tier":    _brier_tier(_leg_today),
+        }
+    except Exception as _bse:
+        _brier_summary = {"error": str(_bse)}
+
     # ── Overall status ────────────────────────────────────────────────────────
     drift_level = drift.get("alert_level", "ok")
+    _boost_drift = boost_framework.get("calibration_status") == "strategy_b_drift"
     if sched_status == "critical" or drift_level == "critical":
         overall = "critical"
-    elif sched_status == "degraded" or drift_level == "alert":
+    elif sched_status == "degraded" or drift_level == "alert" or _boost_drift:
         overall = "degraded"
     else:
         overall = "healthy"
+
+    # ── Market promotion/demotion candidates ─────────────────────────────────
+    try:
+        pending_market_actions = mb_module.get_pending_market_actions(db)
+    except Exception as _pma_e:
+        pending_market_actions = {"error": str(_pma_e)}
+
+    # ── Retraining readiness ──────────────────────────────────────────────────
+    try:
+        retraining_status = mb_module.check_retraining_readiness(db)
+    except Exception as _rt_e:
+        retraining_status = {"error": str(_rt_e)}
+
+    # ── Model version status ──────────────────────────────────────────────────
+    try:
+        import weekly_retrain as _wrt
+        model_status = _wrt.get_model_status(db)
+    except Exception as _ms_e:
+        model_status = {"error": str(_ms_e)}
+
+    # ── CLV summary ───────────────────────────────────────────────────────────
+    try:
+        clv_summary = mb_module.get_clv_summary(db, days=30)
+    except Exception as _clv_e:
+        clv_summary = {"error": str(_clv_e)}
+
+    # ── Validation accuracy (latest persisted snapshot) ───────────────────────
+    try:
+        import validation_tracker as _valtrk
+        validation_accuracy = _valtrk.get_latest_validation_summary()
+    except Exception as _va_e:
+        validation_accuracy = {"error": str(_va_e)}
+
+    # ── Scout trajectory (per-grade WR trend vs targets) ─────────────────────
+    try:
+        scout_trajectory = _valtrk.get_scout_trajectory()
+    except Exception as _st_e:
+        scout_trajectory = {"error": str(_st_e)}
+
+    # ── Tier summary + activation gate ─────────────────────────────────────
+    try:
+        _tier_summary = mb_module.get_tier_summary(db)
+    except Exception as _ts_e:
+        _tier_summary = {"error": str(_ts_e)}
+    try:
+        _activation_gate = mb_module.check_activation_readiness(db)
+    except Exception as _ag_e:
+        _activation_gate = {"error": str(_ag_e)}
+
+    # ── Model routing distribution (7-day) ────────────────────────────────
+    try:
+        _mr_text = __import__("sqlalchemy").text
+        _mr_today = now_ct.strftime("%Y-%m-%d")
+        _mr_rows = db.execute(_mr_text("""
+            SELECT mbl.model_used, COUNT(*) as legs,
+                   ROUND(AVG(CASE WHEN mbl.leg_result='WIN' THEN 100.0
+                                  WHEN mbl.leg_result='LOSS' THEN 0.0
+                                  ELSE NULL END), 1) as win_rate
+            FROM mock_bet_legs mbl
+            JOIN mock_bets mb ON mb.id = mbl.mock_bet_id
+            WHERE mb.game_date >= DATE(:today, '-7 days')
+              AND mb.source NOT IN ('exploration','retroactive_mock')
+              AND COALESCE(mbl.excluded_from_metrics, 0) = 0
+            GROUP BY mbl.model_used
+            ORDER BY legs DESC
+        """), {"today": _mr_today}).fetchall()
+
+        _mr_dist = [
+            {"model": r[0] or "(null)", "legs": r[1], "win_rate": r[2]}
+            for r in _mr_rows
+        ]
+        _mr_models = {r[0] for r in _mr_rows if r[0]}
+        _mr_alert = None
+        if "mlb_ats_v1" not in _mr_models and any(
+            r[0] == "combined_v1" for r in _mr_rows
+        ):
+            _mr_alert = "mlb_ats_v1 has 0 legs in 7d -- possible silent fallback to combined_v1"
+        if "mlb_totals_v1" not in _mr_models and any(
+            r[0] == "combined_v1" for r in _mr_rows
+        ):
+            _t_msg = "mlb_totals_v1 has 0 legs in 7d -- possible silent fallback to combined_v1"
+            _mr_alert = f"{_mr_alert}; {_t_msg}" if _mr_alert else _t_msg
+
+        model_routing = {
+            "distribution_7d": _mr_dist,
+            "submodel_boot_status": getattr(app.state, "submodel_status", {}),
+            "alert": _mr_alert,
+        }
+    except Exception as _mr_e:
+        model_routing = {"error": str(_mr_e)}
 
     return {
         "timestamp_ct":      now_ct.strftime("%Y-%m-%d %H:%M CT"),
@@ -2186,7 +3064,603 @@ def health_daily_summary(db: Session = Depends(get_db)):
         "migration_health":  migration_health,
         "db_stats":          db_stats,
         "recent_settle_errors": recent_errors,
+        "boost_framework":   boost_framework,
+        "exploration_status": exploration_status,
+        "brier_scores":      _brier_summary,
+        "pending_market_actions": pending_market_actions,
+        "retraining_status": retraining_status,
+        "model_status": model_status,
+        "clv_summary": clv_summary,
+        "validation_accuracy": validation_accuracy,
+        "scout_trajectory": scout_trajectory,
+        "tier_summary": _tier_summary,
+        "activation_gate": _activation_gate,
+        "model_routing": model_routing,
+        "chain_status": {
+            "morning":   state.get("last_morning_chain_result"),
+            "afternoon": state.get("last_afternoon_chain_result"),
+        },
     }
+
+
+@app.get("/api/health/brier-scores")
+def health_brier_scores(days: int = Query(30, ge=7, le=365), db: Session = Depends(get_db)):
+    """
+    Full Brier score tracking: per-leg and parlay Brier, Murphy decomposition
+    by sport/market, by-grade breakdown, win-prob calibration buckets, and
+    7-day / 30-day trend deltas.
+    """
+    return mb_module.get_brier_scores(db, days=days)
+
+
+@app.get("/api/health/brier-decomposition")
+def health_brier_decomposition(
+    days: int = Query(30, ge=7, le=365),
+    windows: str = Query(None, description="Comma-separated window sizes, e.g. '7,14,30'"),
+    db: Session = Depends(get_db),
+):
+    """
+    Full Murphy Brier decomposition per (sport, market_type) cell.
+
+    Returns cells sorted by Reliability (calibration leverage), parlay decomposition,
+    and 90-100% WP bucket investigation. Use to identify highest-priority
+    calibration vs feature-engineering interventions.
+
+    Pass ?windows=7,14,30 to get rolling Brier windows with trajectory label instead.
+    """
+    if windows:
+        try:
+            _win_list = [int(w.strip()) for w in windows.split(",") if w.strip().isdigit()]
+        except Exception:
+            _win_list = [7, 14, 30]
+        return mb_module.get_brier_windows(db, windows=_win_list)
+    return mb_module.get_brier_decomposition(db, days=days)
+
+
+@app.get("/api/health/activation-gate")
+def health_activation_gate(db: Session = Depends(get_db)):
+    """Activation readiness for real-money betting — 11 criteria check."""
+    return mb_module.check_activation_readiness(db)
+
+
+@app.get("/api/health/parlay-calibration")
+def health_parlay_calibration():
+    """
+    Return current parlay_calibration table contents + trigger a rebuild
+    from all settled mock_bets.  Use to see and refresh the parlay WP haircuts
+    applied by get_calibrated_parlay_wp().
+    """
+    import os as _os
+    from win_prob_calibration import (
+        build_parlay_calibration_table as _build,
+        _PARLAY_CAL_CREATE,
+    )
+    import sqlite3 as _sq3
+
+    _db = _os.path.join(_os.path.dirname(__file__), "..", "data", "bets.db")
+    build_result = _build(_db)
+
+    rows = []
+    try:
+        con = _sq3.connect(_db, timeout=15)
+        raw = con.execute("""
+            SELECT wp_bucket, bucket_lo, bucket_hi, observed_pred_wp,
+                   observed_actual_wr, haircut_pp, sample_size, confidence, last_updated
+            FROM parlay_calibration ORDER BY bucket_lo
+        """).fetchall()
+        con.close()
+        rows = [
+            {
+                "wp_bucket":         r[0],
+                "avg_predicted_wp":  round(r[3], 2) if r[3] else None,
+                "actual_win_rate":   round(r[4], 2) if r[4] else None,
+                "haircut_pp":        round(r[5], 2) if r[5] else None,
+                "n":                 r[6],
+                "confidence":        r[7],
+                "last_updated":      r[8],
+            }
+            for r in raw
+        ]
+    except Exception as exc:
+        return {"error": str(exc), "build_result": build_result}
+
+    return {"buckets": rows, "build_result": build_result}
+
+
+@app.get("/api/health/player-projections")
+def health_player_projections(
+    game_date: str = Query(None, description="YYYY-MM-DD; defaults to today CT"),
+    sport: str     = Query(None, description="Filter by sport: MLB, NBA, NHL"),
+    db: Session    = Depends(get_db),
+):
+    """
+    Player projection status for a game date.
+
+    Returns stored projections from the player_projections table.
+    If no projections exist for the date, triggers a build run.
+    """
+    from zoneinfo import ZoneInfo
+    _CT = ZoneInfo("America/Chicago")
+    today = game_date or datetime.now(_CT).strftime("%Y-%m-%d")
+
+    rows = db.execute(
+        __import__("sqlalchemy").text("""
+            SELECT player_name, sport, team, opponent,
+                   stat_type, projection, confidence, matchup_adjustment,
+                   venue_adjustment, projected_at
+            FROM player_projections
+            WHERE game_date = :gd
+              AND (:sport IS NULL OR sport = :sport)
+            ORDER BY sport, confidence DESC, projection DESC
+            LIMIT 500
+        """),
+        {"gd": today, "sport": sport},
+    ).fetchall()
+
+    if not rows:
+        # Trigger a build if empty
+        try:
+            import player_projections as _pp
+            build_result = _pp.run_daily_projections(db, game_date=today)
+        except Exception as exc:
+            build_result = {"error": str(exc)}
+
+        rows = db.execute(
+            __import__("sqlalchemy").text("""
+                SELECT player_name, sport, team, opponent,
+                       stat_type, projection, confidence, matchup_adjustment,
+                       venue_adjustment, projected_at
+                FROM player_projections
+                WHERE game_date = :gd
+                  AND (:sport IS NULL OR sport = :sport)
+                ORDER BY sport, confidence DESC, projection DESC
+                LIMIT 500
+            """),
+            {"gd": today, "sport": sport},
+        ).fetchall()
+    else:
+        build_result = None
+
+    projections = [
+        {
+            "player_name":       r[0],
+            "sport":             r[1],
+            "team":              r[2],
+            "opponent":          r[3],
+            "stat_type":         r[4],
+            "projection":        round(r[5], 3) if r[5] is not None else None,
+            "confidence":        round(r[6], 3) if r[6] is not None else None,
+            "matchup_adjustment": round(r[7], 3) if r[7] is not None else None,
+            "venue_adjustment":  round(r[8], 3) if r[8] is not None else None,
+            "projected_at":      r[9],
+        }
+        for r in rows
+    ]
+
+    # Group by sport for summary
+    from collections import defaultdict
+    by_sport: dict = defaultdict(int)
+    for p in projections:
+        by_sport[p["sport"]] += 1
+
+    return {
+        "game_date":   today,
+        "count":       len(projections),
+        "by_sport":    dict(by_sport),
+        "projections": projections,
+        "build_result": build_result,
+    }
+
+
+@app.get("/api/health/per-market-auc")
+def health_per_market_auc(db: Session = Depends(get_db)):
+    """
+    Per-sport-market performance diagnostic (Phase A formalized as endpoint).
+
+    Computes:
+      • Per sport+market: leg WR, avg model WP, avg EV, leg count
+      • Calibration buckets: actual WR vs predicted WP in 10pp bands
+      • AUC proxy: leg WR relative to WP (high WR + close to WP = well calibrated)
+      • Market eligibility recommendations based on data
+
+    Recomputed fresh on each call (no caching — typically called once/day from health UI).
+    Only clean prospective sources (prospective, prospective_pm) are included.
+    Exploration bets are excluded (they are training data, not performance evaluation).
+    """
+    from sqlalchemy import text as _sql
+    from zoneinfo import ZoneInfo as _ZI
+    from datetime import datetime as _dt2
+
+    _CT   = _ZI("America/Chicago")
+    as_of = _dt2.now(_CT).strftime("%Y-%m-%d %H:%M CT")
+
+    _CLEAN_SOURCES = "('prospective','prospective_pm')"
+    _MIN_LEGS = 10
+    # Current-era floor: exclude legs from primitive models (April debugging)
+    _ERA_FLOOR = "2026-05-26"
+
+    # ── Per sport-market performance ──────────────────────────────────────────
+    market_rows = db.execute(_sql(f"""
+        SELECT
+            mbl.sport,
+            mbl.market_type,
+            COUNT(*) as legs,
+            SUM(CASE WHEN mbl.leg_result='WIN' THEN 1 ELSE 0 END) as wins,
+            ROUND(100.0 * SUM(CASE WHEN mbl.leg_result='WIN' THEN 1 ELSE 0 END) /
+                NULLIF(COUNT(*), 0), 1) as leg_wr_pct,
+            ROUND(AVG(mbl.win_prob), 1) as avg_model_wp,
+            ROUND(AVG(mbl.ev), 3) as avg_ev
+        FROM mock_bet_legs mbl
+        JOIN mock_bets mb ON mb.id = mbl.mock_bet_id
+        WHERE mb.source IN {_CLEAN_SOURCES}
+          AND mbl.leg_result IN ('WIN','LOSS')
+          AND COALESCE(mbl.excluded_from_metrics, 0) = 0
+          AND mb.game_date >= :era_floor
+        GROUP BY mbl.sport, mbl.market_type
+        ORDER BY COUNT(*) DESC, leg_wr_pct DESC
+    """), {"era_floor": _ERA_FLOOR}).fetchall()
+
+    by_sport_market = []
+    high_auc_markets = []
+    low_auc_markets  = []
+
+    for r in market_rows:
+        sport, mkt, n, wins, wr_pct, avg_wp, avg_ev = r
+        if not n:
+            continue
+
+        # AUC proxy: how close is actual WR to predicted WP?
+        # Simple metric: |actual_wr - avg_wp| < 8pp → well calibrated
+        # We also use WR relative to 50% as signal strength
+        auc_proxy = None
+        calib_delta = None
+        if wr_pct is not None and avg_wp is not None:
+            calib_delta = round(wr_pct - avg_wp, 1)
+            # AUC proxy: a WR above 55% in a market where model assigns avg WP 60-80%
+            # and the delta is within ±10pp suggests the model has genuine signal
+            if n >= _MIN_LEGS:
+                if wr_pct >= 65.0 and abs(calib_delta) <= 12.0:
+                    auc_proxy = "high_signal"
+                    high_auc_markets.append(f"{sport} {mkt}")
+                elif wr_pct < 45.0 or (calib_delta is not None and calib_delta < -20):
+                    auc_proxy = "no_signal"
+                    low_auc_markets.append(f"{sport} {mkt}")
+                elif wr_pct >= 55.0:
+                    auc_proxy = "moderate_signal"
+                else:
+                    auc_proxy = "weak_signal"
+                    low_auc_markets.append(f"{sport} {mkt}")
+
+        by_sport_market.append({
+            "sport":            sport,
+            "market_type":      mkt,
+            "n_legs":           n,
+            "leg_wr_pct":       wr_pct,
+            "avg_model_wp":     avg_wp,
+            "calibration_delta":calib_delta,
+            "avg_ev":           avg_ev,
+            "signal":           auc_proxy,
+            "low_n":            n < _MIN_LEGS,
+        })
+
+    # ── Calibration buckets ───────────────────────────────────────────────────
+    calib_rows = db.execute(_sql(f"""
+        SELECT
+            mbl.sport,
+            CASE
+                WHEN mbl.win_prob >= 75 THEN '75%+'
+                WHEN mbl.win_prob >= 65 THEN '65-75%'
+                WHEN mbl.win_prob >= 55 THEN '55-65%'
+                WHEN mbl.win_prob >= 45 THEN '45-55%'
+                ELSE '<45%'
+            END as predicted_range,
+            COUNT(*) as legs,
+            ROUND(100.0 * SUM(CASE WHEN mbl.leg_result='WIN' THEN 1 ELSE 0 END) /
+                NULLIF(COUNT(*), 0), 1) as actual_wr_pct,
+            ROUND(AVG(mbl.win_prob), 1) as avg_predicted_wp,
+            ROUND(
+                100.0 * SUM(CASE WHEN mbl.leg_result='WIN' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)
+                - AVG(mbl.win_prob)
+            , 1) as calibration_delta_pp
+        FROM mock_bet_legs mbl
+        JOIN mock_bets mb ON mb.id = mbl.mock_bet_id
+        WHERE mb.source IN {_CLEAN_SOURCES}
+          AND mbl.leg_result IN ('WIN','LOSS')
+          AND COALESCE(mbl.excluded_from_metrics, 0) = 0
+          AND mbl.win_prob IS NOT NULL
+          AND mb.game_date >= :era_floor
+        GROUP BY mbl.sport, predicted_range
+        ORDER BY mbl.sport, AVG(mbl.win_prob) DESC
+    """), {"era_floor": _ERA_FLOOR}).fetchall()
+
+    calibration = [
+        {
+            "sport":             r[0],
+            "predicted_range":   r[1],
+            "n_legs":            r[2],
+            "actual_wr_pct":     r[3],
+            "avg_predicted_wp":  r[4],
+            "calibration_delta": r[5],
+            "verdict": (
+                "overconfident"   if (r[5] or 0) < -8 and (r[2] or 0) >= _MIN_LEGS else
+                "underconfident"  if (r[5] or 0) > 8  and (r[2] or 0) >= _MIN_LEGS else
+                "calibrated"      if (r[2] or 0) >= _MIN_LEGS else
+                "low_n"
+            ),
+        }
+        for r in calib_rows
+    ]
+
+    # ── Injury data coverage ──────────────────────────────────────────────────
+    try:
+        inj_count = db.execute(_sql(
+            "SELECT COUNT(*) FROM injury_reports WHERE game_date = date('now')"
+        )).scalar() or 0
+        inj_sports = db.execute(_sql(
+            "SELECT DISTINCT sport FROM injury_reports WHERE game_date = date('now')"
+        )).fetchall()
+        injury_coverage = {
+            "today_records": inj_count,
+            "sports_covered": [r[0] for r in inj_sports],
+        }
+    except Exception:
+        injury_coverage = {"today_records": 0, "sports_covered": []}
+
+    # ── Line movement coverage ────────────────────────────────────────────────
+    try:
+        lm_count = db.execute(_sql(
+            "SELECT COUNT(*) FROM line_movement_log WHERE date(fetched_at) = date('now')"
+        )).scalar() or 0
+        line_movement_coverage = {"today_snapshots": lm_count}
+    except Exception:
+        line_movement_coverage = {"today_snapshots": 0}
+
+    return {
+        "as_of":             as_of,
+        "source_filter":     "prospective + prospective_pm only (exploration excluded)",
+        "min_legs_for_auc":  _MIN_LEGS,
+        "by_sport_market":   by_sport_market,
+        "calibration":       calibration,
+        "interpretation": {
+            "high_signal_markets": list(set(high_auc_markets)),
+            "low_signal_markets":  list(set(low_auc_markets)),
+            "note": (
+                "Markets with signal >= 65% WR and |calib_delta| <= 12pp are "
+                "eligible for composite scoring uplift. Markets with WR < 45% "
+                "or calib_delta < -20pp are candidates for ban or min_wp floor raise."
+            ),
+        },
+        "injury_coverage":        injury_coverage,
+        "line_movement_coverage": line_movement_coverage,
+    }
+
+
+@app.post("/api/health/refresh-injuries")
+def refresh_injuries_endpoint(
+    game_date: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Manually trigger injury data refresh for today's games.
+
+    Called by the cron scheduler at 7 AM, 1 PM, 4 PM CT.
+    Also callable manually to force a mid-day update.
+    """
+    try:
+        import injury_fetcher as _if
+        result = _if.refresh_injuries(db, game_date=game_date)
+        return {"status": "ok", **result}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+@app.get("/api/exploration/calibration")
+def exploration_calibration(days: int = 30):
+    """
+    Per-tier per-market performance for the exploration diagnostic system.
+
+    Returns verdict per market:
+      validation  → calibrated | overconfident_zone | watch | insufficient_data
+      expansion   → promote | demote | monitor | insufficient_data
+      boundary_testing → consider_expand | slight_improvement | still_broken | insufficient_data
+
+    Promotion rule (expansion → prospective):
+      actual_wr >= expected_wr - 5pp AND n >= 30 → 'promote'
+
+    Demotion rule (expansion → boundary_testing):
+      actual_wr < expected_wr - 15pp AND n >= 30 → 'demote'
+    """
+    import mock_bets as _mb
+    return _mb.get_exploration_calibration(days=days)
+
+
+@app.post("/api/exploration/promote-market")
+def promote_market(body: dict, db: Session = Depends(get_db)):
+    """
+    Manually promote a market from exploration to prospective generation.
+
+    Writes a 'promote' override to market_eligibility_overrides. The recommender
+    picks this up on the next request — no restart required.
+
+    Request body:
+      {
+        "sport":       "NBA",
+        "market_type": "player_points",
+        "min_wp":      62.0,       // optional — inferred from exploration calibration if omitted
+        "priority":    1.1,        // optional — defaults to 1.1 for newly promoted markets
+        "reason":      "30 legs, 67% WR, injury feed reliable",  // optional
+        "applied_by":  "analyst"   // optional
+      }
+
+    Returns the effective eligibility entry that will be applied.
+    """
+    from database import MarketEligibilityOverride
+    from recommender import _normalize_market_key
+    from datetime import datetime, timezone
+
+    sport       = (body.get("sport") or "").strip().upper()
+    market_type = _normalize_market_key(body.get("market_type") or "")
+    reason      = body.get("reason") or ""
+    applied_by  = body.get("applied_by") or ""
+
+    if not sport or not market_type:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail="sport and market_type are required")
+
+    # Infer min_wp from exploration calibration if not supplied
+    min_wp = body.get("min_wp")
+    if min_wp is None:
+        try:
+            import mock_bets as _mb
+            calib = _mb.get_exploration_calibration(days=60)
+            for tier_data in calib.get("tiers", {}).values():
+                for entry in tier_data.get("markets", []):
+                    if entry.get("sport") == sport and entry.get("market_type") == market_type:
+                        actual_wr = entry.get("actual_wr")
+                        if actual_wr is not None:
+                            # min_wp = actual_wr - 5pp, floored at 55%
+                            min_wp = max(55.0, round(actual_wr - 5.0, 1))
+        except Exception:
+            pass
+    if min_wp is None:
+        min_wp = 60.0  # safe fallback
+
+    priority = body.get("priority") or 1.1  # slight boost for newly promoted markets
+
+    row = MarketEligibilityOverride(
+        sport       = sport,
+        market_type = market_type,
+        action      = "promote",
+        min_wp      = float(min_wp),
+        priority    = float(priority),
+        banned      = False,
+        reason      = reason or f"Manually promoted via API",
+        applied_at  = datetime.now(timezone.utc),
+        applied_by  = applied_by or "api",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    effective = {"min_wp": row.min_wp, "priority": row.priority, "banned": False}
+    print(f"[market-promote] ({sport}, {market_type}) min_wp={row.min_wp} priority={row.priority} by={applied_by!r}")
+    return {
+        "status":        "promoted",
+        "sport":         sport,
+        "market_type":   market_type,
+        "effective":     effective,
+        "override_id":   row.id,
+        "note":          "Active on next recommendation request — no restart required.",
+    }
+
+
+@app.post("/api/exploration/demote-market")
+def demote_market(body: dict, db: Session = Depends(get_db)):
+    """
+    Manually demote (ban) a market from prospective generation.
+
+    Writes a 'demote' override to market_eligibility_overrides. The recommender
+    picks this up on the next request — no restart required.
+
+    Request body:
+      {
+        "sport":       "MLB",
+        "market_type": "spreads",
+        "reason":      "9.1% WR, confirmed broken — keep in boundary_testing only",
+        "applied_by":  "analyst"
+      }
+
+    A demotion sets banned=True. The market continues to appear in
+    boundary_testing exploration so recovery can be detected.
+    """
+    from database import MarketEligibilityOverride
+    from recommender import _normalize_market_key
+    from datetime import datetime, timezone
+
+    sport       = (body.get("sport") or "").strip().upper()
+    market_type = _normalize_market_key(body.get("market_type") or "")
+    reason      = body.get("reason") or ""
+    applied_by  = body.get("applied_by") or ""
+
+    if not sport or not market_type:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail="sport and market_type are required")
+
+    row = MarketEligibilityOverride(
+        sport       = sport,
+        market_type = market_type,
+        action      = "demote",
+        min_wp      = 999.0,   # effectively unreachable
+        priority    = 0.0,
+        banned      = True,
+        reason      = reason or "Manually demoted via API",
+        applied_at  = datetime.now(timezone.utc),
+        applied_by  = applied_by or "api",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    print(f"[market-demote] ({sport}, {market_type}) banned=True by={applied_by!r} reason={reason!r}")
+    return {
+        "status":      "demoted",
+        "sport":       sport,
+        "market_type": market_type,
+        "banned":      True,
+        "override_id": row.id,
+        "note":        "Banned from prospective generation. Still tracked in boundary_testing exploration.",
+    }
+
+
+@app.get("/api/exploration/market-overrides")
+def list_market_overrides(db: Session = Depends(get_db)):
+    """
+    List all active market eligibility overrides, most recent first.
+
+    Shows the history of promote/demote decisions. The latest override
+    per (sport, market_type) is what the recommender actually uses.
+    """
+    from database import MarketEligibilityOverride
+    rows = (
+        db.query(MarketEligibilityOverride)
+        .order_by(MarketEligibilityOverride.applied_at.desc())
+        .all()
+    )
+    return {
+        "overrides": [
+            {
+                "id":          r.id,
+                "sport":       r.sport,
+                "market_type": r.market_type,
+                "action":      r.action,
+                "min_wp":      r.min_wp,
+                "priority":    r.priority,
+                "banned":      r.banned,
+                "reason":      r.reason,
+                "applied_at":  r.applied_at.isoformat() if r.applied_at else None,
+                "applied_by":  r.applied_by,
+            }
+            for r in rows
+        ],
+        "total": len(rows),
+    }
+
+
+@app.post("/api/exploration/run-tiered")
+def run_tiered_exploration(
+    daily_target: int = 40,
+    game_date: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Manually trigger tiered exploration bet generation.
+
+    Called by the daily scheduler after morning prospective generation.
+    Can also be triggered manually for testing.
+    """
+    import mock_bets as _mb
+    result = _mb.generate_tiered_exploration_bets(db, game_date=game_date, daily_target=daily_target)
+    return {"status": "ok", **result}
 
 
 @app.get("/api/retrain-log")
@@ -2286,6 +3760,22 @@ def scheduler_jobs():
             "last_run_date": state.get("last_mlb_pitcher_fetch"),
             "next_run_utc":  _next_run_utc(7, state.get("last_mlb_pitcher_fetch"), 45),
             "status":        "ran_today" if state.get("last_mlb_pitcher_fetch") == today_ct else "pending",
+        },
+        {
+            "job_id":        "player_projections",
+            "name":          "Player projections (MLB/NBA/NHL — free APIs)",
+            "schedule_ct":   "08:00 CT",
+            "last_run_date": state.get("last_player_projections"),
+            "next_run_utc":  _next_run_utc(8, state.get("last_player_projections")),
+            "status":        "ran_today" if state.get("last_player_projections") == today_ct else "pending",
+        },
+        {
+            "job_id":        "weekly_retrain",
+            "name":          "Weekly model retraining (Sunday 3 AM CT)",
+            "schedule_ct":   "Sunday 03:00 CT",
+            "last_run_date": state.get("last_weekly_retrain"),
+            "last_result":   state.get("last_weekly_retrain_result"),
+            "status":        "ran_this_week" if state.get("last_weekly_retrain") == today_ct else "pending",
         },
         {
             "job_id":        "mock_generate",
@@ -4549,21 +6039,62 @@ def _run_mock_gen_background(req_stake: float, req_n_picks: int, req_max_legs: i
     from database import SessionLocal as _SL
     _bg_db = _SL()
     try:
-        _cached   = _get_cached_picks()
-        _tier_b   = _cached.get("tier_b", []) if _cached else []
-        result    = mb_module.generate_mock_bets(
-            _bg_db,
-            stake        = req_stake,
-            n_picks      = req_n_picks,
-            max_legs     = req_max_legs,
-            source       = req_source,
-            tier_b_picks = _tier_b,
-        )
-        expl = mb_module.generate_exploration_bets(_bg_db, run_id=result.get("run_id"))
-        result["exploration"] = expl
+        _cached = _get_cached_picks()
+
+        if req_source == "top_picks_page":
+            # Seed top_picks_page bets directly from the picks cache so the
+            # simulation tracks exactly what the user sees on the recommendations
+            # page — bypasses the prospective-source dedup that blocks regeneration.
+            # Stakes are 25% Kelly on $500 bankroll per pick.
+            _cache_picks = _cached.get("picks", []) if _cached else []
+            result = mb_module.seed_top_picks_mock_bets(
+                _cache_picks,
+                _bg_db,
+                kelly_fraction = 0.25,
+                bankroll       = 500.0,
+            )
+            expl = mb_module.generate_exploration_bets(_bg_db, run_id=result.get("run_id"))
+            result["exploration"] = expl
+            try:
+                tiered = mb_module.generate_tiered_exploration_bets(_bg_db, run_id=result.get("run_id"))
+                result["exploration_tiered"] = tiered
+            except Exception as _te:
+                result["exploration_tiered"] = {"error": str(_te)}
+        else:
+            _tier_b = _cached.get("tier_b", []) if _cached else []
+            result  = mb_module.generate_mock_bets(
+                _bg_db,
+                stake        = req_stake,
+                n_picks      = req_n_picks,
+                max_legs     = req_max_legs,
+                source       = req_source,
+                tier_b_picks = _tier_b,
+            )
+            expl = mb_module.generate_exploration_bets(_bg_db, run_id=result.get("run_id"))
+            result["exploration"] = expl
+            try:
+                tiered = mb_module.generate_tiered_exploration_bets(_bg_db, run_id=result.get("run_id"))
+                result["exploration_tiered"] = tiered
+            except Exception as _te:
+                result["exploration_tiered"] = {"error": str(_te)}
+
         _mock_gen_result = result
         _mock_gen_error  = None
         print(f"[mock-gen] background complete — generated={result.get('generated')} run_id={result.get('run_id')}")
+
+        # Backfill scout grades on legs created during this generation
+        try:
+            from placement import backfill_scout_grades_for_today
+            _bf = backfill_scout_grades_for_today()
+            if _bf:
+                result["scout_backfill_updated"] = _bf
+                print(f"[mock-gen] scout backfill: updated {_bf} legs")
+                # Rescore composites now that scout grades are attached
+                from placement import rescore_composites_for_today
+                _rc = rescore_composites_for_today()
+                result["composites_rescored"] = _rc.get("updated", 0)
+        except Exception as _bf_exc:
+            print(f"[mock-gen] scout backfill error: {_bf_exc}")
     except Exception as _e:
         import traceback as _tb
         _mock_gen_error  = str(_e)
@@ -4602,6 +6133,21 @@ def mock_bets_generate(
     return {"status": "started", "message": "Generation started in background. Poll /api/mock-bets/status (~2-4 min)."}
 
 
+@app.get("/api/mock-bets/top-picks-count")
+def mock_bets_top_picks_count(db: Session = Depends(get_db)):
+    """Return how many top_picks_page bets exist for today (CT)."""
+    from datetime import datetime, timezone
+    import pytz
+    _ct = pytz.timezone("US/Central")
+    today = datetime.now(_ct).strftime("%Y-%m-%d")
+    from sqlalchemy import text
+    row = db.execute(text(
+        "SELECT COUNT(*) FROM mock_bets "
+        "WHERE source = 'top_picks_page' AND game_date = :d"
+    ), {"d": today}).fetchone()
+    return {"count": row[0] if row else 0, "date": today}
+
+
 @app.get("/api/mock-bets/status")
 def mock_bets_gen_status():
     """
@@ -4630,6 +6176,20 @@ def mock_bets_settle(db: Session = Depends(get_db)):
     from datetime import datetime as _dt
     sched._scheduler_state["settle_last_ran_ct"] = _dt.now(_ZoneInfo("America/Chicago"))
     return result
+
+
+@app.post("/api/mock-bets/{bet_id}/manual-settle")
+def mock_bet_manual_settle(
+    bet_id: str,
+    home_score: int = Query(..., description="Final home team score"),
+    away_score: int = Query(..., description="Final away team score"),
+    db: Session = Depends(get_db),
+):
+    """
+    Manually settle a single PENDING bet by injecting the home/away final score.
+    Used for end-of-season playoff games that ESPN/OddsAPI no longer expose.
+    """
+    return mb_module.manual_settle_bet(db, bet_id, home_score, away_score)
 
 
 @app.post("/api/attribution/backfill-individual-resolution")
@@ -4663,6 +6223,7 @@ def backfill_individual_resolution(db: Session = Depends(get_db)):
             FROM   mock_bet_legs bl
             JOIN   mock_bets mb ON mb.id = bl.mock_bet_id
             WHERE  bl.leg_result IN ('WIN', 'LOSS')
+              AND  COALESCE(bl.excluded_from_metrics, 0) = 0
               AND  mb.game_date IS NOT NULL
               AND  mb.source IN (
                        'prospective', 'prospective_pm', 'top_picks_page',
@@ -4831,7 +6392,9 @@ def mock_bets_retroactive(req: RetroactiveBetRequest, db: Session = Depends(get_
 
 @app.get("/api/mock-bets/performance")
 def mock_bets_performance(
-    days: int = Query(30, ge=7, le=365),
+    days: int = Query(30, ge=1, le=365),
+    bet_category: Optional[str] = Query(None, description="'team' | 'player_prop' | omit for all"),
+    game_date: Optional[str] = Query(None, description="'YYYY-MM-DD' or 'today' — filter by game_date"),
     db: Session = Depends(get_db),
 ):
     """
@@ -4839,8 +6402,22 @@ def mock_bets_performance(
 
     Returns trust_level (VALIDATED / BUILDING / UNDERPERFORMING / INSUFFICIENT_DATA),
     daily trend, breakdowns by confidence / sport / model.
+    bet_category=team shows only team bets; bet_category=player_prop shows only prop bets.
+    game_date=today (or YYYY-MM-DD) filters to a single day instead of rolling window.
     """
-    return mb_module.get_mock_performance(db, days=days)
+    return mb_module.get_mock_performance(db, days=days, bet_category=bet_category,
+                                          game_date=game_date)
+
+
+@app.get("/api/mock-bets/leg-accuracy")
+def mock_bets_leg_accuracy(
+    days: int = Query(90, ge=1, le=365),
+    source: str = Query("simulation", description="'simulation', 'exploration', or 'prospective'"),
+    game_date: str = Query(None, description="Exact date filter: 'today', 'yesterday', or YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+):
+    """Per-leg win-rate breakdown by sport × market_type for the selected date window."""
+    return mb_module.get_leg_accuracy(db, days=days, source=source, game_date=game_date)
 
 
 @app.get("/api/mock-bets/line-quality")
@@ -4905,6 +6482,100 @@ def mock_bets_training_signal(
     # Don't return the full data array in the API — just the metadata
     result.pop("data", None)
     return result
+
+
+@app.get("/api/mock-bets/top-picks-calibration")
+def top_picks_calibration(
+    days: int = Query(30, ge=7, le=365),
+    db: Session = Depends(get_db),
+):
+    """
+    Calibration and validation signal for top_picks_page simulation bets.
+
+    Answers:
+      1. Parlay-level calibration — does predicted_win_prob predict outcomes?
+      2. Leg-level accuracy — does per-leg win_prob predict leg wins?
+      3. Min-leg-confidence vs parlay outcome correlation.
+      4. Kelly ROI by stake tier.
+
+    Returns bucketed calibration curves, Brier scores, and plain-English
+    interpretation. Data populates as top_picks_page bets settle over time.
+    """
+    return mb_module.get_top_picks_calibration(db, days=days)
+
+
+@app.get("/api/recommend/live-picks")
+def live_picks(
+    game_date: str = Query(None, description="YYYY-MM-DD, defaults to today CT"),
+    db: Session = Depends(get_db),
+):
+    """
+    Live bet recommendation endpoint.
+
+    Applies strict multi-signal filter to today's production picks and returns
+    the slate confidence, qualifying picks (max 5), and red flags.
+    """
+    return mb_module.apply_live_recommendation(db, game_date=game_date)
+
+
+@app.get("/api/recommend/live-picks/backtest")
+def live_picks_backtest(
+    days: int = Query(10, ge=3, le=60),
+    db: Session = Depends(get_db),
+):
+    """
+    Backtest the live filter over the last N days.
+
+    Shows per-day comparison: live-qualifying WR/P&L vs full-slate WR/P&L.
+    """
+    return mb_module.backtest_live_filter(db, days=days)
+
+
+@app.get("/api/mock-bets/pi-concentration")
+def pi_concentration_analysis(db: Session = Depends(get_db)):
+    """
+    Analysis of Pi-gated concentration flags.
+
+    Shows how many legs would have been filtered by Pi thresholds
+    and what their actual outcomes were.  Used to decide whether
+    to wire Pi filtering into live generation.
+    """
+    from sqlalchemy import text as _t
+    rows = db.execute(_t("""
+        SELECT would_have_filtered,
+               COUNT(*) as legs,
+               SUM(CASE WHEN leg_result='WIN' THEN 1 ELSE 0 END) as wins,
+               SUM(CASE WHEN leg_result='LOSS' THEN 1 ELSE 0 END) as losses,
+               ROUND(100.0 * SUM(CASE WHEN leg_result='WIN' THEN 1 ELSE 0 END) / COUNT(*), 1) as wr,
+               ROUND(AVG(pi_diff), 2) as avg_pi,
+               ROUND(AVG(n_bets_containing), 1) as avg_bets
+        FROM pi_concentration_flags
+        GROUP BY would_have_filtered
+        ORDER BY would_have_filtered
+    """)).fetchall()
+
+    total = db.execute(_t("SELECT COUNT(*) FROM pi_concentration_flags")).scalar() or 0
+
+    return {
+        "total_tracked": total,
+        "buckets": [
+            {
+                "filter": r[0],
+                "legs": r[1],
+                "wins": r[2],
+                "losses": r[3],
+                "win_rate": r[4],
+                "avg_pi_diff": r[5],
+                "avg_bets_containing": r[6],
+            }
+            for r in rows
+        ],
+        "recommendation": (
+            "Accumulate 50+ flagged legs before deciding to wire live."
+            if sum(r[1] for r in rows if r[0] != "none") < 50
+            else "Sufficient data — review win rates to decide."
+        ),
+    }
 
 
 class BackfillRequest(BaseModel):
@@ -4979,14 +6650,55 @@ def list_mock_bets(
     offset: int  = 0,
     status: Optional[str] = None,
     sort:   str  = Query("desc"),
+    bet_category: Optional[str] = Query(None, description="'team' | 'player_prop' | omit for all"),
+    bet_tier: Optional[str] = Query(None, description="'T1' | 'T2' | 'T3' | omit for all"),
+    source: Optional[str] = Query(None, description="Source filter: 'model' (prospective+pm+picks), 'exploration', 'simulation', 'retro', or exact source name. Omit for all."),
     db: Session = Depends(get_db),
 ):
-    """List mock bets with optional status filter and sort order (asc|desc, default desc)."""
+    """List mock bets with optional status/tier/source filter and sort order (asc|desc, default desc)."""
     from database import MockBet
     from database import MockBetLeg as _MBL
+    from sqlalchemy import text as _sqlt
     q = db.query(MockBet)
     if status:
         q = q.filter(MockBet.status == status)
+    if bet_tier:
+        q = q.filter(MockBet.bet_tier == bet_tier)
+    # Source filter — group aliases map to multiple source values
+    _SOURCE_GROUPS = {
+        "model":       ["prospective", "prospective_pm", "top_picks_page", "prospective_low_lqs",
+                        "prospective_legacy", "forced_generation"],
+        "exploration": ["exploration"],
+        "simulation":  ["simulation"],
+        "retro":       ["retroactive_mock"],
+        "shadow":      ["shadow_negbin", "shadow_negbin_fh", "shadow_negbin_excluded"],
+    }
+    if source:
+        src_list = _SOURCE_GROUPS.get(source)
+        if src_list:
+            q = q.filter(MockBet.source.in_(src_list))
+        else:
+            q = q.filter(MockBet.source == source)
+    if bet_category:
+        # Fetch matching IDs via raw SQL, then apply a WHERE EXISTS subquery
+        # instead of a giant IN(...) to avoid SQLite page errors.
+        matched_ids = [
+            row[0] for row in db.execute(
+                _sqlt("""
+                    SELECT mock_bet_id FROM mock_bet_legs
+                    GROUP BY mock_bet_id
+                    HAVING SUM(CASE WHEN COALESCE(bet_category,'team')=:cat THEN 1 ELSE 0 END)=COUNT(*)
+                """),
+                {"cat": bet_category},
+            )
+        ]
+        if not matched_ids:
+            q = q.filter(MockBet.id == None)  # empty result
+        else:
+            # Batch into chunks of 500 to keep IN clauses SQLite-safe
+            from sqlalchemy import or_
+            chunks = [matched_ids[i:i+500] for i in range(0, len(matched_ids), 500)]
+            q = q.filter(or_(*[MockBet.id.in_(chunk) for chunk in chunks]))
     if sort == "asc":
         q = q.order_by(MockBet.generated_at.asc())
     else:
@@ -5005,6 +6717,7 @@ def list_mock_bets(
             "market_type":    leg.market_type,
             "sport":          leg.sport,
             "win_prob":       leg.win_prob,
+            "open_odds":      leg.open_odds,
             "ale_considered": bool(leg.ale_considered),
             "ale_switched":   bool(leg.ale_switched),
             "ale_naive_pick": leg.ale_naive_pick,
@@ -5040,6 +6753,8 @@ def list_mock_bets(
                 "boost_strategy":     m.boost_strategy,
                 "promo_ev_lift":      m.promo_ev_lift,
                 "promo_boosted_odds": m.promo_boosted_odds,
+                "bet_tier":           m.bet_tier,
+                "composite_score":    m.composite_score,
                 "leg_details":        sorted(legs_by_bet.get(m.id, []), key=lambda x: x["leg_index"] or 0),
             }
             for m in rows
@@ -5694,6 +7409,103 @@ def submit_user_pick(req: UserPickRequest, db: Session = Depends(get_db)):
     }
 
 
+class PlaceFromMockRequest(BaseModel):
+    mock_bet_id: str
+    actual_odds_american: Optional[List[Optional[int]]] = None  # per-leg overrides
+    actual_stake: float = 10.0
+    book: str = "FanDuel"
+
+
+@app.post("/api/user-picks/place-from-mock")
+def place_from_mock(req: PlaceFromMockRequest, db: Session = Depends(get_db)):
+    """Create a user_pick from an existing mock bet — records actual placed odds/stake."""
+    from database import MockBet, MockBetLeg as _MBL
+    from zoneinfo import ZoneInfo as _ZI
+    from sqlalchemy import text as _sqlt
+
+    mock = db.query(MockBet).filter(MockBet.id == req.mock_bet_id).first()
+    if not mock:
+        raise HTTPException(status_code=404, detail="Mock bet not found")
+
+    mock_legs = (
+        db.query(_MBL)
+        .filter(_MBL.mock_bet_id == req.mock_bet_id)
+        .order_by(_MBL.leg_index)
+        .all()
+    )
+    if not mock_legs:
+        raise HTTPException(status_code=400, detail="Mock bet has no legs")
+
+    _CT_TZ = _ZI("America/Chicago")
+    _now = datetime.now(_CT_TZ)
+    _game_date = mock.game_date or _now.strftime("%Y-%m-%d")
+    pick_id = str(uuid.uuid4())
+
+    # Build legs — use actual_odds overrides if provided, else fall back to model odds
+    overrides = req.actual_odds_american or []
+    leg_objs = []
+    for i, ml in enumerate(mock_legs):
+        amer = overrides[i] if i < len(overrides) and overrides[i] is not None else ml.open_odds
+        dec = _american_to_decimal(amer) if amer else None
+        leg_objs.append(UserPickLeg(
+            user_pick_id  = pick_id,
+            leg_index     = i,
+            description   = ml.description,
+            sport         = ml.sport,
+            market_type   = ml.market_type,
+            team          = ml.resolved_home_team,
+            odds_american = amer,
+            odds_decimal  = dec,
+            point         = None,
+        ))
+
+    combined = 1.0
+    for lo in leg_objs:
+        if lo.odds_decimal:
+            combined *= lo.odds_decimal
+    combined = round(combined, 4)
+    potential = round(req.actual_stake * (combined - 1), 2) if combined > 1 else 0
+
+    pick = UserPick(
+        id              = pick_id,
+        submitted_at    = _now,
+        game_date       = _game_date,
+        bet_type        = mock.bet_type or "parlay",
+        stake           = req.actual_stake,
+        legs            = len(leg_objs),
+        combined_odds   = combined,
+        notes           = f"Placed from model T{mock.bet_tier or '?'} pick | book={req.book} | mock={req.mock_bet_id[:8]}",
+        status          = "PENDING",
+        potential_profit = potential,
+        ingestion_source = "user_placed_from_model",
+        bet_placed_at   = _now,
+    )
+    db.add(pick)
+    for lo in leg_objs:
+        db.add(lo)
+    db.flush()
+
+    # Store placed_mock_bet_id via raw SQL (column may not be on ORM yet)
+    try:
+        db.execute(_sqlt(
+            "UPDATE user_picks SET placed_mock_bet_id = :mid WHERE id = :pid"
+        ), {"mid": req.mock_bet_id, "pid": pick_id})
+    except Exception:
+        pass  # column may not exist yet on first run before restart
+
+    db.commit()
+
+    return {
+        "pick_id": pick_id,
+        "mock_bet_id": req.mock_bet_id,
+        "stake": req.actual_stake,
+        "combined_odds": combined,
+        "potential_profit": potential,
+        "book": req.book,
+        "legs": len(leg_objs),
+    }
+
+
 @app.get("/api/user-picks")
 def list_user_picks(
     date: Optional[str] = None,
@@ -5930,6 +7742,43 @@ def exploration_generate(db: Session = Depends(get_db)):
     """
     try:
         result = mb_module.generate_exploration_bets(db)
+        return {"status": "ok", **result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/mock-bets/exploration-tiered")
+def exploration_tiered(
+    game_date: Optional[str] = None,
+    daily_target: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Manually trigger tiered exploration bet generation (player props + new markets).
+    Safe to call multiple times — idempotent via bet_info dedup.
+    """
+    try:
+        result = mb_module.generate_tiered_exploration_bets(
+            db, game_date=game_date, daily_target=daily_target
+        )
+        return {"status": "ok", **result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/mock-bets/daily-sims")
+def daily_sims(
+    game_date: Optional[str] = None,
+    bets_per_game: int = 3,
+    db: Session = Depends(get_db),
+):
+    """
+    Generate full-slate simulation bets for every game today.
+    Covers all NBA/MLB/NHL games regardless of whether they made the main picks cut.
+    Safe to call multiple times — idempotent via bet_info dedup.
+    """
+    try:
+        result = mb_module.generate_daily_sims(db, game_date=game_date, bets_per_game=bets_per_game)
         return {"status": "ok", **result}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -7227,6 +9076,19 @@ def trigger_scout_run(db: Session = Depends(get_db)):
         except Exception:
             pass
 
+    # Backfill scout grades on legs created before scout data existed
+    try:
+        from placement import backfill_scout_grades_for_today
+        _bf = backfill_scout_grades_for_today()
+        if _bf:
+            result["scout_backfill_updated"] = _bf
+            # Rescore composites now that scout grades are attached
+            from placement import rescore_composites_for_today
+            _rc = rescore_composites_for_today()
+            result["composites_rescored"] = _rc.get("updated", 0)
+    except Exception:
+        pass
+
     # Update scheduler state
     try:
         import scheduler as _sched
@@ -7471,3 +9333,852 @@ def placement_parlay_suggestions(
 ):
     """Top A-grade props as a suggested parlay, with combined hit probability."""
     return _placement.get_parlay_suggestions(db, max_legs=max_legs)
+
+
+# ─── Validation Tracking ──────────────────────────────────────────────────────
+
+@app.get("/api/validation/summary")
+def validation_summary():
+    """Latest persisted snapshot from all four validation layers (no re-run)."""
+    import validation_tracker as _vt
+    return _vt.get_latest_validation_summary()
+
+
+@app.post("/api/validation/run")
+def validation_run(window_days: int = Query(30, ge=7, le=90)):
+    """Manually trigger all four validation layers and return fresh results."""
+    import validation_tracker as _vt
+    return _vt.run_all_validations(window_days=window_days)
+
+
+@app.get("/api/validation/scout")
+def validation_scout(window_days: int = Query(30, ge=7, le=90)):
+    """Scout prediction accuracy (per-grade WR and Brier score)."""
+    import validation_tracker as _vt
+    return _vt.validate_scout_predictions(window_days=window_days)
+
+
+@app.get("/api/validation/projections")
+def validation_projections(game_date: Optional[str] = Query(None)):
+    """
+    Player projection accuracy vs ESPN box scores.
+    game_date format: YYYY-MM-DD. Defaults to yesterday + today.
+    """
+    import validation_tracker as _vt
+    return _vt.validate_player_projections(game_date=game_date)
+
+
+@app.get("/api/validation/placement")
+def validation_placement(
+    since: Optional[str] = Query(None, description="Start date YYYY-MM-DD (default: 2026-05-16, post-calibration-fix)"),
+    window_days: Optional[int] = Query(None, ge=1, le=365, description="Alternative: last N days"),
+    bet_category: Optional[str] = Query(None, description="Filter: 'team' | 'player_prop' | omit for all"),
+):
+    """
+    ROI by source (placement rec_type proxy).
+    Default cutoff is 2026-05-16 (post win_prob scale + _ALT_MARKETS calibration fix).
+    Pass since=2026-01-01 to see pre-fix data for comparison.
+    bet_category=team shows only team bets; bet_category=player_prop shows only prop bets.
+    """
+    import validation_tracker as _vt
+    return _vt.validate_placement(since=since, window_days=window_days, bet_category=bet_category)
+
+
+@app.get("/api/validation/signal-agreement")
+def validation_signal_agreement(
+    window_days: int = Query(30, ge=7, le=90),
+    bet_category: Optional[str] = Query(None, description="Filter: 'team' | 'player_prop' | omit for all"),
+):
+    """Win rate by number of aligned prediction signals (0–3). Filter by bet_category for split view."""
+    import validation_tracker as _vt
+    return _vt.compute_signal_agreement(window_days=window_days, bet_category=bet_category)
+
+
+@app.get("/api/validation/scout-trajectory")
+def validation_scout_trajectory(lookback_runs: int = Query(10, ge=2, le=50)):
+    """Per-grade WR and Brier trend across the last N validation runs, vs targets."""
+    import validation_tracker as _vt
+    return _vt.get_scout_trajectory(lookback_runs=lookback_runs)
+
+
+@app.get("/api/validation/grade-drivers")
+def validation_grade_drivers(
+    grade: str = Query("B", description="Scout grade to analyse: A, B, C, or D"),
+    since: Optional[str] = Query(None, description="Start date YYYY-MM-DD (default: 2026-05-10)"),
+):
+    """
+    Per sport/market WR breakdown for a scout grade. Flags cells that
+    outperform or underperform the grade average by ≥10 points.
+    """
+    import validation_tracker as _vt
+    return _vt.analyze_grade_drivers(grade=grade, since=since)
+
+
+@app.get("/api/validation/scout-multipliers")
+def validation_scout_multipliers(db: Session = Depends(get_db)):
+    """
+    Current dynamic scout multipliers used in composite scoring, plus the
+    empirical data they're derived from.
+    """
+    import placement as _plc
+    dynamic = _plc.get_dynamic_scout_multipliers(db)
+    return {
+        "dynamic": dynamic,
+        "static_fallback": _plc._SCOUT_GRADE_MULTIPLIERS,
+        "using_dynamic": dynamic != _plc._SCOUT_GRADE_MULTIPLIERS,
+        "cache_ttl_seconds": _plc._DYNAMIC_SCOUT_MULT_TTL,
+        "min_n_for_trust": _plc._SCOUT_GRADE_MULT_MIN_N,
+    }
+
+
+@app.post("/api/fanduel/parse-screenshot")
+async def fanduel_parse_screenshot(
+    image: UploadFile = File(...),
+    game_date: Optional[str] = Form(default=None),
+):
+    """
+    Parse a single FanDuel bet slip screenshot.
+    Accepts multipart/form-data with:
+      image     — image file (PNG/JPG)
+      game_date — YYYY-MM-DD of the games (optional; defaults to today CT)
+
+    Returns parsed pick dict plus EXIF timestamp info:
+      bet_date, bet_time, timestamp_source ('exif'|'current'), timestamp_display
+    """
+    from zoneinfo import ZoneInfo as _ZI
+    _ct_tz = _ZI("America/Chicago")
+    now_ct = datetime.now(_ct_tz)
+
+    gdate = game_date or now_ct.strftime("%Y-%m-%d")
+
+    raw_bytes = await image.read()
+    mime = image.content_type or "image/png"
+
+    # Save to temp file for EXIF extraction
+    tmp_path = f"/tmp/fd_screenshot_{uuid.uuid4()}.img"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(raw_bytes)
+
+        # EXIF timestamp extraction
+        exif_dt = _extract_screenshot_timestamp(tmp_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    if exif_dt is not None:
+        timestamp_source = "exif"
+        bet_dt = exif_dt
+        timestamp_display = bet_dt.strftime("%-m/%-d/%Y") + " at " + bet_dt.strftime("%-I:%M %p") + " CT (from EXIF)"
+    else:
+        timestamp_source = "current"
+        bet_dt = now_ct.replace(tzinfo=None)
+        timestamp_display = "No EXIF timestamp — using current time: " + now_ct.strftime("%-m/%-d/%Y") + " at " + now_ct.strftime("%-I:%M %p") + " CT"
+
+    bet_date = bet_dt.strftime("%Y-%m-%d")
+    bet_time = bet_dt.strftime("%H:%M:%S")
+    # ISO string for datetime-local input (no timezone suffix)
+    timestamp_iso = bet_dt.strftime("%Y-%m-%dT%H:%M")
+
+    # ── Parse: free OCR path first, Claude vision as optional upgrade ────────────
+    has_api_key = bool(os.environ.get("ANTHROPIC_API_KEY", ""))
+
+    # Always run the free OCR parser — no key needed
+    result = fp.parse_screenshot_free(raw_bytes, game_date=gdate)
+
+    # If OCR found no legs AND the Anthropic key is available, upgrade to Claude
+    if not result.get("parsed_legs") and has_api_key:
+        claude_result = fp.parse_screenshot(raw_bytes, mime_type=mime, game_date=gdate)
+        if "error" not in claude_result:
+            claude_result["parse_method"] = "anthropic_vision"
+            result = claude_result
+        # else: stick with the empty OCR result
+
+    # If OCR found no legs AND no API key, surface a clear warning (not an error)
+    if not result.get("parsed_legs") and not has_api_key:
+        result["warnings"] = result.get("warnings", []) + [
+            "OCR could not extract bet details from this image. "
+            "Review the raw_text field and enter legs manually. "
+            "Set ANTHROPIC_API_KEY for automatic vision parsing."
+        ]
+
+    result["bet_date"] = bet_date
+    result["bet_time"] = bet_time
+    result["timestamp_source"] = timestamp_source
+    result["timestamp_display"] = timestamp_display
+    result["timestamp_iso"] = timestamp_iso
+
+    return result
+
+
+# ─── NegBin Shadow Tracker ────────────────────────────────────────────────────
+
+_NEGBIN_ODDS_BANDS = [
+    ("1.3-1.7x", 1.3, 1.7),
+    ("1.7-2.2x", 1.7, 2.2),
+    ("2.2-2.8x", 2.2, 2.8),
+    ("2.8-3.5x", 2.8, 3.5),
+    ("3.5-5.0x", 3.5, 5.0),
+]
+
+_NEGBIN_CELL_ADJ = {
+    "fav_away": 1.10,
+    "dog_home": 0.70,
+    "fav_home": 1.00,
+    "dog_away": 1.00,
+}
+
+_NEGBIN_CELL_LABELS = {
+    "fav_away": "Fav @ Away",
+    "dog_home": "Dog @ Home",
+    "fav_home": "Fav @ Home",
+    "dog_away": "Dog @ Away",
+}
+
+_NEGBIN_STAKE = 10.0
+
+
+def _negbin_db_connect():
+    import sqlite3 as _sq3
+    from database import DB_PATH
+    con = _sq3.connect(DB_PATH, timeout=15)
+    con.row_factory = _sq3.Row
+    return con
+
+
+def _negbin_is_won(leg_results_str: str | None) -> bool | None:
+    """Return True if all legs are WIN, False if any leg is LOSS, None if pending."""
+    if not leg_results_str:
+        return None
+    results = [r.strip() for r in leg_results_str.split(",") if r.strip()]
+    if not results:
+        return None
+    if any(r == "LOSS" for r in results):
+        return False
+    if all(r == "WIN" for r in results):
+        return True
+    return None  # pending / mixed
+
+
+def _negbin_parlay_status(leg_results_str: str | None) -> str:
+    won = _negbin_is_won(leg_results_str)
+    if won is True:
+        return "WON"
+    if won is False:
+        return "LOST"
+    return "PENDING"
+
+
+def _negbin_pnl(won: bool | None, odds: float) -> float | None:
+    if won is True:
+        return round((_NEGBIN_STAKE * odds) - _NEGBIN_STAKE, 4)
+    if won is False:
+        return round(-_NEGBIN_STAKE, 4)
+    return None
+
+
+def _negbin_band_for_odds(odds: float) -> str | None:
+    for label, lo, hi in _NEGBIN_ODDS_BANDS:
+        if lo <= odds < hi:
+            return label
+    return None
+
+
+def _negbin_quality(eff_n: float) -> str:
+    if eff_n >= 30:
+        return "RELIABLE"
+    if eff_n >= 10:
+        return "DIRECTIONAL"
+    return "TOO THIN"
+
+
+def _negbin_cohort_filter(cohort: str) -> str:
+    if cohort == "clean":
+        return "AND mb.cohort = 'clean'"
+    if cohort == "prospective_legacy":
+        return "AND mb.cohort = 'prospective_legacy'"
+    return ""  # "all" — no filter
+
+
+def _negbin_view_filter(view: str) -> str:
+    """Filter for measurement (all) vs live-realistic (only live_realistic=1) view."""
+    if view == "live_realistic":
+        return "AND mb.live_realistic = 1"
+    return ""  # "measurement" — no filter, show all
+
+
+@app.get("/api/negbin/tracker")
+def negbin_tracker(
+    days: int = Query(30, ge=1, le=365),
+    cohort: str = Query("clean"),
+    view: str = Query("measurement"),
+):
+    """
+    Comprehensive NegBin shadow pipeline tracker.
+    Returns band-for-band stats, 2x2 cell performance, parlay structure,
+    daily stats, per-parlay drill-down, and overall status.
+    """
+    import sqlite3 as _sq3
+    from collections import defaultdict as _dd
+
+    cohort_filter = _negbin_cohort_filter(cohort)
+    view_filter = _negbin_view_filter(view)
+
+    con = _negbin_db_connect()
+    cur = con.cursor()
+
+    # ── 1. Fetch all NegBin shadow bets in the window ────────────────────────
+    nb_sql = f"""
+        SELECT mb.id, mb.odds, mb.negbin_odds_band, mb.status, mb.game_date,
+               mb.legs, mb.negbin_leg_count, mb.predicted_win_prob,
+               mb.composite_score, mb.negbin_cell_adj, mb.cohort,
+               mb.live_realistic,
+               GROUP_CONCAT(mbl.leg_result, ',')     AS leg_results,
+               GROUP_CONCAT(mbl.fixture_id, ',')     AS fixture_ids,
+               GROUP_CONCAT(mbl.description, '||')   AS leg_descs,
+               GROUP_CONCAT(mbl.negbin_cell, ',')    AS leg_cells,
+               GROUP_CONCAT(mbl.negbin_wp, ',')      AS leg_negbin_wps,
+               GROUP_CONCAT(mbl.negbin_mu_home, ',') AS leg_mu_homes,
+               GROUP_CONCAT(mbl.negbin_mu_away, ',') AS leg_mu_aways,
+               GROUP_CONCAT(mbl.negbin_edge_pp, ',') AS leg_edge_pps,
+               GROUP_CONCAT(mbl.predicted_win_prob, ',') AS leg_pred_wps,
+               GROUP_CONCAT(mbl.market_type, ',')    AS leg_market_types,
+               GROUP_CONCAT(mbl.sport, ',')          AS leg_sports
+        FROM mock_bets mb
+        JOIN mock_bet_legs mbl ON mbl.mock_bet_id = mb.id
+        WHERE mb.source = 'shadow_negbin'
+          AND mb.game_date >= date('now', '-' || ? || ' days')
+          {cohort_filter}
+          {view_filter}
+        GROUP BY mb.id
+        ORDER BY mb.game_date DESC, mb.id
+    """
+    cur.execute(nb_sql, (days,))
+    nb_rows = [dict(r) for r in cur.fetchall()]
+
+    # ── 2. Fetch ATS comparison bets (same window, MLB only) ─────────────────
+    ats_sql = """
+        SELECT mb.id, mb.odds, mb.negbin_odds_band, mb.status, mb.game_date,
+               mb.legs,
+               GROUP_CONCAT(mbl.leg_result, ',') AS leg_results
+        FROM mock_bets mb
+        JOIN mock_bet_legs mbl ON mbl.mock_bet_id = mb.id
+        WHERE mb.source IN ('prospective', 'prospective_pm')
+          AND mb.sport = 'MLB'
+          AND mb.game_date >= date('now', '-' || ? || ' days')
+        GROUP BY mb.id
+    """
+    cur.execute(ats_sql, (days,))
+    ats_rows = [dict(r) for r in cur.fetchall()]
+
+    # ── 3. Fetch full leg details for per-parlay list ─────────────────────────
+    leg_detail_sql = f"""
+        SELECT mbl.mock_bet_id, mbl.description, mbl.negbin_wp, mbl.negbin_mu_home,
+               mbl.negbin_mu_away, mbl.negbin_cell, mbl.negbin_edge_pp,
+               mbl.predicted_win_prob, mbl.leg_result, mbl.market_type, mbl.sport,
+               mbl.fixture_id
+        FROM mock_bet_legs mbl
+        JOIN mock_bets mb ON mb.id = mbl.mock_bet_id
+        WHERE mb.source = 'shadow_negbin'
+          AND mb.game_date >= date('now', '-' || ? || ' days')
+          {cohort_filter}
+          {view_filter}
+        ORDER BY mbl.id
+    """
+    cur.execute(leg_detail_sql, (days,))
+    all_leg_details = [dict(r) for r in cur.fetchall()]
+    con.close()
+
+    # Index leg details by parlay id
+    legs_by_parlay: dict = _dd(list)
+    for leg in all_leg_details:
+        legs_by_parlay[leg["mock_bet_id"]].append(leg)
+
+    # ── 4. Band-for-band analysis ─────────────────────────────────────────────
+    # Group NegBin bets by band
+    nb_by_band: dict = _dd(list)
+    for row in nb_rows:
+        band = row.get("negbin_odds_band") or _negbin_band_for_odds(row.get("odds") or 0.0)
+        if band:
+            nb_by_band[band].append(row)
+
+    # Group ATS bets by band (use stored band if available, else derive from odds)
+    ats_by_band: dict = _dd(list)
+    for row in ats_rows:
+        band = row.get("negbin_odds_band") or _negbin_band_for_odds(row.get("odds") or 0.0)
+        if band:
+            ats_by_band[band].append(row)
+
+    def _band_stats(rows: list) -> dict:
+        """Compute win/pnl stats for a list of parlay rows."""
+        n = len(rows)
+        wins = 0
+        total_pnl = 0.0
+        total_odds = 0.0
+        for r in rows:
+            won = _negbin_is_won(r.get("leg_results"))
+            pnl = _negbin_pnl(won, r.get("odds") or 1.0)
+            if pnl is not None:
+                total_pnl += pnl
+            if won is True:
+                wins += 1
+            total_odds += r.get("odds") or 0.0
+        wr = round(wins / n * 100, 2) if n else None
+        roi = round(total_pnl / (n * _NEGBIN_STAKE) * 100, 2) if n else None
+        avg_odds = round(total_odds / n, 4) if n else None
+        breakeven = round(1 / avg_odds * 100, 2) if avg_odds else None
+        edge = round(wr - breakeven, 2) if (wr is not None and breakeven is not None) else None
+        return {
+            "n": n, "wins": wins, "wr": wr, "pnl": round(total_pnl, 4),
+            "roi": roi, "avg_odds": avg_odds, "breakeven": breakeven, "edge": edge,
+        }
+
+    def _leg_reuse(rows: list, game_date: str | None = None) -> tuple:
+        """Return (raw_n, avg_reuse, eff_n) for a list of parlay rows."""
+        # Track leg appearances using date:description as key
+        leg_appearances: dict = _dd(int)
+        for r in rows:
+            gd = r.get("game_date", "")
+            descs = (r.get("leg_descs") or "").split("||")
+            for d in descs:
+                d = d.strip()
+                if d:
+                    leg_appearances[f"{gd}:{d}"] += 1
+        raw_n = len(rows)
+        distinct = len(leg_appearances)
+        total_appearances = sum(leg_appearances.values())
+        avg_reuse = round(total_appearances / distinct, 4) if distinct else 1.0
+        eff_n = round(raw_n / avg_reuse, 2) if avg_reuse else float(raw_n)
+        return raw_n, avg_reuse, eff_n
+
+    def _by_legs_split(rows: list) -> list:
+        """Split parlay rows by leg count and compute stats per count."""
+        by_legs: dict = _dd(list)
+        for r in rows:
+            lc = r.get("negbin_leg_count") or r.get("legs") or 0
+            by_legs[int(lc)].append(r)
+        result = []
+        for lc in sorted(by_legs.keys()):
+            rs = by_legs[lc]
+            s = _band_stats(rs)
+            result.append({
+                "legs": lc,
+                "n": s["n"], "wins": s["wins"], "wr": s["wr"],
+                "edge": s["edge"],
+                "comparable": s["n"] >= 5,
+            })
+        return result
+
+    bands_out = []
+    nb_total_n = nb_total_wins = 0
+    nb_total_pnl = 0.0
+    ats_total_n = ats_total_wins = 0
+    ats_total_pnl = 0.0
+
+    for band_label, lo, hi in _NEGBIN_ODDS_BANDS:
+        nb_rows_band = nb_by_band.get(band_label, [])
+        ats_rows_band = ats_by_band.get(band_label, [])
+
+        nb_s = _band_stats(nb_rows_band)
+        ats_s = _band_stats(ats_rows_band)
+
+        raw_n, avg_reuse, eff_n = _leg_reuse(nb_rows_band)
+        quality = _negbin_quality(eff_n)
+
+        nb_vs_ats_edge = None
+        if nb_s["edge"] is not None and ats_s["edge"] is not None:
+            nb_vs_ats_edge = round(nb_s["edge"] - ats_s["edge"], 2)
+
+        # Underfill diagnostic
+        underfill_reason = None
+        if nb_s["n"] < 10 and nb_s["n"] > 0:
+            underfill_reason = "LEG_CONSUMPTION"
+        elif nb_s["n"] == 0:
+            underfill_reason = "NO_CONSTRUCTABLE"
+
+        nb_total_n += nb_s["n"]
+        nb_total_wins += nb_s["wins"]
+        nb_total_pnl += nb_s["pnl"]
+        ats_total_n += ats_s["n"]
+        ats_total_wins += ats_s["wins"]
+        ats_total_pnl += ats_s["pnl"]
+
+        bands_out.append({
+            "band": band_label, "lo": lo, "hi": hi,
+            # NegBin shadow
+            "nb_n": nb_s["n"],
+            "nb_wins": nb_s["wins"],
+            "nb_wr": nb_s["wr"],
+            "nb_pnl": nb_s["pnl"],
+            "nb_roi": nb_s["roi"],
+            "nb_avg_odds": nb_s["avg_odds"],
+            "nb_breakeven": nb_s["breakeven"],
+            "nb_edge": nb_s["edge"],
+            # Effective N
+            "nb_raw_n": raw_n,
+            "nb_avg_reuse": avg_reuse,
+            "nb_eff_n": eff_n,
+            "nb_quality": quality,
+            # ATS baseline
+            "ats_n": ats_s["n"],
+            "ats_wins": ats_s["wins"],
+            "ats_wr": ats_s["wr"],
+            "ats_pnl": ats_s["pnl"],
+            "ats_roi": ats_s["roi"],
+            "ats_edge": ats_s["edge"],
+            # Delta
+            "nb_vs_ats_edge": nb_vs_ats_edge,
+            # Leg count split
+            "by_legs": _by_legs_split(nb_rows_band),
+            # Underfill diagnostic
+            "underfill_reason": underfill_reason,
+        })
+
+    # Band totals
+    nb_total_wr = round(nb_total_wins / nb_total_n * 100, 2) if nb_total_n else None
+    nb_total_roi = round(nb_total_pnl / (nb_total_n * _NEGBIN_STAKE) * 100, 2) if nb_total_n else None
+    ats_total_wr = round(ats_total_wins / ats_total_n * 100, 2) if ats_total_n else None
+    ats_total_roi = round(ats_total_pnl / (ats_total_n * _NEGBIN_STAKE) * 100, 2) if ats_total_n else None
+
+    # ── 5. 2×2 Cell performance ───────────────────────────────────────────────
+    cell_stats: dict = _dd(lambda: {"n": 0, "wins": 0, "pnl": 0.0, "odds_sum": 0.0})
+    for r in nb_rows:
+        won = _negbin_is_won(r.get("leg_results"))
+        pnl = _negbin_pnl(won, r.get("odds") or 1.0)
+        # Determine dominant cell from leg cells
+        cells_str = r.get("leg_cells") or ""
+        leg_cells = [c.strip() for c in cells_str.split(",") if c.strip()]
+        if not leg_cells:
+            continue
+        # Use most common cell as the parlay's cell
+        from collections import Counter as _Counter
+        cell = _Counter(leg_cells).most_common(1)[0][0]
+        cell_stats[cell]["n"] += 1
+        if won is True:
+            cell_stats[cell]["wins"] += 1
+        if pnl is not None:
+            cell_stats[cell]["pnl"] += pnl
+        cell_stats[cell]["odds_sum"] += r.get("odds") or 0.0
+
+    cells_out = []
+    for cell_key in ["fav_away", "dog_home", "fav_home", "dog_away"]:
+        cs = cell_stats[cell_key]
+        n = cs["n"]
+        wins = cs["wins"]
+        pnl = round(cs["pnl"], 4)
+        wr = round(wins / n * 100, 2) if n else None
+        roi = round(pnl / (n * _NEGBIN_STAKE) * 100, 2) if n else None
+        avg_odds = round(cs["odds_sum"] / n, 4) if n else None
+        breakeven = round(1 / avg_odds * 100, 2) if avg_odds else None
+        edge = round(wr - breakeven, 2) if (wr is not None and breakeven is not None) else None
+        adj = _NEGBIN_CELL_ADJ.get(cell_key, 1.0)
+        adj_pct = int(round((adj - 1.0) * 100))
+        adj_label = f"+{adj_pct}%" if adj_pct >= 0 else f"{adj_pct}%"
+        cells_out.append({
+            "cell": cell_key,
+            "label": _NEGBIN_CELL_LABELS.get(cell_key, cell_key),
+            "n": n, "wins": wins, "wr": wr, "roi": roi, "edge": edge,
+            "cell_adj": adj,
+            "adj_label": adj_label,
+        })
+
+    # ── 6. Parlay structure ───────────────────────────────────────────────────
+    leg_count_dist: dict = _dd(int)
+    for r in nb_rows:
+        lc = int(r.get("negbin_leg_count") or r.get("legs") or 0)
+        leg_count_dist[lc] += 1
+
+    total_parlays = len(nb_rows)
+    leg_distribution = []
+    for lc in sorted(leg_count_dist.keys()):
+        cnt = leg_count_dist[lc]
+        pct = round(cnt / total_parlays * 100, 1) if total_parlays else 0.0
+        leg_distribution.append({
+            "legs": lc,
+            "n": cnt,
+            "pct": pct,
+            "validated": cnt >= 5,
+        })
+
+    # Reuse histogram: count how many distinct legs appear N times
+    all_leg_app: dict = _dd(int)
+    for r in nb_rows:
+        gd = r.get("game_date", "")
+        descs = (r.get("leg_descs") or "").split("||")
+        for d in descs:
+            d = d.strip()
+            if d:
+                all_leg_app[f"{gd}:{d}"] += 1
+    reuse_histogram: dict = _dd(int)
+    for key, cnt in all_leg_app.items():
+        reuse_histogram[cnt] += 1
+    # Sort by appearance count
+    reuse_histogram_out = {str(k): v for k, v in sorted(reuse_histogram.items())}
+
+    # Parlays at max reuse cap (appear in 3+ parlays)
+    at_cap = sum(1 for cnt in all_leg_app.values() if cnt >= 3)
+    total_distinct_legs = len(all_leg_app)
+
+    # Underfill by band
+    underfill_by_band = []
+    for band_obj in bands_out:
+        if band_obj["nb_n"] < 10:
+            underfill_by_band.append({
+                "band": band_obj["band"],
+                "target": 10,
+                "filled": band_obj["nb_n"],
+                "reason": band_obj["underfill_reason"],
+                "available_combos": None,  # runtime computation not available here
+            })
+
+    structure_out = {
+        "leg_distribution": leg_distribution,
+        "reuse_histogram": reuse_histogram_out,
+        "at_cap": at_cap,
+        "total_distinct_legs": total_distinct_legs,
+        "underfill_by_band": underfill_by_band,
+    }
+
+    # ── 7. Daily stats ────────────────────────────────────────────────────────
+    daily_map: dict = _dd(lambda: {"generated": 0, "settled": 0, "pending": 0,
+                                    "pnl": 0.0, "wins": 0, "n_settled": 0,
+                                    "covered": 0, "total": 0})
+    for r in nb_rows:
+        gd = r.get("game_date", "unknown")
+        won = _negbin_is_won(r.get("leg_results"))
+        pnl = _negbin_pnl(won, r.get("odds") or 1.0)
+        daily_map[gd]["generated"] += 1
+        daily_map[gd]["total"] += 1
+        if won is not None:
+            daily_map[gd]["settled"] += 1
+            daily_map[gd]["n_settled"] += 1
+            if pnl is not None:
+                daily_map[gd]["pnl"] += pnl
+            if won is True:
+                daily_map[gd]["wins"] += 1
+        else:
+            daily_map[gd]["pending"] += 1
+        # Coverage: does the parlay have all fixture_ids populated?
+        fids = r.get("fixture_ids") or ""
+        fid_list = [f for f in fids.split(",") if f.strip()]
+        leg_cnt = int(r.get("negbin_leg_count") or r.get("legs") or 1)
+        if len(fid_list) >= leg_cnt:
+            daily_map[gd]["covered"] += 1
+
+    daily_out = []
+    for gd in sorted(daily_map.keys(), reverse=True):
+        dm = daily_map[gd]
+        ns = dm["n_settled"]
+        wr = round(dm["wins"] / ns * 100, 2) if ns else None
+        cov = round(dm["covered"] / dm["total"] * 100, 1) if dm["total"] else 0.0
+        daily_out.append({
+            "date": gd,
+            "generated": dm["generated"],
+            "settled": dm["settled"],
+            "pending": dm["pending"],
+            "pnl": round(dm["pnl"], 4),
+            "wr": wr,
+            "coverage_pct": cov,
+        })
+
+    # ── 8. Per-parlay list ────────────────────────────────────────────────────
+    parlays_out = []
+    for r in nb_rows:
+        won = _negbin_is_won(r.get("leg_results"))
+        pnl = _negbin_pnl(won, r.get("odds") or 1.0)
+        status = _negbin_parlay_status(r.get("leg_results"))
+
+        # Build leg list from detailed query
+        leg_details = legs_by_parlay.get(r["id"], [])
+        legs_out = []
+        for leg in leg_details:
+            legs_out.append({
+                "description": leg.get("description"),
+                "negbin_wp": leg.get("negbin_wp"),
+                "negbin_mu_home": leg.get("negbin_mu_home"),
+                "negbin_mu_away": leg.get("negbin_mu_away"),
+                "negbin_cell": leg.get("negbin_cell"),
+                "negbin_edge_pp": leg.get("negbin_edge_pp"),
+                "predicted_wp": leg.get("predicted_win_prob"),
+                "leg_result": leg.get("leg_result"),
+                "market_type": leg.get("market_type"),
+                "sport": leg.get("sport"),
+                "fixture_id": leg.get("fixture_id"),
+            })
+
+        parlays_out.append({
+            "id": r["id"],
+            "game_date": r.get("game_date"),
+            "odds": r.get("odds"),
+            "band": r.get("negbin_odds_band") or _negbin_band_for_odds(r.get("odds") or 0.0),
+            "status": status,
+            "cohort": r.get("cohort"),
+            "win_prob": r.get("predicted_win_prob"),
+            "composite": r.get("composite_score"),
+            "leg_count": int(r.get("negbin_leg_count") or r.get("legs") or 0),
+            "cell_adj": r.get("negbin_cell_adj"),
+            "pnl": pnl,
+            "legs": legs_out,
+        })
+
+    # ── 9. Overall status ─────────────────────────────────────────────────────
+    settled_count = sum(1 for r in nb_rows if _negbin_is_won(r.get("leg_results")) is not None)
+    pending_count = len(nb_rows) - settled_count
+    status_label = "EVALUABLE" if settled_count >= 50 else "COLLECTING"
+
+    # First clean date
+    clean_rows = [r for r in nb_rows if r.get("cohort") == "clean"]
+    first_clean_date = None
+    days_since_start = None
+    if clean_rows:
+        dates = [r.get("game_date") for r in clean_rows if r.get("game_date")]
+        if dates:
+            first_clean_date = min(dates)
+            try:
+                from datetime import date as _date, timedelta as _td
+                fd = _date.fromisoformat(first_clean_date)
+                days_since_start = (_date.today() - fd).days
+            except Exception:
+                pass
+
+    # ── Fav@Home carve-out stats ─────────────────────────────────────────────
+    fh_out = None
+    try:
+        con2 = _negbin_db_connect()
+        cur2 = con2.cursor()
+        fh_sql = f"""
+            SELECT mb.id, mb.odds, mb.status, mb.negbin_odds_band, mb.game_date,
+                   GROUP_CONCAT(mbl.leg_result, ',') AS leg_results,
+                   GROUP_CONCAT(mbl.negbin_cell, ',') AS leg_cells,
+                   GROUP_CONCAT(mbl.description, '||') AS leg_descs
+            FROM mock_bets mb
+            JOIN mock_bet_legs mbl ON mbl.mock_bet_id = mb.id
+            WHERE mb.source = 'shadow_negbin_fh'
+              AND mb.game_date >= date('now', '-' || ? || ' days')
+            GROUP BY mb.id
+        """
+        cur2.execute(fh_sql, (days,))
+        fh_rows = [dict(r) for r in cur2.fetchall()]
+        con2.close()
+
+        if fh_rows:
+            fh_n = len(fh_rows)
+            fh_wins = sum(1 for r in fh_rows if _negbin_is_won(r.get("leg_results")) is True)
+            fh_settled = sum(1 for r in fh_rows if _negbin_is_won(r.get("leg_results")) is not None)
+            fh_pending = fh_n - fh_settled
+            fh_pnl = sum(_negbin_pnl(_negbin_is_won(r.get("leg_results")), r.get("odds") or 1.0) or 0
+                         for r in fh_rows)
+            fh_wr = round(fh_wins / fh_settled * 100, 2) if fh_settled else None
+            fh_roi = round(fh_pnl / (fh_settled * _NEGBIN_STAKE) * 100, 2) if fh_settled else None
+            fh_out = {
+                "n": fh_n, "settled": fh_settled, "pending": fh_pending,
+                "wins": fh_wins, "wr": fh_wr, "pnl": round(fh_pnl, 4), "roi": fh_roi,
+            }
+    except Exception:
+        pass
+
+    return {
+        "filters": {"days": days, "cohort": cohort, "view": view},
+        "bands": bands_out,
+        "nb_total": {
+            "n": nb_total_n, "wins": nb_total_wins,
+            "wr": nb_total_wr,
+            "pnl": round(nb_total_pnl, 4),
+            "roi": nb_total_roi,
+        },
+        "ats_total": {
+            "n": ats_total_n, "wins": ats_total_wins,
+            "wr": ats_total_wr,
+            "pnl": round(ats_total_pnl, 4),
+            "roi": ats_total_roi,
+        },
+        "cells": cells_out,
+        "structure": structure_out,
+        "daily": daily_out,
+        "parlays": parlays_out,
+        "fav_home_carveout": fh_out,
+        "status": status_label,
+        "settled_count": settled_count,
+        "pending_count": pending_count,
+        "first_clean_date": first_clean_date,
+        "days_since_start": days_since_start,
+    }
+
+
+@app.get("/api/negbin/parlay/{parlay_id}")
+def negbin_parlay_detail(parlay_id: str):
+    """
+    Full details for a single NegBin shadow parlay.
+    Returns the same shape as a parlays[] item in /api/negbin/tracker.
+    """
+    import sqlite3 as _sq3
+
+    con = _negbin_db_connect()
+    cur = con.cursor()
+
+    # Fetch the parlay header
+    cur.execute("""
+        SELECT mb.id, mb.odds, mb.negbin_odds_band, mb.status, mb.game_date,
+               mb.legs, mb.negbin_leg_count, mb.predicted_win_prob,
+               mb.composite_score, mb.negbin_cell_adj, mb.cohort,
+               GROUP_CONCAT(mbl.leg_result, ',') AS leg_results
+        FROM mock_bets mb
+        JOIN mock_bet_legs mbl ON mbl.mock_bet_id = mb.id
+        WHERE mb.id = ?
+          AND mb.source = 'shadow_negbin'
+        GROUP BY mb.id
+    """, (parlay_id,))
+    row = cur.fetchone()
+    if not row:
+        con.close()
+        raise HTTPException(status_code=404, detail=f"NegBin parlay '{parlay_id}' not found")
+
+    r = dict(row)
+
+    # Fetch full leg details
+    cur.execute("""
+        SELECT description, negbin_wp, negbin_mu_home, negbin_mu_away,
+               negbin_cell, negbin_edge_pp, predicted_win_prob,
+               leg_result, market_type, sport, fixture_id
+        FROM mock_bet_legs
+        WHERE mock_bet_id = ?
+        ORDER BY id
+    """, (parlay_id,))
+    leg_rows = [dict(lg) for lg in cur.fetchall()]
+    con.close()
+
+    won = _negbin_is_won(r.get("leg_results"))
+    pnl = _negbin_pnl(won, r.get("odds") or 1.0)
+    status = _negbin_parlay_status(r.get("leg_results"))
+
+    legs_out = [
+        {
+            "description": lg.get("description"),
+            "negbin_wp": lg.get("negbin_wp"),
+            "negbin_mu_home": lg.get("negbin_mu_home"),
+            "negbin_mu_away": lg.get("negbin_mu_away"),
+            "negbin_cell": lg.get("negbin_cell"),
+            "negbin_edge_pp": lg.get("negbin_edge_pp"),
+            "predicted_wp": lg.get("predicted_win_prob"),
+            "leg_result": lg.get("leg_result"),
+            "market_type": lg.get("market_type"),
+            "sport": lg.get("sport"),
+            "fixture_id": lg.get("fixture_id"),
+        }
+        for lg in leg_rows
+    ]
+
+    return {
+        "id": r["id"],
+        "game_date": r.get("game_date"),
+        "odds": r.get("odds"),
+        "band": r.get("negbin_odds_band") or _negbin_band_for_odds(r.get("odds") or 0.0),
+        "status": status,
+        "cohort": r.get("cohort"),
+        "win_prob": r.get("predicted_win_prob"),
+        "composite": r.get("composite_score"),
+        "leg_count": int(r.get("negbin_leg_count") or r.get("legs") or 0),
+        "cell_adj": r.get("negbin_cell_adj"),
+        "pnl": pnl,
+        "legs": legs_out,
+    }

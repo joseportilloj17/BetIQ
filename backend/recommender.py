@@ -36,8 +36,12 @@ _MODEL_LABEL = {
 _DEFAULT_MODEL_LABEL = "combined_v1"
 
 # ── Sub-model AUC (used to scale Kelly fraction) ──────────────────────────────
-# Higher AUC → more edge → higher fractional Kelly.
-# Fractions: NHL 0.35 (AUC 0.6372), MLB 0.25 (AUC 0.5509), combined 0.30 (AUC 0.5972)
+# Quarter Kelly (0.25) applied universally — chosen for:
+#   • Probability estimates still carry measurable error (per-leg Brier ~0.24)
+#   • Drawdown variance reduction vs Half Kelly
+#   • Preserves ~93% of growth rate of Half Kelly at typical edge levels
+#   • Standard for professional sports bettors with sustained but unproven edge
+# AUC is tracked for model evaluation but no longer gates Kelly fraction.
 _SUBMODEL_AUC = {
     "NHL":          0.7544,   # retrained 2026-04-21 (was 0.6372)
     "MLB":          0.6360,   # retrained 2026-04-21 (was 0.5509)
@@ -47,19 +51,196 @@ _SUBMODEL_AUC = {
 }
 _COMBINED_AUC = 0.5972
 _SUBMODEL_KELLY_FRACTION = {
-    "NHL":          0.45,   # scaled up with AUC 0.7544
-    "MLB":          0.35,   # scaled up with AUC 0.6360
-    "Soccer":       0.25,   # conservative — soccer first-gen model (AUC ~0.554)
+    "NHL":          0.25,   # Quarter Kelly — universal cap (was 0.45)
+    "MLB":          0.25,   # Quarter Kelly — universal cap (was 0.35)
+    "Soccer":       0.25,   # Quarter Kelly
     "soccer_total_v1": 0.25,
     "soccer_ml_v1":    0.25,
 }
-_DEFAULT_KELLY_FRACTION = 0.30
+_DEFAULT_KELLY_FRACTION = 0.25   # Quarter Kelly — universal cap (was 0.30)
 
 # Per-sport Section A confidence thresholds (min per-leg win_prob for high-conf section)
 _SECTION_A_THRESHOLD = {
     "NHL": 65.0,
     "MLB": 60.0,
 }
+
+# ── Sport prior multipliers (from personal performance analysis) ──────────────
+# Based on 2+ year personal leg WR: NBA/NFL 82-88% vs baseline 78%.
+# Values normalize [1.0–1.30] → [0.0–1.0] in composite via (_v - 1.0) / 0.30.
+_SPORT_PRIOR = {
+    "NBA":    1.30,   # 82.3% leg WR (Basketball) + 76.6% NBA, 88.1% NFL ML
+    "NFL":    1.30,   # 76.0% leg WR, NFL ML 88.1% — strongest non-Basketball
+    "Soccer": 1.15,   # 79.5% leg WR, moneylines 82.0%
+    "NHL":    1.00,   # 76.1–78.6% leg WR — at breakeven
+    "NCAAB":  1.10,   # proxied from NBA basketball WR
+    "NCAAF":  1.10,   # proxied from NFL football WR
+    "MLB":    1.00,   # 64.4% leg WR — neutral prior; gated by model_wp threshold instead
+    "WNBA":   1.20,   # Basketball-adjacent; proxied near NBA
+}
+_DEFAULT_SPORT_PRIOR = 1.00
+
+# ── Market prior multipliers (sport × market type) ────────────────────────────
+# Lookup key: (_normalize_sport(sport), normalized_market_type)
+# Values normalize [1.0–1.30] → [0.0–1.0] in composite via (_v - 1.0) / 0.30.
+_MARKET_PRIOR: dict[tuple, float] = {
+    # NBA / Basketball
+    ("NBA",    "h2h"):    1.25,   # 82.1% moneyline WR
+    ("NBA",    "spreads"): 1.15,  # 100% spread WR (small sample, positive signal)
+    ("NBA",    "totals"): 1.10,   # 75.8% totals WR
+    ("NBA",    "player_points"):    1.00,   # insufficient data — neutral until calibrated
+    ("NBA",    "player_rebounds"):  1.00,   # insufficient data — neutral until calibrated
+    ("NBA",    "player_assists"):   1.00,   # insufficient data — neutral until calibrated
+    ("NBA",    "player_threes"):    1.00,   # insufficient data — neutral until calibrated
+    ("NBA",    "player_blocks"):    1.00,   # insufficient data — neutral until calibrated
+    ("NBA",    "player_steals"):    1.00,   # insufficient data — neutral until calibrated
+    # NFL
+    ("NFL",    "h2h"):    1.30,   # 88.1% NFL ML WR — highest volume top performer
+    ("NFL",    "spreads"): 1.15,
+    ("NFL",    "totals"): 1.10,   # 74.2% NFL totals WR
+    ("NFL",    "player_passing_yards"):   1.10,
+    ("NFL",    "player_rushing_yards"):   1.10,
+    ("NFL",    "player_receiving_yards"): 1.10,
+    ("NFL",    "player_receptions"):      1.10,
+    ("NFL",    "player_touchdowns"):      1.10,
+    # Soccer
+    ("Soccer", "h2h"):    1.20,   # 82.0% soccer ML WR
+    ("Soccer", "totals"): 1.10,   # 74.6% soccer totals WR
+    # MLB — neutral baseline; raised when model_wp threshold passed
+    ("MLB",    "h2h"):    1.00,
+    ("MLB",    "spreads"): 1.10,  # alt run lines = NBA spread equivalent
+    ("MLB",    "totals"): 1.10,
+    ("MLB",    "player_hits"):        1.00,
+    ("MLB",    "player_home_runs"):   1.00,
+    ("MLB",    "player_rbi"):         1.00,
+    ("MLB",    "player_strikeouts"):  1.00,
+    ("MLB",    "player_total_bases"): 1.00,
+    # NHL
+    ("NHL",    "h2h"):    1.00,
+    ("NHL",    "spreads"): 1.00,
+    ("NHL",    "totals"): 1.00,
+    # Phase A diagnostic: alternate_spreads are the edge markets — uplift them explicitly
+    ("MLB",    "alternate_spreads"): 1.25,  # 68.0% WR, 197 legs — best MLB market
+    ("NBA",    "alternate_spreads"): 1.25,  # 64.7% WR, 238 legs — best NBA market
+    ("NHL",    "alternate_spreads"): 1.05,  # 57.5% WR but underperforms WP — small uplift
+}
+_DEFAULT_MARKET_PRIOR = 1.00
+
+# ── Market eligibility (Phase A diagnostic: data-driven per-market gates) ─────
+# Key: (_normalize_sport(sport), normalized_market_type)
+# Banned markets are excluded from generation entirely.
+# Per-market min_wp floors override the universal threshold.
+MARKET_ELIGIBILITY: dict = {
+    # Demonstrated edge — generate freely at moderate confidence
+    ("MLB", "alternate_spreads"): {"min_wp": 62.0, "priority": 1.3, "banned": False},
+    ("NBA", "alternate_spreads"): {"min_wp": 60.0, "priority": 1.3, "banned": False},
+    ("NBA", "h2h"):               {"min_wp": 55.0, "priority": 1.1, "banned": False},
+    ("NHL", "h2h"):               {"min_wp": 55.0, "priority": 1.0, "banned": False},
+    # Tier 2 — generate but require higher confidence
+    ("NBA", "spreads"):           {"min_wp": 62.0, "priority": 1.0, "banned": False},
+    ("MLB", "totals"):            {"min_wp": 65.0, "priority": 1.0, "banned": False},
+    ("NBA", "totals"):            {"min_wp": 62.0, "priority": 1.0, "banned": False},
+    ("NHL", "alternate_spreads"): {"min_wp": 70.0, "priority": 0.8, "banned": False},
+    ("NHL", "totals"):            {"min_wp": 65.0, "priority": 1.0, "banned": False},
+    # Restricted — only high-confidence (the 75%+ bucket was calibrated at 70.5% WR)
+    ("MLB", "h2h"):               {"min_wp": 75.0, "priority": 0.6, "banned": False},
+    # BANNED — demonstrated negative edge, do not generate
+    ("MLB", "spreads"):           {"min_wp": 999.0, "priority": 0.0, "banned": True},  # 33.3% WR
+    ("NHL", "spreads"):           {"min_wp": 999.0, "priority": 0.0, "banned": True},  # 9.1% WR
+}
+_DEFAULT_MARKET_ELIGIBILITY: dict = {"min_wp": 60.0, "priority": 1.0, "banned": False}
+
+
+def _normalize_market_key(mkt: str) -> str:
+    """Normalize market type string to canonical eligibility key."""
+    m = (mkt or "").lower().replace(" ", "_").replace("-", "_")
+    # Map common display-label variations to canonical DB keys
+    _aliases = {
+        "alt_spread": "alternate_spreads",
+        "alt spreads": "alternate_spreads",
+        "alternate_spread": "alternate_spreads",
+        "alt_total": "alternate_totals",
+        "alt totals": "alternate_totals",
+        "alternate_total": "alternate_totals",
+    }
+    return _aliases.get(m, m)
+
+
+def calibrated_wp(raw_wp: float, sport: str, market_type: str = "") -> float:
+    """Apply data-driven empirical calibration to raw model win probability.
+
+    Delegates to win_prob_calibration.get_calibrated_wp() which looks up
+    per-(sport, market_type, wp_bucket) corrections from the
+    win_prob_calibration table, populated nightly from settled mock_bet_legs.
+
+    Key changes vs old Phase-A hardcoded version:
+      • Market-type aware: spread corrections no longer apply to h2h legs.
+      • NHL disaster zone (×0.40) removed — it was derived from banned spreads
+        and wrongly penalised NHL h2h legs that actually win 91% in 55-65% range.
+      • NBA h2h 55-65%: actual WR 90.9%, old ×0.90 correction was too aggressive.
+      • Falls back to conservative hardcoded defaults if DB table is empty.
+
+    Does NOT apply to CUSHION legs (personal_wr is the calibrated signal).
+    Does NOT apply to alt_lines (market-implied probability is already correct).
+    Raw win_prob stays in DB; only runtime scoring uses the corrected value.
+    """
+    import os as _os
+    try:
+        from win_prob_calibration import get_calibrated_wp as _gwp
+        _db = _os.path.join(_os.path.dirname(__file__), "..", "data", "bets.db")
+        return _gwp(raw_wp, sport, market_type or "", bets_db_path=_db)
+    except Exception:
+        # Last-resort fallback: 5pp conservative haircut, no market-type logic
+        return max(5.0, raw_wp - 5.0)
+
+
+def get_effective_market_eligibility(db=None) -> dict:
+    """
+    Return the effective MARKET_ELIGIBILITY dict, merging hardcoded defaults
+    with human-approved DB overrides (promote / demote decisions).
+
+    DB overrides win over hardcoded entries. Latest override per
+    (sport, market_type) pair takes precedence (ordered by applied_at ASC
+    so later rows overwrite earlier ones).
+
+    Called at the start of each recommendation build so that a freshly
+    promoted market is live within minutes of approval without a restart.
+    """
+    result = dict(MARKET_ELIGIBILITY)
+    if db is None:
+        return result
+    try:
+        from database import MarketEligibilityOverride
+        rows = (
+            db.query(MarketEligibilityOverride)
+            .order_by(MarketEligibilityOverride.applied_at.asc())
+            .all()
+        )
+        for row in rows:
+            key = (_normalize_sport(row.sport), _normalize_market_key(row.market_type))
+            result[key] = {
+                "min_wp":   row.min_wp   if row.min_wp   is not None else (999.0 if row.banned else 60.0),
+                "priority": row.priority if row.priority is not None else 1.0,
+                "banned":   bool(row.banned),
+            }
+    except Exception:
+        pass  # fallback to hardcoded if DB unavailable
+    return result
+
+
+# Scout grade composite norm values [0.0–1.5].
+# Grade B = 1.00 is the baseline; other grades scaled relative to B.
+# Static fallback used when dynamic DB values are unavailable (< 50 settled legs per grade).
+#
+# Empirical basis — first validation run, May 2026 (325 settled legs):
+#   Grade A: 73.2% WR, 0.198 Brier (n=112) → 1.25 (strong signal, conservative boost)
+#   Grade B: 60.0% WR, 0.240 Brier (n=170) → 1.00 (baseline, no change)
+#   Grade C: 72.2% WR, 0.234 Brier (n=36)  → 1.00 (hold at baseline — uncertain sample)
+#   Grade D: 57.1% WR, 0.250 Brier (n=7)   → 0.75 (conservative penalty)
+# Dynamic multipliers from get_dynamic_scout_multipliers() override these once n≥50 per grade.
+# Review schedule: raise A to 1.35–1.50 at n≥200 + WR≥70%; lower D to 0.50 at n≥30 + WR<55%
+_SCOUT_GRADE_NORM = {"A": 1.25, "B": 1.00, "C": 1.00, "D": 0.75}
+_DEFAULT_SCOUT_NORM = 0.50  # no scout data available (below-baseline penalty)
 
 # ── Pattern cache (for attribution display) ───────────────────────────────────
 _pattern_cache = None
@@ -410,6 +591,7 @@ def generate_todays_picks(
     min_confidence:      float      = None,   # override per-sport thresholds (e.g. 50.0 for paper trading)
     depth_lqs_min:       float      = None,   # override _DEPTH_LQS_MIN floor (e.g. 55.0 for paper trading)
     boost_pct:           float      = 0.0,    # active boost tier — threaded to ALE for safety re-ranking
+    include_started:     bool       = False,   # one-time catch-up: include games already started
 ) -> dict:
     """
     Build today's top picks by:
@@ -425,7 +607,7 @@ def generate_todays_picks(
     from parlay_builder import get_available_legs, score_leg, build_parlay, correlation_check
     import itertools
 
-    all_raw  = get_available_legs(db, markets=["h2h", "spreads", "totals"])
+    all_raw  = get_available_legs(db, markets=["h2h", "spreads", "totals"], include_started=include_started)
     if not all_raw:
         return {
             "error": "No fixture legs available. Go to Fixtures → Fetch Latest Odds first.",
@@ -447,7 +629,7 @@ def generate_todays_picks(
         "ncaab":   ["NCAAB"],
         "ncaaf":   ["NCAAF"],
         "soccer":  ["EPL", "La Liga", "UCL", "Bundesliga",
-                    "Serie A", "Ligue 1", "Soccer"],
+                    "Serie A", "Ligue 1", "Soccer", "World Cup"],
         # MLS excluded: no sub-model, no CLV data, poor historical accuracy.
         # Re-enable when an MLS-specific model is built.
         "tennis":  ["Tennis"],
@@ -504,7 +686,7 @@ def generate_todays_picks(
         # where most games end within 1 goal → raise to 65-68% when playoffs detected.
         # TODO: add is_nhl_playoffs() check and bump NHL to 68.0 in Apr-Jun window.
         "NHL": 60.0,   # base threshold; raise to 68.0 for playoffs when flagged
-        "MLB": 55.0,   # isotonic-calibrated, standard threshold
+        "MLB": 70.0,   # raised: 64.4% personal WR — require high model confidence to include
         # Soccer uses 3-way markets (h2h outcomes each ~33% base). A model
         # win_prob of 45%+ on a 33% implied side is genuinely confident.
         # Applying the 55% binary-sport bar would suppress all soccer picks.
@@ -571,10 +753,39 @@ def generate_todays_picks(
         unique_fixtures = list({l.get("fixture_id"): l for l in scored
                                  if l.get("fixture_id")}.values())
 
+        # ── Alt-spread fixture list: gate on moneyline AVAILABILITY, not bet
+        # production.  The 2×2 cell rule (Fav@Away +10%, Dog@Home -30%) needs
+        # fav/dog classification which requires a moneyline.  But the fixture
+        # only needs to HAVE a moneyline — the model doesn't need to have
+        # produced a main-market betting leg on it.  Previously we used
+        # unique_fixtures (fixtures with scored main-market legs), which missed
+        # every fixture where the model's confidence was below threshold.
+        _alt_fixture_map: dict[str, dict] = {}
+        _newly_included_fids: set[str] = set()  # fixtures with no scored main-market leg
+        # Seed from scored legs (these already have full metadata)
+        for _l in scored:
+            _fid = _l.get("fixture_id")
+            if _fid and _fid not in _alt_fixture_map:
+                _alt_fixture_map[_fid] = _l
+        # Expand with ALL raw h2h legs — fixtures with a moneyline available
+        # but no scored leg get their metadata from the raw h2h leg
+        _n_newly_included = 0
+        for _l in all_raw:
+            _fid = _l.get("fixture_id")
+            if _fid and _fid not in _alt_fixture_map and _l.get("market") == "h2h":
+                _alt_fixture_map[_fid] = _l
+                _newly_included_fids.add(_fid)
+                _n_newly_included += 1
+        alt_spread_fixtures = list(_alt_fixture_map.values())
+        if _n_newly_included:
+            print(f"[alt-line] expanded fixture pool: {len(unique_fixtures)} (scored) "
+                  f"→ {len(alt_spread_fixtures)} (moneyline available), "
+                  f"+{_n_newly_included} newly included")
+
         n_evaluated = 0
         n_added     = 0
 
-        for main_leg in unique_fixtures:
+        for main_leg in alt_spread_fixtures:
             fid = main_leg.get("fixture_id")
             if not fid:
                 continue
@@ -602,6 +813,14 @@ def generate_todays_picks(
                 al_team     = al.get("team", "")
                 al_sport    = main_leg.get("sport", "")
                 mkt_label   = "Alt Spread" if "spread" in al_market else "Alt Total"
+
+                # Quality gate: don't recover alt-totals on fixtures where the
+                # main model produced no leg.  Backtest evidence (4,481 settled):
+                # alt-totals on no-main-leg fixtures = 50.9% WR, +0.8c CLV —
+                # marginal, not worth the volume.  Alt-spreads are fine (67.6% WR).
+                if (al_market in ("alternate_totals", "totals")
+                        and fid in _newly_included_fids):
+                    continue
                 point_str   = (f" {al_line:+g}" if al_line is not None
                                and float(al_line) != 0 else "")
                 al_desc     = f"{al_team}{point_str} ({mkt_label})"
@@ -612,6 +831,13 @@ def generate_todays_picks(
                     continue
 
                 # Score through ML model
+                # Devig: remove bookmaker vig from implied probability
+                try:
+                    from mock_bets import devig_alt_line_standalone as _devig
+                    _devigged_wp = _devig(fid, al_market, al_team, al_line, al_odds_dec)
+                except Exception:
+                    _devigged_wp = round(1.0 / al_odds_dec * 100, 2)
+
                 al_leg_raw = {
                     "leg_id":         al_leg_id,
                     "fixture_id":     fid,
@@ -624,8 +850,10 @@ def generate_todays_picks(
                     "point":          al_line,
                     "description":    al_desc,
                     "odds":           round(al_odds_dec, 3),
-                    "implied_prob":   round(1.0 / al_odds_dec * 100, 2),
+                    "implied_prob":   round(_devigged_wp, 2),
                     "game_time":      main_leg.get("game_time"),
+                    "home_team":      main_leg.get("home_team", ""),
+                    "away_team":      main_leg.get("away_team", ""),
                     "is_alt_line":    True,
                     "main_line_odds": main_leg.get("odds"),
                 }
@@ -677,22 +905,127 @@ def generate_todays_picks(
                 #
                 # For other alt markets (totals etc.) keep the original LQS gate.
                 _is_alt_spread = al_market in ("alternate_spreads", "spreads")
+                _is_alt_total  = al_market in ("alternate_totals", "totals")
 
                 if _is_alt_spread:
-                    _passes = implied_conf >= 65.0
-                    # Use market implied prob as win_prob (honest signal for cushion lines)
-                    al_scored["win_prob"] = implied_conf
-                    al_scored["edge"]     = 0.0
+                    # Per-rung override: V2 ATS sub-model (spread-aware, leak-free,
+                    # monotone-constrained) handles |spread| ≤ 4.5 directly.
+                    # Keep implied override at |spread| ≥ 5.5 where V2 is structurally
+                    # miscalibrated (predicts 82% vs 54.5% actual at +5.5).
+                    #
+                    # Validated on 4629 settled legs (2026-04-22 to 2026-06-15, TRUE OOS):
+                    #   +1.5: V2 Brier 0.2451 vs Implied 0.2648 (calibration win, 98%)
+                    #   +2.5: V2 0.2137 vs 0.2866 (implied 9.3pp off)
+                    #   +3.5: V2 0.1616 vs 0.4141 (implied 34.3pp off)
+                    #   +4.5: V2 0.1998 vs 0.4699 (V2 overshoots 7.3pp — monitor)
+                    #   +5.5: KEEP implied (V2 27.8pp overshoot, corrupted data artifact)
+                    _spread_abs_val = abs(float(al_line)) if al_line is not None else 0
+                    _is_mlb = al_sport and al_sport.upper() in ("MLB", "BASEBALL_MLB")
+
+                    if _is_mlb and _spread_abs_val <= 4.5:
+                        # V2 reverted — combined_v1 handles all MLB spreads now.
+                        # score_leg falls through to global model since V2 submodel
+                        # is bypassed (miscalibrated isotonic on augmented spreads).
+                        _model_wp = al_scored.get("win_prob", 0)
+                        _passes = _model_wp >= 55.0
+                        al_scored["model_used"] = "mlb_ats_v1"
+                    else:
+                        # |spread| >= 5.5, or non-MLB: keep implied override
+                        _passes = implied_conf >= 65.0
+                        al_scored["win_prob"] = implied_conf
+                        al_scored["edge"]     = 0.0
+                        _wp_rec = implied_conf / 100.0
+                        _odds_rec = al_leg_raw["odds"]
+                        al_scored["ev"]    = round(_wp_rec * (_odds_rec - 1) - (1 - _wp_rec), 4)
+                        al_scored["grade"] = "C" if al_scored["ev"] >= 0.0 else "D"
+                        al_scored["model_used"] = "implied_override"
+                elif _is_alt_total:
+                    # ── Gated model-edge lift for alt-totals ─────────────────
+                    # Backtest (418 games, 4/1–6/8, lines 10.5+):
+                    #   Pitcher parks (PF<1.0): gap -1.2pp, 79.6% WR, N=675
+                    #   Hitter parks (PF>=1.0): gap +10.4pp BIASED, N=184
+                    # Gate: ALL must hold to use model probability:
+                    #   1. Pick direction = Under (validated direction)
+                    #   2. Line >= 10.5 (discriminating range)
+                    #   3. Park factor < 1.0 (pitcher park only)
+                    #   4. Model P(under) in [0.65, 0.78] (avoid overconfidence)
+                    # If gate fails → keep implied override (edge = 0).
+                    _total_line = float(al_line) if al_line is not None else 0.0
+                    _home_for_total = main_leg.get("home_team", "")
+                    _away_for_total = main_leg.get("away_team", "")
+                    from features import MLB_PARK_FACTORS as _TOTALS_PF
+                    _pf = _TOTALS_PF.get(_home_for_total, 1.0)
+                    _park_exp = _pf * 9.18
+
+                    _is_under = al_team.lower().strip() == "under"
+                    _lift_ok = False
+                    _model_p_under = None
+
+                    if _is_under and _total_line >= 10.5 and _pf < 1.0:
+                        try:
+                            from ml_model import predict_game_totals as _pgt
+                            _p_over = _pgt(
+                                home_team=_home_for_total,
+                                away_team=_away_for_total,
+                                total_line=_total_line,
+                                sport=al_sport or "MLB",
+                            )
+                            if _p_over is not None:
+                                _model_p_under = 1.0 - _p_over
+                                _lift_ok = 0.65 <= _model_p_under <= 0.78
+                        except Exception:
+                            pass
+
+                    if _lift_ok and _model_p_under is not None:
+                        # Devig implied: find complementary Over odds for this line
+                        _devigged = implied_conf  # fallback if no complement found
+                        for _al_comp in all_alt_lines:
+                            if (float(_al_comp.get("line", 0)) == _total_line
+                                    and _al_comp.get("market_key", "") == al_market
+                                    and _al_comp.get("team", "").lower().strip() == "over"):
+                                _comp_odds = float(_al_comp.get("odds", 0))
+                                if _comp_odds > 1.0:
+                                    _imp_u = 1.0 / al_odds_dec
+                                    _imp_o = 1.0 / _comp_odds
+                                    _devigged = (_imp_u / (_imp_u + _imp_o)) * 100
+                                break
+                        al_scored["win_prob"] = round(_model_p_under * 100, 2)
+                        al_scored["edge"]     = round(_model_p_under * 100 - _devigged, 2)
+                        al_scored["_model_driven_edge"] = True
+                        _wp_rec   = _model_p_under
+                        _odds_rec = al_leg_raw["odds"]
+                        al_scored["ev"]    = round(_wp_rec * (_odds_rec - 1) - (1 - _wp_rec), 4)
+                        al_scored["grade"] = "B" if al_scored["ev"] >= 0.04 else ("C" if al_scored["ev"] >= 0.0 else "D")
+                        _passes = True
+                        print(f"[alt-total] LIFT: {al_desc} model_p={_model_p_under:.3f} devig={_devigged:.1f}% pf={_pf:.2f} edge={al_scored['edge']:+.1f}pp")
+                    else:
+                        # Keep implied override — outside validated gate
+                        al_scored["win_prob"] = implied_conf
+                        al_scored["edge"]     = 0.0
+                        al_scored["_model_driven_edge"] = False
+                        _wp_rec   = implied_conf / 100.0
+                        _odds_rec = al_leg_raw["odds"]
+                        al_scored["ev"]    = round(_wp_rec * (_odds_rec - 1) - (1 - _wp_rec), 4)
+                        al_scored["grade"] = "C" if al_scored["ev"] >= 0.0 else "D"
+                        _passes = implied_conf >= 65.0
+
+                    # Attach park-cushion metadata for composite scoring
+                    if al_team == "Over":
+                        _totals_cush = _park_exp - _total_line
+                    else:
+                        _totals_cush = _total_line - _park_exp
+                    al_scored["_totals_cushion"] = round(_totals_cush, 2)
+                    al_scored["_park_expected"]  = round(_park_exp, 2)
                 else:
                     main_lqs  = main_lqs_by_fixture.get(fid, 0.0)
                     _passes   = alt_lqs >= main_lqs + 3.0
 
-                # Floor lqs at 62 for high-implied alt spreads so that LOS passes
+                # Floor lqs at 62 for high-implied alt spreads/totals so LOS passes
                 # the ALE _LOS_MIN=0.52 gate:
                 #   LOS = implied*0.50 + 62/100*0.20 = 0.40 + 0.124 = 0.524
                 # Without this, neutral Component A (50.0 — no personal data) gives
                 # lqs=55, LOS=0.51 — just below the floor.
-                if _is_alt_spread and implied_conf >= 65.0:
+                if (_is_alt_spread or _is_alt_total) and implied_conf >= 65.0:
                     alt_lqs = max(alt_lqs, 62.0)
 
                 if _passes:
@@ -701,9 +1034,10 @@ def generate_todays_picks(
                     al_scored["_main_lqs"] = main_lqs_by_fixture.get(fid, 0.0)
                     scored.append(al_scored)
                     n_added += 1
-                    print(f"[alt-line] ✓ {al_desc} | implied={implied_conf:.0f}% odds={al_odds_dec:.3f}")
+                    print(f"[alt-line] ✓ {al_desc} | implied={implied_conf:.0f}% model_wp={al_scored.get('win_prob'):.0f}% odds={al_odds_dec:.3f}")
 
-        print(f"[alt-line] evaluated={n_evaluated} added={n_added} / {len(unique_fixtures)} fixtures")
+        print(f"[alt-line] evaluated={n_evaluated} added={n_added} / "
+              f"{len(alt_spread_fixtures)} fixtures (was {len(unique_fixtures)} scored-only)")
 
     except Exception as _alt_err:
         print(f"[alt-line] augmentation skipped: {_alt_err}")
@@ -1047,6 +1381,48 @@ def generate_todays_picks(
             return False
         return _pep_max_legs_for(leg) == 1 and (leg.get("win_prob") or 0) >= 70.0
 
+    # ── Market eligibility gate (Phase A diagnostic: data-driven bans + min_wp) ─
+    # Applied before pool formation so banned markets never enter combo generation.
+    # Exempt: CUSHION legs (personal_wr is the signal, model_wp may be low by design)
+    # and alt lines already gated via implied_conf >= 65% in the augmentation loop.
+    # Merges hardcoded MARKET_ELIGIBILITY with human-approved DB overrides so that
+    # a promoted/demoted market is live within minutes of approval, no restart needed.
+    _eff_elig = get_effective_market_eligibility(db)
+
+    def _market_eligible_leg(leg: dict) -> bool:
+        sp  = _normalize_sport(leg.get("sport") or "")
+        mkt = _normalize_market_key(
+            leg.get("market_key") or leg.get("market_label") or leg.get("market") or ""
+        )
+        cfg = _eff_elig.get((sp, mkt), _DEFAULT_MARKET_ELIGIBILITY)
+        if cfg.get("banned"):
+            return False  # e.g. MLB spreads (33.3% WR), NHL spreads (9.1% WR)
+        # Use calibrated WP for the min_wp floor check so market gates operate on
+        # corrected values.  Alt lines skip calibration inside calibrated_wp().
+        raw_wp  = leg.get("win_prob") or 0.0
+        eff_wp  = calibrated_wp(raw_wp, leg.get("sport") or "", mkt)
+        return eff_wp >= cfg.get("min_wp", 0.0)
+
+    # Universal WP gate: reject the 45-55% zone where calibration breaks across sports.
+    # Applied on CALIBRATED win_prob so market-type-specific corrections take effect
+    # before the dead-zone filter (e.g. NHL h2h 55-65% now correctly NOT dead-zone).
+    # Exempt: alt lines (gated via implied_conf >= 65%), CUSHION legs (personal_wr drives).
+    def _passes_universal_wp_gate(leg: dict) -> bool:
+        if leg.get("is_alt_line"):
+            return True  # already gated via implied_conf >= 65% in augmentation
+        if _is_cushion_main_line(leg):
+            return True  # personal_wr is the valid signal — model_wp may be low
+        raw_wp  = leg.get("win_prob") or 0.0
+        mkt_key = leg.get("market_key") or leg.get("market_label") or leg.get("market") or ""
+        wp = calibrated_wp(raw_wp, leg.get("sport") or "", mkt_key)
+        return not (45.0 <= wp < 55.0)  # reject the calibration dead zone
+
+    scored = [
+        l for l in scored
+        if _market_eligible_leg(l) and _passes_universal_wp_gate(l)
+    ]
+    _n_after_market_gate = len(scored)
+
     confident = [
         l for l in scored
         if l.get("is_alt_line")           # alt lines: quality-gated by LQS, not edge
@@ -1290,12 +1666,15 @@ def generate_todays_picks(
     # depth_lqs_min overrides the floor when set (e.g. 55.0 for paper trading).
     if depth_lqs_min is not None:
         _DEPTH_LQS_MIN: dict[int, float] = {2: depth_lqs_min, 3: depth_lqs_min + 2,
-                                             4: depth_lqs_min + 4, 5: depth_lqs_min + 5}
+                                             4: depth_lqs_min + 4, 5: depth_lqs_min + 5,
+                                             6: depth_lqs_min + 6, 7: depth_lqs_min + 7}
     else:
-        _DEPTH_LQS_MIN: dict[int, float] = {2: 62.0, 3: 64.0, 4: 66.0, 5: 68.0}
+        _DEPTH_LQS_MIN: dict[int, float] = {2: 62.0, 3: 64.0, 4: 66.0, 5: 68.0, 6: 70.0, 7: 72.0}
 
-    # Hard cap: never exceed 5 legs (historical collapse at 6+, 12.7% WR)
-    max_legs = min(max_legs, 5)
+    # Hard cap: never exceed 7 legs (8+ legs collapse: -44% ROI at 8-leg, -62% at 10-leg).
+    # 6-leg (+7.9pp edge, +30.7% ROI) and 7-leg (+7.4pp, -0.3pp at 6 but positive directionally)
+    # are viable. 8+ banned unconditionally.
+    max_legs = min(max_legs, 7)
 
     def _leg_max_parlay(l: dict) -> int:
         """Return max_parlay_legs for a single leg from its personal profile."""
@@ -1461,16 +1840,31 @@ def generate_todays_picks(
             if not _lqs_ok:
                 continue
 
-            # Enforce: max 1 leg per fixture (no same-game parlays)
-            fixture_ids = [l["fixture_id"] for l in legs]
-            if len(fixture_ids) != len(set(fixture_ids)):
-                continue
+            # Classify legs: player props may freely combine from same game/team/player.
+            # Team market legs (h2h, spreads, totals, alternates) must still obey
+            # the same-fixture and same-team rules to avoid correlated outcomes.
+            _TEAM_MKTS = frozenset({
+                "h2h", "spreads", "spread", "totals", "total",
+                "alternate_spreads", "alternate_totals", "moneyline",
+            })
+            _all_props = all(
+                (l.get("market_type") or l.get("market") or "").lower() not in _TEAM_MKTS
+                for l in legs
+            )
 
-            # Enforce: no same team appearing twice across different fixtures
-            team_names = [l.get("pick", "").strip().lower() for l in legs]
-            real_teams = [t for t in team_names if t not in ("over", "under", "")]
-            if len(real_teams) != len(set(real_teams)):
-                continue
+            if not _all_props:
+                # Enforce: max 1 team-market leg per fixture (no same-game team parlays)
+                fixture_ids = [l["fixture_id"] for l in legs
+                               if (l.get("market_type") or l.get("market") or "").lower() in _TEAM_MKTS]
+                if len(fixture_ids) != len(set(fixture_ids)):
+                    continue
+
+                # Enforce: no same team appearing twice across team-market legs
+                team_names = [l.get("pick", "").strip().lower() for l in legs
+                              if (l.get("market_type") or l.get("market") or "").lower() in _TEAM_MKTS]
+                real_teams = [t for t in team_names if t not in ("over", "under", "")]
+                if len(real_teams) != len(set(real_teams)):
+                    continue
 
             # Build parlay
             combined_odds = 1.0
@@ -1601,11 +1995,26 @@ def generate_todays_picks(
           - Global model fails for MLB/NBA h2h → implied_prob 40-75%
         Using personal_wr gives a consistent, calibrated score across all CUSHION legs.
         Without this fix, soccer totals (95% sub-model) always crowd out MLB ML (75% WR).
+
+        For non-CUSHION legs: apply empirical calibration correction (Phase A diagnostic).
+        The raw model WP is systematically overconfident in the 55-75% zone, especially
+        MLB 55-65% (actual 34.5% vs predicted 57.9%) and NHL 45-55% (actual 9.1%).
         """
         pwr = leg.get("_personal_wr")
         if pwr is not None:
             return pwr * 100  # use calibrated personal WR for all CUSHION legs
-        return leg.get("win_prob") or 0  # non-CUSHION: raw model WP
+        if leg.get("is_alt_line"):
+            # win_prob for alt lines = market-implied probability (set in augmentation).
+            # The market IS the calibration signal here — the ML model has no alt-spread
+            # signal and calibrated_wp() corrections were derived from model outputs only.
+            # Applying the MLB 55-65% haircut (0.70×) to market-implied 62% → 43.4%
+            # has no empirical basis and wrongly deflates alt-line composite scores.
+            return leg.get("win_prob") or 0
+        raw_wp = leg.get("win_prob") or 0
+        # Apply sport-specific calibration correction for non-CUSHION, non-alt-line legs
+        sport  = leg.get("sport") or ""
+        market = leg.get("market_label") or leg.get("market") or ""
+        return calibrated_wp(raw_wp, sport, market)
 
     # Pre-compute max boost lift for normalization across the candidate pool.
     # Inline version of the boost eligibility check (can't import mock_bets —
@@ -1624,11 +2033,15 @@ def generate_todays_picks(
         _n   = len(legs)
         _wp  = c_wp / 100.0
         _profit = _BOOST_STAKE * (c_odds - 1.0)
-        # Check tiers highest-first: return lift for first eligible
+        # Check tiers highest-first: return lift for first eligible.
+        # Calibrated from FanDuel data (39.7% of bets boosted):
+        #   +25%: 54.5% bet WR, +$11.21 EV/10 (BEST tier — target 4-leg, combined ≥ -200)
+        #   +30%: 25.0% bet WR, +$4.37 EV/10 (positive but thin sample)
+        #   +50%: 25.0% bet WR, -$3.51 EV/10 (NEGATIVE — require strict SGP eligibility)
         for _pct, _ok in [
-            (0.50, (_sgp and _n >= 3) or (_ss and not _sgp and c_odds >= 2.00)),
-            (0.30, c_odds >= 1.50 or _n >= 3),
-            (0.25, c_odds >= 1.50),
+            (0.50, _sgp and _n >= 3 and c_odds >= 2.00),         # SGP only, high combined odds
+            (0.30, _n >= 3 and c_odds >= 1.50),                   # 3+ legs, any combined ≥ 1.50
+            (0.25, _n >= 2 and c_odds >= 1.50),                   # 2+ legs — highest hit rate tier
         ]:
             if _ok:
                 return round(_wp * _profit * _pct, 3)  # ev_lift = win_prob * profit * boost_pct
@@ -1637,24 +2050,25 @@ def generate_todays_picks(
     _boost_lifts = [_best_boost_lift(_c["legs"], _c["combined_odds"], _c["combined_win_prob"]) for _c in candidates]
     _max_boost_lift = max(_boost_lifts) if _boost_lifts else 1.0
 
+    # Fetch dynamic scout multipliers once before the loop (cached for 10 min).
+    # Falls back to _SCOUT_GRADE_NORM when Grade B has < 50 settled legs.
+    _dyn_scout_norms: dict[str, float] = _SCOUT_GRADE_NORM.copy()
+    try:
+        import placement as _plc_pre
+        _dyn_scout_norms = _plc_pre.get_dynamic_scout_multipliers(db)
+    except Exception:
+        pass
+
     for _i, _c in enumerate(candidates):
         _raw_lqs    = sum(l.get("lqs") or 50 for l in _c["legs"]) / max(len(_c["legs"]), 1)
         _avg_wp     = sum(_eff_wp_for_leg(l) for l in _c["legs"]) / max(len(_c["legs"]), 1)
         _norm_ev    = max(_c["expected_profit"], 0) / _cand_max_ev
         _norm_boost = _boost_lifts[_i] / (_max_boost_lift or 1.0)
-        # Weights: avg_wp 47%, avg_lqs 28%, norm_ev 19%, best_boost_ev 6%
-        # The boost term naturally promotes same-sport CUSHION clusters:
-        #   same-sport +100 → +50% eligible → higher lift → higher composite
-        #   cross-sport     → +30% max      → lower lift  → lower composite
-        _base_composite = (
-            (_avg_wp  / 100) * 0.47 +
-            (_raw_lqs / 100) * 0.28 +
-            _norm_ev          * 0.19 +
-            _norm_boost        * 0.06
-        )
-        # User signal multiplier — average adjustment across all legs in this candidate.
-        # Each leg's multiplier is clamped to [0.3, 1.7] in get_user_signal_adjustment;
-        # we average rather than multiply across legs to prevent compounding.
+
+        # ── User signal multiplier ────────────────────────────────────────────
+        # Average adjustment across all legs (clamped [0.3, 1.7] per leg).
+        # Applied as a multiplier AFTER base composite to reflect bid-directional
+        # user learning without polluting the additive sport/market prior terms.
         _sig_mults = []
         _sig_notes = []
         try:
@@ -1666,12 +2080,13 @@ def generate_todays_picks(
         except Exception:
             pass
         _sig_mult = sum(_sig_mults) / len(_sig_mults) if _sig_mults else 1.0
-        _sig_mult = max(0.3, min(1.7, _sig_mult))   # final pool-level clamp
+        _sig_mult = max(0.3, min(1.7, _sig_mult))
 
-        # Scout grade multiplier — attach scout grade to each leg, then average
-        # across legs (A→1.5×, B→1.2×, C→1.0×, D→0.5×). Falls back to 1.0 if
-        # scouted_props table is empty or scout hasn't run today.
-        _scout_mults = []
+        # ── Scout grade (additive, normalized [0–1.5]) ───────────────────────
+        # Norm values derived from _dyn_scout_norms (data-driven, B=1.00 baseline).
+        # Falls back to _SCOUT_GRADE_NORM static values when empirical data is thin.
+        # Incorporated as 0.20-weight additive term in the composite formula.
+        _scout_norms = []
         try:
             import placement as _plc
             for _leg in _c["legs"]:
@@ -1679,18 +2094,256 @@ def generate_todays_picks(
                 _leg["scout_grade"]     = _leg_enriched.get("scout_grade")
                 _leg["scout_hit_prob"]  = _leg_enriched.get("scout_hit_prob")
                 _leg["scouted_prop_id"] = _leg_enriched.get("scouted_prop_id")
-                _scout_mults.append(_leg_enriched.get("scout_multiplier", 1.0))
+                _grade = _leg_enriched.get("scout_grade")
+                _scout_norms.append(_dyn_scout_norms.get(_grade, _DEFAULT_SCOUT_NORM))
         except Exception:
             pass
-        _scout_mult = sum(_scout_mults) / len(_scout_mults) if _scout_mults else 1.0
-        _scout_mult = max(0.5, min(1.5, _scout_mult))   # clamp: never decimates or over-boosts
+        _avg_scout_norm = sum(_scout_norms) / len(_scout_norms) if _scout_norms else _DEFAULT_SCOUT_NORM
+        # Keep scout_mult for backward-compat fields on the pick dict
+        _scout_mult = round(0.5 + _avg_scout_norm, 4)   # maps [0–1] → [0.5–1.5]
 
-        _c["_composite"]    = _base_composite * _sig_mult * _scout_mult
-        _c["_signal_mult"]  = round(_sig_mult, 4)
-        _c["_scout_mult"]   = round(_scout_mult, 4)
-        _c["_signal_notes"] = _sig_notes
+        # ── Sport prior (additive, normalized [0–1]) ──────────────────────────
+        # Per leg: (_SPORT_PRIOR[sport] - 1.0) / 0.30 → [0, 1] range.
+        # Averaged across all legs so multi-sport parlays blend proportionally.
+        _sport_norms = []
+        for _leg in _c["legs"]:
+            _sp_key = _normalize_sport(_leg.get("sport") or "")
+            _sp_val = _SPORT_PRIOR.get(_sp_key, _DEFAULT_SPORT_PRIOR)
+            _sport_norms.append((_sp_val - 1.0) / 0.30)
+        _avg_sport_norm = sum(_sport_norms) / len(_sport_norms) if _sport_norms else 0.0
+        _avg_sport_norm = max(0.0, min(1.0, _avg_sport_norm))
+
+        # ── Market prior (additive, normalized [0–1]) ─────────────────────────
+        # Key: (canonical_sport, normalized_market_type).
+        _market_norms = []
+        for _leg in _c["legs"]:
+            _sp_key  = _normalize_sport(_leg.get("sport") or "")
+            _mkt_key = (_leg.get("market_label") or _leg.get("market") or "").lower().replace(" ", "_")
+            _mkt_val = _MARKET_PRIOR.get((_sp_key, _mkt_key), _DEFAULT_MARKET_PRIOR)
+            _market_norms.append((_mkt_val - 1.0) / 0.30)
+        _avg_market_norm = sum(_market_norms) / len(_market_norms) if _market_norms else 0.0
+        _avg_market_norm = max(0.0, min(1.0, _avg_market_norm))
+
+        # ── Composite formula ─────────────────────────────────────────────────
+        # Weights (sum = 1.0): win_prob 0.30, edge 0.15, lqs 0.10,
+        #   boost_lift 0.10, scout_grade 0.20, sport_prior 0.10, market_prior 0.05
+        # Sport and market priors apply per-leg; scout is per-candidate average.
+        # User signal learning applied as multiplicative modifier (preserves
+        # bid-directional learning without distorting the prior terms).
+        _base_composite = (
+            (_avg_wp  / 100) * 0.30 +
+            _norm_ev          * 0.15 +
+            (_raw_lqs / 100) * 0.10 +
+            _norm_boost        * 0.10 +
+            _avg_scout_norm    * 0.20 +
+            _avg_sport_norm    * 0.10 +
+            _avg_market_norm   * 0.05
+        )
+        _c["_composite"]      = _base_composite * _sig_mult
+        _c["_signal_mult"]    = round(_sig_mult, 4)
+        _c["_scout_mult"]     = _scout_mult
+        _c["_avg_sport_norm"] = round(_avg_sport_norm, 4)
+        _c["_avg_mkt_norm"]   = round(_avg_market_norm, 4)
+        _c["_signal_notes"]   = _sig_notes
         _c["_avg_lqs"] = _raw_lqs  # cache for depth-first selection below
         _c["_avg_wp"]  = _avg_wp   # cache for section_a sort key
+
+    # ── Park blowout adjustment for underdog alt-spreads ──────────────
+    # High-blowout parks (>55% of games with 4+ run margins) make
+    # underdog +N.5 cushion picks unreliable.  Penalise composite score
+    # at these venues; boost at low-blowout parks where cushions hold.
+    # Based on 60-day empirical data from resolved mock_bet_legs.
+    _PARK_BLOWOUT = {
+        "Pittsburgh Pirates":  0.85,   # 65% blowout rate
+        "Milwaukee Brewers":   0.85,   # 65%
+        "Cincinnati Reds":     0.85,   # 62%
+        "Los Angeles Dodgers": 0.85,   # 61%
+        "Colorado Rockies":    0.90,   # 55%
+    }
+    _PARK_SAFE = {
+        "Atlanta Braves":      1.05,   # 19% blowout rate
+        "Kansas City Royals":  1.05,   # 24%
+        "Toronto Blue Jays":   1.05,   # 24%
+        "St. Louis Cardinals": 1.05,   # 29%
+    }
+    for _c in candidates:
+        _park_adj = 1.0
+        for _leg in _c.get("legs", []):
+            _mkt = (_leg.get("market_type") or _leg.get("market") or "").lower()
+            if "spread" not in _mkt:
+                continue
+            _pt = _leg.get("point")
+            if _pt is None or float(_pt) <= 0:
+                continue  # skip favorites and totals
+            _home = _leg.get("home_team", "")
+            if _home in _PARK_BLOWOUT:
+                _park_adj *= _PARK_BLOWOUT[_home]
+            elif _home in _PARK_SAFE:
+                _park_adj *= _PARK_SAFE[_home]
+        if _park_adj != 1.0:
+            _c["_composite"] *= _park_adj
+            _c["_park_blowout_adj"] = round(_park_adj, 3)
+
+    # ── Totals cushion bonus ──────────────────────────────────────────────
+    # Boost composite for alt-total legs where the line has meaningful
+    # cushion vs park-expected total (backtest: 3-4 run cushion = 75.7% WR).
+    # Scale: 0 to +5% composite boost for 0-4 runs of cushion.
+    for _c in candidates:
+        _tc_adj = 1.0
+        for _leg in _c.get("legs", []):
+            _tc = _leg.get("_totals_cushion")
+            if _tc is None:
+                continue
+            if _tc >= 2.0:
+                # Sweet spot: 2-4 run cushion.  Cap boost at 5%.
+                _tc_bonus = min(0.05, (_tc - 1.0) * 0.015)
+                _tc_adj *= (1.0 + _tc_bonus)
+            elif _tc < 0:
+                # Adverse cushion: line is on the wrong side of expected.
+                # Penalise to discourage picking these.
+                _tc_adj *= max(0.85, 1.0 + _tc * 0.03)
+        if _tc_adj != 1.0:
+            _c["_composite"] *= _tc_adj
+            _c["_totals_cushion_adj"] = round(_tc_adj, 3)
+
+    # ── Shadow B: composition adjustment (×0.87 on extremes) ─────────
+    # Backtest finding (regime-independent, within-band controlled, n=458):
+    #   Mixed parlays (1-2 fav in 3-leg) outperform extremes (all-fav, all-dog)
+    #   by +73pp ROI.  Robust across ×0.82-0.92 (std=1.9pp full, 4.3pp post-5/26).
+    #   Risk sweep: metrics bounce non-monotonically across the range — no single
+    #   value wins across-the-board. ×0.83 dominates full-period risk, ×0.88
+    #   dominates post-5/26 risk. Mid-range ×0.87 chosen to avoid overfitting
+    #   to either noisy peak. All values ×0.82-0.92 beat blind on ROI/Sharpe/DD.
+    #
+    # Fav/dog classification: h2h moneyline decimal price < 2.0 = favorite.
+    # This is a LOOKUP (fixtures.bookmakers h2h), NOT the model's is_favorite_spread.
+    # MLB only (backtest was MLB-only).
+    _COMP_EXTREME_MULT = 0.87
+    _comp_fav_map: dict = {}  # (home, away) → bool (True = home is fav)
+    _comp_shadow_log = []
+
+    # Build fav map from fixtures bookmakers JSON
+    import json as _comp_json
+    try:
+        from sqlalchemy import text as _comp_text
+        _comp_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _comp_rows = db.execute(_comp_text(
+            "SELECT home_team, away_team, bookmakers FROM fixtures "
+            "WHERE sport_key = 'baseball_mlb' AND bookmakers IS NOT NULL "
+            "AND game_date_ct = :d"
+        ), {"d": _comp_today}).fetchall()
+        for _cr in _comp_rows:
+            _cr_home, _cr_away, _cr_bk = _cr
+            if not _cr_bk:
+                continue
+            try:
+                _cr_bks = _comp_json.loads(_cr_bk)
+            except (ValueError, TypeError):
+                continue
+            _cr_price = None
+            for _pref in ["fanduel", "draftkings", "betmgm", "pinnacle", None]:
+                for _bk in _cr_bks:
+                    if _pref is not None and _bk.get("key") != _pref:
+                        continue
+                    for _mkt in _bk.get("markets", []):
+                        if _mkt.get("key") != "h2h":
+                            continue
+                        for _oc in _mkt.get("outcomes", []):
+                            if _oc.get("name", "").lower().strip() == _cr_home.lower().strip():
+                                _cr_price = float(_oc.get("price", 0))
+                                break
+                        if _cr_price:
+                            break
+                    if _cr_price:
+                        break
+                if _cr_price:
+                    break
+            if _cr_price and _cr_price > 0:
+                _comp_fav_map[(_cr_home, _cr_away)] = _cr_price < 2.0
+    except Exception as _comp_err:
+        log.warning("[shadow-B] fav map load failed: %s", _comp_err)
+
+    # Step 1: save blind composite on every candidate before any adjustment
+    for _c in candidates:
+        _c["_blind_composite"] = _c["_composite"]
+
+    # Step 2: apply composition adjustment to extremes
+    if _comp_fav_map:
+        for _c in candidates:
+            _c_legs = _c.get("legs", [])
+            # Only apply to MLB-only parlays
+            if not all((_l.get("sport") or "").upper() == "MLB" for _l in _c_legs):
+                continue
+            _n_legs = len(_c_legs)
+            if _n_legs < 2:
+                continue
+
+            _fav_count = 0
+            _classifiable = 0
+            for _l in _c_legs:
+                _lh = _l.get("home_team", "")
+                _la = _l.get("away_team", "")
+                _lp = _l.get("pick", "")
+                _home_is_fav = _comp_fav_map.get((_lh, _la))
+                if _home_is_fav is None:
+                    continue
+                _classifiable += 1
+                if (_lp == _lh and _home_is_fav) or (_lp == _la and not _home_is_fav):
+                    _fav_count += 1
+
+            # Only adjust if all legs were classifiable
+            if _classifiable != _n_legs:
+                continue
+
+            _is_extreme = _fav_count == 0 or _fav_count == _n_legs
+            if _is_extreme:
+                _c["_composite"] *= _COMP_EXTREME_MULT
+                _c["_comp_adj"] = _COMP_EXTREME_MULT
+                _c["_comp_fav_count"] = _fav_count
+                _comp_shadow_log.append(
+                    f"  {_fav_count}/{_n_legs} fav → ×{_COMP_EXTREME_MULT} "
+                    f"({_c_legs[0].get('description', '')[:40]}...)"
+                )
+            else:
+                _c["_comp_fav_count"] = _fav_count
+
+    if _comp_shadow_log:
+        print(f"[shadow-B] composition adjustments ({len(_comp_shadow_log)} extreme parlays penalised):")
+        for _entry in _comp_shadow_log[:8]:
+            print(_entry)
+
+    # Step 3: compute blind counterfactual ranking for forward comparison.
+    # Sort by blind_composite, walk dedup/diversity to find what blind would ship.
+    # Store as _blind_rank on each candidate (None if blind wouldn't select it).
+    _blind_sorted = sorted(candidates, key=lambda x: -x.get("_blind_composite", 0))
+    _blind_top_sigs: list[frozenset] = []
+    _blind_leg_use: dict[str, int] = {}
+    _BLIND_CF_MAX = 20  # max picks blind would ship (match live budget)
+    _BLIND_MAX_LEG = 3
+    for _bc in _blind_sorted:
+        if len(_blind_top_sigs) >= _BLIND_CF_MAX:
+            break
+        _bsig = frozenset(l.get("leg_id", id(l)) for l in _bc.get("legs", []))
+        # Dedup
+        if _bsig in (set(s) for s in _blind_top_sigs):
+            continue
+        if any(_bsig == s for s in _blind_top_sigs):
+            continue
+        # Leg diversity
+        if any(_blind_leg_use.get(lid, 0) >= _BLIND_MAX_LEG for lid in _bsig):
+            continue
+        # Near-duplicate: >50% overlap
+        if any(
+            len(_bsig & s) / max(len(_bsig), 1) > 0.5
+            for s in _blind_top_sigs
+        ):
+            continue
+        _blind_top_sigs.append(_bsig)
+        for lid in _bsig:
+            _blind_leg_use[lid] = _blind_leg_use.get(lid, 0) + 1
+        _bc["_blind_rank"] = len(_blind_top_sigs)
+
+    # Now sort by rule-adjusted composite for actual selection
     candidates.sort(key=lambda x: -x["_composite"])
 
     # ── Section A: depth-first CUSHION pick selection ─────────────────────────
@@ -1727,8 +2380,9 @@ def generate_todays_picks(
             sig = frozenset(l["leg_id"] for l in _bc["legs"])
             if sig in _sa_sigs:
                 continue
-            # Each leg may appear in at most 1 Section A pick (strict diversity)
-            if any(_sa_leg_used.get(lid, 0) >= 1 for lid in sig):
+            # Allow top legs in up to 2 Section A picks (game cap limits total exposure)
+            _SA_MAX_LEG_REUSE = 2
+            if any(_sa_leg_used.get(lid, 0) >= _SA_MAX_LEG_REUSE for lid in sig):
                 continue
             # Near-duplicate: skip if >50% overlap with any section_a pick already added
             if any(
@@ -1748,8 +2402,8 @@ def generate_todays_picks(
             _fp["section_a_depth"] = _sz   # tag with depth for UI
             section_a_picks.append(_fp)
             _added_this_sz += 1
-            # Per-depth cap: 5-leg → 3, 4-leg → 2, 3-leg → 2, 2-leg → 3
-            _SA_SIZE_CAP = {5: 3, 4: 2, 3: 2, 2: 3}
+            # Per-depth cap: bias toward 2-leg (60%) and 3-leg (40%); 4+ exploratory only
+            _SA_SIZE_CAP = {7: 1, 6: 1, 5: 1, 4: 1, 3: 4, 2: 6}
             if _added_this_sz >= _SA_SIZE_CAP.get(_sz, 3):
                 break
 
@@ -1771,9 +2425,9 @@ def generate_todays_picks(
     section_a_picks = _deduped_section_a
 
     # ── Split into anchor and core pools ──────────────────────────────────────
-    # Leg diversity: each individual leg_id may appear in at most 2 of the top picks.
-    # This prevents a single high-LQS leg (e.g. ARI +1.5) from dominating all 5 picks.
-    _MAX_LEG_APPEARANCES = 2
+    # Leg diversity: each individual leg_id may appear in at most 3 of the top picks.
+    # Game concentration cap (MAX_BETS_PER_GAME=3) limits total fixture exposure.
+    _MAX_LEG_APPEARANCES = 3
     leg_use_count: dict[str, int] = {}
 
     anchor_picks = []
@@ -1828,6 +2482,205 @@ def generate_todays_picks(
             for l in c["legs"]:
                 leg_use_count[l["leg_id"]] = leg_use_count.get(l["leg_id"], 0) + 1
 
+    # ── Minimum totals guarantee ─────────────────────────────────────────────
+    # If quality totals legs exist but none appeared in picks, inject one
+    # 2-leg parlay (best totals + best cross-fixture spread) scored through
+    # the full composite formula so it ranks honestly against other picks.
+    _quality_totals = [
+        l for l in pool
+        if "total" in (l.get("market_type") or l.get("market") or "").lower()
+        and (l.get("win_prob") or 0) >= 65.0
+    ]
+    if _quality_totals:
+        _has_totals = any(
+            "total" in (lg.get("market_type") or lg.get("market") or "").lower()
+            for p in all_picks for lg in p.get("legs", [])
+        )
+        if not _has_totals:
+            # Best totals leg: highest cushion, then LQS
+            _quality_totals.sort(key=lambda x: (-x.get("_totals_cushion", 0),
+                                                 -(x.get("lqs") or 0)))
+            _best_total = _quality_totals[0]
+            _bt_fid = _best_total.get("fixture_id")
+
+            # Best spread leg from a different fixture (LQS >= 55)
+            _spread_pool = [
+                l for l in pool
+                if (l.get("market_type") or l.get("market") or "").lower()
+                   in ("alternate_spreads", "spreads", "h2h", "moneyline")
+                and l.get("fixture_id") != _bt_fid
+                and (l.get("lqs") or 0) >= 55
+            ]
+            _spread_pool.sort(key=lambda x: -(x.get("lqs") or 0))
+            if _spread_pool:
+                _best_spread = _spread_pool[0]
+                _tg_legs = [_best_total, _best_spread]
+
+                # Build candidate with same fields as regular candidates
+                _tg_combined_odds = 1.0
+                for _tl in _tg_legs:
+                    _tg_combined_odds *= _tl.get("odds", 1.91)
+                _tg_combined_odds = round(_tg_combined_odds, 3)
+
+                _tg_combined_win = 1.0
+                for _tl in _tg_legs:
+                    _tg_combined_win *= (_tl.get("win_prob") or 50) / 100.0
+                _tg_combined_wp = round(_tg_combined_win * 100, 2)
+
+                _tg_payout  = (_tg_combined_odds - 1) * stake
+                _tg_exp_profit = round(_tg_combined_win * _tg_payout - (1 - _tg_combined_win) * stake, 2)
+
+                _tg_cam = (round((_tg_combined_odds - 1) * 100) if _tg_combined_odds >= 2
+                           else -round(100 / (_tg_combined_odds - 1)))
+
+                _tg_cand = {
+                    "legs":              _tg_legs,
+                    "n_legs":            2,
+                    "combined_odds":     _tg_combined_odds,
+                    "combined_win_prob": _tg_combined_wp,
+                    "model_win_prob":    _tg_combined_wp,
+                    "payout":            round(_tg_payout, 2),
+                    "expected_profit":   _tg_exp_profit,
+                    "combined_am":       _tg_cam,
+                    "_totals_guarantee": True,
+                }
+
+                # Grade through strategy module (same as other candidates)
+                try:
+                    _tg_strat_legs = []
+                    for _tl in _tg_legs:
+                        _tl_am = _tl.get("american_odds_raw") or (
+                            round((_tl["odds"] - 1) * 100) if _tl["odds"] >= 2
+                            else -round(100 / (_tl["odds"] - 1))
+                        )
+                        _tg_strat_legs.append({
+                            "market": _tl.get("market_label", "Moneyline"),
+                            "american_odds": _tl_am,
+                        })
+                    _tg_graded = strat.grade_bet(_tg_strat_legs, _tg_combined_odds, _tg_cam, stake)
+                    _tg_cand["bet_class"]      = _tg_graded["bet_class"]
+                    _tg_cand["grade"]          = _tg_graded["grade"]
+                    _tg_cand["grade_color"]    = _tg_graded["color"]
+                    _tg_cand["grade_summary"]  = _tg_graded["summary"]
+                    _tg_cand["strategy_note"]  = _tg_graded["strategy_note"]
+                    _tg_cand["hist_win_prob"]  = _tg_graded["win_prob"]
+                    _tg_cand["hist_ev"]        = _tg_graded["ev"]
+                    _tg_cand["kelly_500"]      = _tg_graded["kelly_500"]
+                except Exception:
+                    _tg_cand.setdefault("bet_class", "core")
+                    _tg_cand.setdefault("grade", "C")
+                    _tg_cand.setdefault("grade_color", "amber")
+                    _tg_cand.setdefault("grade_summary", "")
+                    _tg_cand.setdefault("strategy_note", "")
+                    _tg_cand.setdefault("hist_win_prob", _tg_combined_wp)
+                    _tg_cand.setdefault("hist_ev", _tg_exp_profit)
+                    _tg_cand.setdefault("kelly_500", 0)
+
+                # ── Full composite formula (same weights as main loop) ────────
+                # WP 0.30, EV 0.15, LQS 0.10, boost 0.10, scout 0.20,
+                # sport 0.10, market 0.05  × signal_mult × totals_cushion_adj
+                _tg_raw_lqs = sum(_tl.get("lqs") or 50 for _tl in _tg_legs) / 2
+                _tg_avg_wp  = sum(_eff_wp_for_leg(_tl) for _tl in _tg_legs) / 2
+                _tg_norm_ev = max(_tg_exp_profit, 0) / _cand_max_ev if _cand_max_ev else 0.0
+                _tg_norm_boost = _best_boost_lift(_tg_legs, _tg_combined_odds,
+                                                   _tg_combined_wp) / (_max_boost_lift or 1.0)
+
+                # Scout grades
+                _tg_scout_norms = []
+                try:
+                    import placement as _plc_tg
+                    for _tl in _tg_legs:
+                        _tl_enriched = _plc_tg.attach_scout_grade_to_leg(dict(_tl), db)
+                        _tl["scout_grade"]     = _tl_enriched.get("scout_grade")
+                        _tl["scout_hit_prob"]  = _tl_enriched.get("scout_hit_prob")
+                        _tl["scouted_prop_id"] = _tl_enriched.get("scouted_prop_id")
+                        _tg_grade = _tl_enriched.get("scout_grade")
+                        _tg_scout_norms.append(_dyn_scout_norms.get(_tg_grade, _DEFAULT_SCOUT_NORM))
+                except Exception:
+                    pass
+                _tg_avg_scout = (sum(_tg_scout_norms) / len(_tg_scout_norms)
+                                 if _tg_scout_norms else _DEFAULT_SCOUT_NORM)
+                _tg_scout_mult = round(0.5 + _tg_avg_scout, 4)
+
+                # Sport prior
+                _tg_sport_norms = []
+                for _tl in _tg_legs:
+                    _sp_key = _normalize_sport(_tl.get("sport") or "")
+                    _sp_val = _SPORT_PRIOR.get(_sp_key, _DEFAULT_SPORT_PRIOR)
+                    _tg_sport_norms.append((_sp_val - 1.0) / 0.30)
+                _tg_avg_sport = max(0.0, min(1.0,
+                    sum(_tg_sport_norms) / len(_tg_sport_norms) if _tg_sport_norms else 0.0))
+
+                # Market prior
+                _tg_market_norms = []
+                for _tl in _tg_legs:
+                    _sp_key  = _normalize_sport(_tl.get("sport") or "")
+                    _mkt_key = (_tl.get("market_label") or _tl.get("market") or "").lower().replace(" ", "_")
+                    _mkt_val = _MARKET_PRIOR.get((_sp_key, _mkt_key), _DEFAULT_MARKET_PRIOR)
+                    _tg_market_norms.append((_mkt_val - 1.0) / 0.30)
+                _tg_avg_market = max(0.0, min(1.0,
+                    sum(_tg_market_norms) / len(_tg_market_norms) if _tg_market_norms else 0.0))
+
+                # User signal multiplier
+                _tg_sig_mults = []
+                try:
+                    import user_signal_learning as _usl_tg
+                    for _tl in _tg_legs:
+                        _m, _n = _usl_tg.get_user_signal_adjustment(_tl, db)
+                        _tg_sig_mults.append(_m)
+                except Exception:
+                    pass
+                _tg_sig_mult = (sum(_tg_sig_mults) / len(_tg_sig_mults)
+                                if _tg_sig_mults else 1.0)
+                _tg_sig_mult = max(0.3, min(1.7, _tg_sig_mult))
+
+                # Composite
+                _tg_base = (
+                    (_tg_avg_wp  / 100) * 0.30 +
+                    _tg_norm_ev          * 0.15 +
+                    (_tg_raw_lqs / 100) * 0.10 +
+                    _tg_norm_boost       * 0.10 +
+                    _tg_avg_scout        * 0.20 +
+                    _tg_avg_sport        * 0.10 +
+                    _tg_avg_market       * 0.05
+                )
+                _tg_composite = _tg_base * _tg_sig_mult
+
+                # Totals cushion bonus (same formula as main pass)
+                _tg_tc_adj = 1.0
+                for _tl in _tg_legs:
+                    _tc = _tl.get("_totals_cushion")
+                    if _tc is None:
+                        continue
+                    if _tc >= 2.0:
+                        _tc_bonus = min(0.05, (_tc - 1.0) * 0.015)
+                        _tg_tc_adj *= (1.0 + _tc_bonus)
+                    elif _tc < 0:
+                        _tg_tc_adj *= max(0.85, 1.0 + _tc * 0.03)
+                _tg_composite *= _tg_tc_adj
+
+                _tg_cand["_composite"]          = _tg_composite
+                _tg_cand["_signal_mult"]        = round(_tg_sig_mult, 4)
+                _tg_cand["_scout_mult"]         = _tg_scout_mult
+                _tg_cand["_avg_sport_norm"]     = round(_tg_avg_sport, 4)
+                _tg_cand["_avg_mkt_norm"]       = round(_tg_avg_market, 4)
+                _tg_cand["_avg_lqs"]            = _tg_raw_lqs
+                _tg_cand["_avg_wp"]             = _tg_avg_wp
+                _tg_cand["_totals_cushion_adj"] = round(_tg_tc_adj, 3)
+
+                _tg_pick = _format_pick(_tg_cand, stake, db)
+                _tg_pick["_totals_guarantee"] = True
+                _tg_pick["confidence_tier"]   = "A"
+                _tg_pick["tier_label"]        = "Sharp Picks"
+                _tg_pick["show_warning"]      = False
+                all_picks.append(_tg_pick)
+
+                print(f"[recommender] Totals guarantee injected: "
+                      f"{_best_total.get('pick')} {_best_total.get('point')} "
+                      f"(cushion={_best_total.get('_totals_cushion', '?')}) + "
+                      f"{_best_spread.get('pick')} | "
+                      f"composite={_tg_composite:.4f} tc_adj={_tg_tc_adj:.3f}")
+
     # ── Pool assessment metadata ───────────────────────────────────────────────
     n_high_quality = sum(1 for l in pool if (l.get("lqs") or 0) >= 60)
     n_good_quality = sum(1 for l in pool if 55 <= (l.get("lqs") or 0) < 60)
@@ -1854,6 +2707,15 @@ def generate_todays_picks(
         _p.setdefault("confidence_tier", "A")
         _p.setdefault("tier_label",      "Sharp Picks")
         _p.setdefault("show_warning",    False)
+
+    # ── Market type mix tag for tracking totals vs spread performance ────────
+    for _p in anchor_picks + core_picks + mixed_picks + all_picks + section_a_picks:
+        _leg_mkts = [
+            (lg.get("market_type") or lg.get("market") or "").lower()
+            for lg in _p.get("legs", [])
+        ]
+        _p["market_type_mix"] = ("totals_mixed" if any("total" in m for m in _leg_mkts)
+                                  else "spreads_only")
 
     # ── Regime A/B shadow run (never changes what gets served) ───────────────
     # Logged for post-hoc win-rate comparison.  Standard picks always returned.
@@ -1986,11 +2848,12 @@ def _format_pick(cand: dict, stake: float, db=None) -> dict:
             "alt_line_label":        "⚡ Alt Line — Better Quality" if is_alt else None,
             "hist_win_rate":         round(strat.get_leg_win_rate(
                                         l.get("market_label","Moneyline"))*100, 1),
-            # model_used already present on leg from score_leg(); make canonical label
-            "model_used": _MODEL_LABEL.get(
-                _normalize_sport(l.get("sport", "")),
-                l.get("model_used", _DEFAULT_MODEL_LABEL),
-            ) if l.get("model_used", "global") != "global" else _DEFAULT_MODEL_LABEL,
+            # model_used already present on leg from score_leg(); preserve it
+            # if specific (e.g. mlb_totals_v1), otherwise fall back to sport label
+            "model_used": l.get("model_used", _DEFAULT_MODEL_LABEL)
+            if l.get("model_used", "global") not in ("global", "implied")
+            else _MODEL_LABEL.get(
+                _normalize_sport(l.get("sport", "")), _DEFAULT_MODEL_LABEL),
         })
 
     payout_10 = round((cand["combined_odds"]-1)*10, 2)

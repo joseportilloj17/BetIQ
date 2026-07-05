@@ -332,6 +332,7 @@
   <div class="nav-section">Analytics</div>
   <div class="nav-item" onclick="showPage('attribution')">📈 Attribution</div>
   <div class="nav-item" onclick="showPage('simulation')">🧪 Simulation</div>
+  <div class="nav-item" onclick="showPage('negbin')" style="color:var(--purple,#a855f7)">🔬 NegBin Shadow</div>
   <div class="nav-item" onclick="showPage('bankroll')">💰 Bankroll</div>
   <div class="nav-item" id="nav-recommend" onclick="showPage('recommend')" style="color:var(--amber);font-weight:600">⭐ Today's Picks</div>
   <div class="nav-item active" onclick="showPage('dashboard')">📊 Dashboard</div>
@@ -353,6 +354,8 @@
   <div class="nav-section">Model</div>
   <div class="nav-item" onclick="showPage('model')">🧠 Train / Backtest</div>
   <div class="nav-item" onclick="showPage('risk')">⚖️ Risk Profile</div>
+  <div class="nav-section">System</div>
+  <div class="nav-item" onclick="showPage('admin')">⚙️ Admin</div>
 </nav>
 
 <!-- Main content -->
@@ -2056,6 +2059,20 @@ Rockets +4.5  Alt Spread  -950"
     <div id="sim-top-picks-accuracy"><div class="loading">Loading…</div></div>
   </div>
 
+  <!-- Top Picks Calibration -->
+  <div class="card" id="sim-calibration-card" style="margin-bottom:20px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <div>
+        <div class="card-title" style="margin:0">Picks Calibration &amp; Validation Signal</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">
+          Does predicted win prob match actual outcomes? · per-leg accuracy · Kelly ROI tiers
+        </div>
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="loadTopPicksCalibration()">↻</button>
+    </div>
+    <div id="sim-calibration-content"><div class="loading">Loading…</div></div>
+  </div>
+
   <!-- A: Trust Meter -->
   <div style="display:grid;grid-template-columns:1fr 2fr;gap:16px;margin-bottom:20px">
     <div class="card" id="trust-meter-card">
@@ -2065,11 +2082,20 @@ Rockets +4.5  Alt Spread  -950"
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
         <div class="card-title" style="margin:0">Performance Summary</div>
-        <select id="sim-days" onchange="loadSimulation()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
-          <option value="7">7 days</option>
-          <option value="30" selected>30 days</option>
-          <option value="90">90 days</option>
-        </select>
+        <div style="display:flex;gap:6px;align-items:center">
+          <div id="sim-cat-toggle" style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;font-size:11px">
+            <button onclick="setSimCatFilter('')"    id="sim-cat-all"  style="padding:4px 8px;background:var(--blue);color:#fff;border:none;cursor:pointer">All</button>
+            <button onclick="setSimCatFilter('team')"         id="sim-cat-team" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Team</button>
+            <button onclick="setSimCatFilter('player_prop')"  id="sim-cat-prop" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Props</button>
+          </div>
+          <select id="sim-days" onchange="loadSimulationDebounced()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+            <option value="today">Today</option>
+            <option value="yesterday">Yesterday</option>
+            <option value="7">7 days</option>
+            <option value="30" selected>30 days</option>
+            <option value="90">90 days</option>
+          </select>
+        </div>
       </div>
       <div id="sim-perf-summary"><div class="loading">Loading…</div></div>
     </div>
@@ -2165,7 +2191,17 @@ Rockets +4.5  Alt Spread  -950"
         <div class="card-title" style="margin:0">Model Progress</div>
         <div style="font-size:11px;color:var(--muted);margin-top:2px">Weekly performance snapshots · tier segmentation · trust gates</div>
       </div>
-      <button class="btn btn-ghost btn-sm" onclick="loadModelProgress()">↻</button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="mp-days" onchange="loadModelProgress()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+          <option value="0" selected>Overall</option>
+          <option value="today">Today</option>
+          <option value="yesterday">Yesterday</option>
+          <option value="7">7 days</option>
+          <option value="30">30 days</option>
+          <option value="90">90 days</option>
+        </select>
+        <button class="btn btn-ghost btn-sm" onclick="loadModelProgress()">↻</button>
+      </div>
     </div>
     <div id="model-progress-content"><div class="loading">Loading…</div></div>
   </div>
@@ -2182,11 +2218,43 @@ Rockets +4.5  Alt Spread  -950"
     <div id="line-quality-content"><div class="loading">Loading…</div></div>
   </div>
 
+  <!-- LIVE PICKS card -->
+  <div class="card" id="live-picks-card" style="margin-bottom:20px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div class="card-title" style="margin:0">Live Picks</div>
+        <span id="live-picks-badge" style="font-size:11px;font-weight:600;padding:3px 10px;border-radius:12px;letter-spacing:0.5px"></span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span id="live-picks-count" style="font-size:11px;color:var(--muted)"></span>
+        <button class="btn btn-ghost btn-sm" onclick="loadLivePicks()">&#8635;</button>
+      </div>
+    </div>
+    <div id="live-picks-content"><div class="loading">Loading...</div></div>
+  </div>
+
   <!-- G: Mock bet log -->
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
       <div class="card-title" style="margin:0">Mock Bet Log</div>
       <div style="display:flex;gap:8px;align-items:center">
+        <div style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;font-size:11px">
+          <button onclick="setLogSourceFilter('model')"      id="log-src-model" style="padding:4px 8px;background:var(--blue);color:#fff;border:none;cursor:pointer">Model</button>
+          <button onclick="setLogSourceFilter('')"            id="log-src-all"   style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">All</button>
+          <button onclick="setLogSourceFilter('exploration')" id="log-src-expl"  style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Explore</button>
+          <button onclick="setLogSourceFilter('shadow')"      id="log-src-shadow" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Shadow</button>
+        </div>
+        <div style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;font-size:11px">
+          <button onclick="setLogCatFilter('')"           id="log-cat-all"  style="padding:4px 8px;background:var(--blue);color:#fff;border:none;cursor:pointer">All</button>
+          <button onclick="setLogCatFilter('team')"       id="log-cat-team" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Team</button>
+          <button onclick="setLogCatFilter('player_prop')" id="log-cat-prop" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Props</button>
+        </div>
+        <div style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;font-size:11px">
+          <button onclick="setTierFilter('')"    id="tier-all" style="padding:4px 8px;background:var(--blue);color:#fff;border:none;cursor:pointer">All</button>
+          <button onclick="setTierFilter('T1')"  id="tier-t1"  style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">T1</button>
+          <button onclick="setTierFilter('T2')" id="tier-t2" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">T2</button>
+          <button onclick="setTierFilter('T3')"  id="tier-t3"  style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">T3</button>
+        </div>
         <select id="mock-log-status" onchange="_mockPage=0;loadMockBetLog()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
           <option value="">All</option>
           <option value="PENDING">Pending</option>
@@ -2199,6 +2267,103 @@ Rockets +4.5  Alt Spread  -950"
       </div>
     </div>
     <div id="mock-bet-log" class="table-wrap"><div class="loading">Loading…</div></div>
+  </div>
+</div>
+
+<!-- ── NegBin Shadow Tracker ── -->
+<div class="page" id="page-negbin">
+  <div class="page-header">
+    <div>
+      <div class="page-title">NegBin Shadow Tracker</div>
+      <div class="page-sub">Forward shadow evaluation &middot; Band-for-band vs live ATS &middot; Graduation read</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <!-- Cohort filter -->
+      <div id="nb-cohort-filter" style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;font-size:11px">
+        <button onclick="setNbCohort('clean')" id="nb-coh-clean" style="padding:4px 10px;background:var(--blue);color:#fff;border:none;cursor:pointer">Clean</button>
+        <button onclick="setNbCohort('prospective_legacy')" id="nb-coh-legacy" style="padding:4px 10px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Legacy</button>
+        <button onclick="setNbCohort('all')" id="nb-coh-all" style="padding:4px 10px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">All</button>
+      </div>
+      <!-- View toggle: Measurement vs Live-realistic -->
+      <div id="nb-view-filter" style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;font-size:11px">
+        <button onclick="setNbView('measurement')" id="nb-view-meas" style="padding:4px 10px;background:var(--blue);color:#fff;border:none;cursor:pointer">Measurement</button>
+        <button onclick="setNbView('live_realistic')" id="nb-view-live" style="padding:4px 10px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Live-Realistic</button>
+      </div>
+      <select id="nb-days" onchange="loadNegbin()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+        <option value="7">7 days</option>
+        <option value="14">14 days</option>
+        <option value="30" selected>30 days</option>
+        <option value="90">90 days</option>
+      </select>
+      <button class="btn btn-ghost btn-sm" onclick="loadNegbin()">Refresh</button>
+    </div>
+  </div>
+
+  <!-- Status strip -->
+  <div id="nb-status-strip" style="margin-bottom:16px;padding:9px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)">
+    <span>Loading...</span>
+  </div>
+
+  <!-- Band-for-band table (graduation core) -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:12px">Band-for-Band Performance</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">NegBin shadow vs live ATS baseline &middot; effective-N discounts for leg reuse correlation</div>
+    <div id="nb-band-table"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- 2x2 Cell Performance + Parlay Structure side by side -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
+    <div class="card">
+      <div class="card-title" style="margin-bottom:12px">2x2 Cell Performance</div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Fav/Dog x Home/Away mispricing thesis</div>
+      <div id="nb-cell-grid"><div class="loading">Loading...</div></div>
+    </div>
+    <div class="card">
+      <div class="card-title" style="margin-bottom:12px">Parlay Structure</div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Leg count distribution &middot; reuse profile &middot; underfill diagnostics</div>
+      <div id="nb-structure"><div class="loading">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Daily trend -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:12px">Daily Trend</div>
+    <div id="nb-daily"><div class="loading">Loading...</div></div>
+    <canvas id="nb-daily-chart" style="max-height:180px;display:none"></canvas>
+  </div>
+
+  <!-- Parlay log (drill-down) -->
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div>
+        <div class="card-title" style="margin:0">Shadow Parlay Log</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">Click a parlay to inspect legs</div>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select id="nb-log-band" onchange="renderNbLog()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:6px;font-size:11px">
+          <option value="">All Bands</option>
+          <option value="1.3-1.7x">1.3-1.7x</option>
+          <option value="1.7-2.2x">1.7-2.2x</option>
+          <option value="2.2-2.8x">2.2-2.8x</option>
+          <option value="2.8-3.5x">2.8-3.5x</option>
+          <option value="3.5-5.0x">3.5-5.0x</option>
+        </select>
+        <select id="nb-log-status" onchange="renderNbLog()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:6px;font-size:11px">
+          <option value="">All Status</option>
+          <option value="PENDING">Pending</option>
+          <option value="WON">Won</option>
+          <option value="LOST">Lost</option>
+        </select>
+      </div>
+    </div>
+    <div id="nb-parlay-log" class="table-wrap"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- Drill-down modal -->
+  <div id="nb-drill-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:1000;justify-content:center;align-items:center" onclick="if(event.target===this)this.style.display='none'">
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:12px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto;padding:24px">
+      <div id="nb-drill-content"></div>
+    </div>
   </div>
 </div>
 
@@ -2794,7 +2959,247 @@ Rockets +4.5  Alt Spread  -950"
   </div><!-- /oddslab-panel-main -->
 </div><!-- /page-oddslab -->
 
+<!-- ── Admin ── -->
+<div class="page" id="page-admin">
+  <div class="page-header">
+    <div>
+      <div class="page-title">⚙️ Admin</div>
+      <div class="page-sub">Server status, quick actions, and bet-slip screenshot upload</div>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="loadAdminStatus()">↻ Refresh</button>
+  </div>
+
+  <!-- Status cards -->
+  <div class="section-label" style="font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 10px">Server Status</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+    <div style="background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px 12px">
+      <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Total Settled</div>
+      <div id="admin-stat-settled" style="font-size:1.1rem;font-weight:700;color:var(--muted)">…</div>
+    </div>
+    <div style="background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px 12px">
+      <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Win Rate</div>
+      <div id="admin-stat-wr" style="font-size:1.1rem;font-weight:700;color:var(--muted)">…</div>
+    </div>
+    <div style="background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px 12px">
+      <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Today's Picks</div>
+      <div id="admin-stat-picks" style="font-size:1.1rem;font-weight:700;color:var(--muted)">…</div>
+    </div>
+    <div style="background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px 12px">
+      <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Pending Bets</div>
+      <div id="admin-stat-pending" style="font-size:1.1rem;font-weight:700;color:var(--muted)">…</div>
+    </div>
+  </div>
+  <div style="background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px 12px;margin-bottom:18px">
+    <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Server Time</div>
+    <div id="admin-stat-uptime" style="font-size:1.1rem;font-weight:700;color:var(--muted)">…</div>
+  </div>
+
+  <!-- Action buttons -->
+  <div class="section-label" style="font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 10px">Actions</div>
+
+  <button class="btn" style="display:block;width:100%;padding:16px 18px;margin-bottom:12px;border:none;border-radius:12px;font-size:1rem;font-weight:600;cursor:pointer;text-align:left;background:#1e40af;color:#fff;position:relative;transition:opacity .15s"
+    onclick="runAdminAction(this,'POST','/api/mock-bets/settle','Run Settlement','admin-result')">
+    <span style="display:block;font-size:1rem">Run Settlement</span>
+    <span style="display:block;font-size:0.75rem;font-weight:400;opacity:0.7;margin-top:3px">Settle all pending mock bets</span>
+    <span class="admin-spinner" style="display:none;position:absolute;right:18px;top:50%;transform:translateY(-50%);width:18px;height:18px;border:3px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:adminSpin .7s linear infinite"></span>
+  </button>
+
+  <button class="btn" style="display:block;width:100%;padding:16px 18px;margin-bottom:12px;border:none;border-radius:12px;font-size:1rem;font-weight:600;cursor:pointer;text-align:left;background:#065f46;color:#fff;position:relative;transition:opacity .15s"
+    onclick="runAdminAction(this,'POST','/api/recommend/today','Generate PM Picks','admin-result')">
+    <span style="display:block;font-size:1rem">Generate PM Picks</span>
+    <span style="display:block;font-size:0.75rem;font-weight:400;opacity:0.7;margin-top:3px">Refresh today's recommendations</span>
+    <span class="admin-spinner" style="display:none;position:absolute;right:18px;top:50%;transform:translateY(-50%);width:18px;height:18px;border:3px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:adminSpin .7s linear infinite"></span>
+  </button>
+
+  <button class="btn" style="display:block;width:100%;padding:16px 18px;margin-bottom:12px;border:none;border-radius:12px;font-size:1rem;font-weight:600;cursor:pointer;text-align:left;background:#6b21a8;color:#fff;position:relative;transition:opacity .15s"
+    onclick="runAdminAction(this,'POST','/api/scout/calibration/run','Refresh Calibration','admin-result')">
+    <span style="display:block;font-size:1rem">Refresh Calibration</span>
+    <span style="display:block;font-size:0.75rem;font-weight:400;opacity:0.7;margin-top:3px">Run scout calibration check</span>
+    <span class="admin-spinner" style="display:none;position:absolute;right:18px;top:50%;transform:translateY(-50%);width:18px;height:18px;border:3px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:adminSpin .7s linear infinite"></span>
+  </button>
+
+  <button class="btn" style="display:block;width:100%;padding:16px 18px;margin-bottom:12px;border:none;border-radius:12px;font-size:1rem;font-weight:600;cursor:pointer;text-align:left;background:#92400e;color:#fff;position:relative;transition:opacity .15s"
+    onclick="runAdminAction(this,'POST','/api/health/refresh-injuries','Refresh Injuries','admin-result')">
+    <span style="display:block;font-size:1rem">Refresh Injuries</span>
+    <span style="display:block;font-size:0.75rem;font-weight:400;opacity:0.7;margin-top:3px">Pull latest injury reports</span>
+    <span class="admin-spinner" style="display:none;position:absolute;right:18px;top:50%;transform:translateY(-50%);width:18px;height:18px;border:3px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:adminSpin .7s linear infinite"></span>
+  </button>
+
+  <button class="btn" style="display:block;width:100%;padding:16px 18px;margin-bottom:12px;border:none;border-radius:12px;font-size:1rem;font-weight:600;cursor:pointer;text-align:left;background:#1e3a5f;color:#fff;position:relative;transition:opacity .15s"
+    onclick="runAdminAction(this,'POST','/api/validation/run','Run Validations','admin-result')">
+    <span style="display:block;font-size:1rem">Run Validations</span>
+    <span style="display:block;font-size:0.75rem;font-weight:400;opacity:0.7;margin-top:3px">Model + signal validation suite</span>
+    <span class="admin-spinner" style="display:none;position:absolute;right:18px;top:50%;transform:translateY(-50%);width:18px;height:18px;border:3px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:adminSpin .7s linear infinite"></span>
+  </button>
+
+  <div id="admin-result" style="display:none;margin-top:6px;padding:14px;border-radius:10px;background:var(--surface2);border:1px solid var(--border);font-size:0.82rem;line-height:1.6;white-space:pre-wrap;word-break:break-word">
+    <div id="admin-result-label" style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px"></div>
+    <div id="admin-result-body"></div>
+  </div>
+
+  <!-- Screenshot upload -->
+  <div class="section-label" style="font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:22px 0 10px">Upload Bet Slip Screenshot</div>
+
+  <div style="background:var(--surface2);border:2px dashed var(--border);border-radius:12px;padding:20px 16px;text-align:center;margin-bottom:12px">
+    <label for="admin-slip-file" style="display:block;cursor:pointer;font-size:0.9rem;color:var(--muted);margin-bottom:8px">
+      Tap to choose a screenshot (camera or photo roll)
+    </label>
+    <input type="file" id="admin-slip-file" accept="image/*"
+           onchange="adminOnFileChosen(this)" style="display:none">
+    <div id="admin-file-name" style="font-size:0.8rem;color:var(--green);min-height:18px"></div>
+  </div>
+
+  <button id="admin-upload-btn" onclick="adminUploadScreenshot(this)"
+    disabled style="display:block;width:100%;padding:16px 18px;margin-bottom:12px;border:none;border-radius:12px;font-size:1rem;font-weight:600;cursor:pointer;text-align:left;background:#0e7490;color:#fff;position:relative;transition:opacity .15s;opacity:0.4">
+    <span style="display:block;font-size:1rem">Parse Screenshot</span>
+    <span style="display:block;font-size:0.75rem;font-weight:400;opacity:0.7;margin-top:3px">Upload to /api/fanduel/parse-screenshot</span>
+    <span class="admin-spinner" style="display:none;position:absolute;right:18px;top:50%;transform:translateY(-50%);width:18px;height:18px;border:3px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:adminSpin .7s linear infinite"></span>
+  </button>
+
+  <div id="admin-ts-block" style="display:none;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:14px 12px;margin-bottom:10px">
+    <div id="admin-ts-display" style="font-size:0.85rem;color:var(--muted);margin-bottom:10px"></div>
+    <label style="font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:4px" for="admin-ts-override">Override timestamp</label>
+    <input type="datetime-local" id="admin-ts-override"
+      style="width:100%;background:var(--surface1,#0f1117);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:10px 12px;font-size:0.9rem">
+  </div>
+
+  <!-- ── Browsing-page game-card UI ── -->
+  <div id="admin-game-result" style="display:none;margin-top:6px">
+
+    <!-- Status bar -->
+    <div id="admin-game-status" style="padding:10px 14px;border-radius:10px;background:var(--surface2);border:1px solid var(--border);font-size:0.82rem;margin-bottom:10px"></div>
+
+    <!-- Raw OCR (collapsible) -->
+    <details id="admin-game-raw-details" style="background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:10px 14px;margin-bottom:12px">
+      <summary style="cursor:pointer;font-size:0.75rem;color:var(--muted);user-select:none">▶ Raw OCR text</summary>
+      <pre id="admin-game-raw-text" style="margin-top:8px;font-size:0.72rem;white-space:pre-wrap;word-break:break-word;color:var(--muted);max-height:200px;overflow-y:auto"></pre>
+    </details>
+
+    <!-- Game cards -->
+    <div id="admin-game-cards"></div>
+
+    <!-- Warnings -->
+    <div id="admin-game-warnings" style="display:none;padding:10px 14px;border-radius:8px;background:#451a1a;border:1px solid #7f1d1d;font-size:0.78rem;color:#fca5a5;margin-bottom:60px;line-height:1.6"></div>
+
+    <!-- Sticky bottom bar for selected legs -->
+    <div id="admin-game-sticky" style="display:none;position:sticky;bottom:0;left:0;right:0;background:var(--surface1,#0f1117);border-top:1px solid var(--border);padding:12px 16px;z-index:50">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <div style="flex:1;min-width:120px">
+          <span id="admin-sel-count" style="font-weight:700;font-size:1rem">0 legs</span>
+          <span id="admin-sel-odds" style="color:var(--amber,#f59e0b);font-weight:700;margin-left:8px"></span>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <div>
+            <input id="admin-game-stake" type="number" step="0.01" value="10" placeholder="Stake $"
+              style="width:80px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 10px;font-size:0.85rem">
+          </div>
+          <button onclick="adminSubmitGameLines(this)"
+            style="padding:10px 18px;border:none;border-radius:10px;background:var(--amber,#f59e0b);color:#000;font-weight:700;font-size:0.9rem;cursor:pointer;position:relative">
+            Submit Bet
+            <span class="admin-spinner" style="display:none;position:absolute;right:10px;top:50%;transform:translateY(-50%);width:14px;height:14px;border:2px solid rgba(0,0,0,.2);border-top-color:#000;border-radius:50%;animation:adminSpin .7s linear infinite"></span>
+          </button>
+        </div>
+      </div>
+      <div id="admin-game-submit-result" style="display:none;margin-top:8px;padding:10px;border-radius:8px;background:var(--surface2);font-size:0.78rem;white-space:pre-wrap;word-break:break-word"></div>
+    </div>
+  </div>
+
+  <!-- Parse result + manual correction form -->
+  <div id="admin-parse-result" style="display:none;margin-top:6px">
+
+    <!-- Status bar -->
+    <div id="admin-parse-status" style="padding:10px 14px;border-radius:10px;background:var(--surface2);border:1px solid var(--border);font-size:0.82rem;margin-bottom:10px"></div>
+
+    <!-- Raw OCR text (collapsible) -->
+    <details id="admin-raw-text-details" style="background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:10px 14px;margin-bottom:12px">
+      <summary style="cursor:pointer;font-size:0.75rem;color:var(--muted);user-select:none">▶ Raw OCR text (tap to expand)</summary>
+      <pre id="admin-raw-text" style="margin-top:8px;font-size:0.72rem;white-space:pre-wrap;word-break:break-word;color:var(--muted);max-height:200px;overflow-y:auto"></pre>
+    </details>
+
+    <!-- Parsed legs editor -->
+    <div style="font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 8px">Parsed Legs</div>
+    <div id="admin-legs-container"></div>
+    <button onclick="adminAddLeg()" style="display:block;width:100%;padding:12px;margin-bottom:16px;border:1px dashed var(--border);border-radius:10px;background:transparent;color:var(--muted);font-size:0.85rem;cursor:pointer">+ Add leg</button>
+
+    <!-- Bet summary fields -->
+    <div style="font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 8px">Bet Summary</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+      <div>
+        <div style="font-size:0.68rem;color:var(--muted);margin-bottom:3px">Combined Odds</div>
+        <input id="admin-summary-odds" type="text" placeholder="+450" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:9px 10px;font-size:0.9rem">
+      </div>
+      <div>
+        <div style="font-size:0.68rem;color:var(--muted);margin-bottom:3px">Stake ($)</div>
+        <input id="admin-summary-stake" type="number" step="0.01" placeholder="10.00" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:9px 10px;font-size:0.9rem">
+      </div>
+      <div>
+        <div style="font-size:0.68rem;color:var(--muted);margin-bottom:3px">Potential Payout ($)</div>
+        <input id="admin-summary-payout" type="number" step="0.01" placeholder="55.00" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:9px 10px;font-size:0.9rem">
+      </div>
+      <div>
+        <div style="font-size:0.68rem;color:var(--muted);margin-bottom:3px">Bet Status</div>
+        <select id="admin-summary-status" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:9px 10px;font-size:0.9rem">
+          <option value="PENDING">Pending</option>
+          <option value="SETTLED_WIN">Won</option>
+          <option value="SETTLED_LOSS">Lost</option>
+          <option value="CASHED_OUT">Cashed Out</option>
+          <option value="PUSH">Push</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Warnings -->
+    <div id="admin-warnings" style="display:none;padding:10px 14px;border-radius:8px;background:#451a1a;border:1px solid #7f1d1d;font-size:0.78rem;color:#fca5a5;margin-bottom:12px;line-height:1.6"></div>
+
+    <!-- Submit button -->
+    <div style="padding:8px 0 4px;font-size:0.7rem;color:var(--muted);text-align:center">
+      Review the fields above, correct any OCR errors, then submit.
+    </div>
+    <button id="admin-submit-btn" onclick="adminSubmitParsed(this)"
+      style="display:block;width:100%;padding:16px;border:none;border-radius:12px;background:var(--amber,#f59e0b);color:#000;font-size:1rem;font-weight:700;cursor:pointer;position:relative;transition:opacity .15s">
+      Submit to A/B Test
+      <span class="admin-spinner" style="display:none;position:absolute;right:18px;top:50%;transform:translateY(-50%);width:18px;height:18px;border:3px solid rgba(0,0,0,.2);border-top-color:#000;border-radius:50%;animation:adminSpin .7s linear infinite"></span>
+    </button>
+    <div id="admin-submit-result" style="display:none;margin-top:8px;padding:12px 14px;border-radius:10px;background:var(--surface2);border:1px solid var(--border);font-size:0.82rem;white-space:pre-wrap;word-break:break-word"></div>
+  </div>
+</div><!-- /page-admin -->
+
 </main>
+</div>
+
+<!-- Place Bet Modal -->
+<div id="place-bet-modal" onclick="if(event.target===this)_closePlaceBetModal()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;width:380px;max-width:90vw;overflow:hidden">
+    <div id="place-bet-header" style="padding:12px 16px;border-bottom:1px solid var(--border);font-weight:700;font-size:13px;color:var(--text)"></div>
+    <div style="padding:16px;display:flex;flex-direction:column;gap:12px">
+      <div id="place-bet-legs" style="font-size:12px;color:var(--muted);max-height:120px;overflow-y:auto"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:3px">Combined Odds (American)</label>
+          <input id="place-bet-odds" type="number" style="width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:6px;font-size:13px">
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:3px">Stake ($)</label>
+          <input id="place-bet-stake" type="number" step="0.01" value="10.00" style="width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:6px;font-size:13px">
+        </div>
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--muted);display:block;margin-bottom:3px">Book</label>
+        <select id="place-bet-book" style="width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:6px;font-size:13px">
+          <option value="FanDuel">FanDuel</option>
+          <option value="DraftKings">DraftKings</option>
+          <option value="BetMGM">BetMGM</option>
+          <option value="Caesars">Caesars</option>
+          <option value="Other">Other</option>
+        </select>
+      </div>
+      <div id="place-bet-payout" style="font-size:12px;color:var(--green);text-align:right"></div>
+    </div>
+    <div style="padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end">
+      <button onclick="_closePlaceBetModal()" style="padding:7px 16px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;cursor:pointer;font-size:13px">Cancel</button>
+      <button id="place-bet-confirm" onclick="_confirmPlaceBet()" style="padding:7px 16px;background:var(--green);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">Confirm Placed</button>
+    </div>
+  </div>
 </div>
 
 <div id="toast">✓ Done</div>
@@ -2843,11 +3248,12 @@ async function apiFetch(path, opts={}) {
 }
 
 // ── Navigation ─────────────────────────────────────────────────────────────
-function showPage(name) {
+function showPage(name, skipHash) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   document.getElementById('page-'+name)?.classList.add('active');
   document.querySelector(`[onclick="showPage('${name}')"]`)?.classList.add('active');
+  if (!skipHash) window.location.hash = name;
   const loaders = {
     dashboard:   loadDashboard,
     slip:        () => { checkSlipStatus(); switchSlipTab('paste'); },
@@ -2865,6 +3271,7 @@ function showPage(name) {
     livebets:    () => { loadLiveBets(); loadCashOutPerformance(); },
     theses:      loadThesesPage,
     abtest:      loadAbTest,
+    negbin:      loadNegbin,
   };
   loaders[name]?.();
 }
@@ -2987,18 +3394,21 @@ function _startHealthPoll() {
 }
 
 async function loadDashboard() {
-  const [sum, legs, sport, pnl, market] = await Promise.all([
+  // Batch 1: core stats (3 calls)
+  const [sum, legs, sport] = await Promise.all([
     apiFetch('/api/stats/summary'), apiFetch('/api/stats/by-legs'),
-    apiFetch('/api/stats/by-sport'), apiFetch('/api/stats/monthly-pnl'),
-    apiFetch('/api/stats/by-market'),
+    apiFetch('/api/stats/by-sport'),
   ]);
   if (!sum) return;
   renderStats(sum); renderLegsChart(legs||[]); renderSportChart(sport||[]);
-  renderPnlChart(pnl||[]); renderMarketChart(market||[]); renderTypeChart(sum);
-  loadPromoPerformanceWidget();
-  loadDashboardCashOutWidget();
-  loadDashboardBetSummary();
-  loadDashboardCurationCard();
+  renderTypeChart(sum);
+  // Batch 2: remaining charts + widgets (staggered)
+  const [pnl, market] = await Promise.all([
+    apiFetch('/api/stats/monthly-pnl'), apiFetch('/api/stats/by-market'),
+  ]);
+  renderPnlChart(pnl||[]); renderMarketChart(market||[]);
+  await Promise.all([loadPromoPerformanceWidget(), loadDashboardCashOutWidget()]);
+  await Promise.all([loadDashboardBetSummary(), loadDashboardCurationCard()]);
 }
 
 // ── Promo performance widget ───────────────────────────────────────────────────
@@ -3333,7 +3743,7 @@ async function loadBetHistoryNew(source) {
       const badgeLabel = isWin ? 'WIN' : isLoss ? 'LOSS' : (b.status||'').replace('SETTLED_','');
       const profit = b.sim_pnl != null ? (b.sim_pnl >= 0 ? `<span style="color:var(--green)">+$${b.sim_pnl.toFixed(2)}</span>` : `<span style="color:var(--red)">-$${Math.abs(b.sim_pnl).toFixed(2)}</span>`) : '—';
       const srcBadge = `<span style="font-size:10px;color:var(--muted);margin-left:4px">${(b.source||'').replace('_',' ')}</span>`;
-      const date   = b.generated_at ? b.generated_at.slice(0,10) : (b.game_date||'—');
+      const date   = b.game_date || (b.generated_at ? b.generated_at.slice(0,10) : '—');
       const lqs    = b.avg_lqs != null ? `<span style="font-size:10px;color:var(--muted)"> LQS ${b.avg_lqs.toFixed(2)}</span>` : '';
       const expandId = 'simleg-' + (b.bet_id||'').toString().slice(0,8);
       const betOdds = b.odds || 1;
@@ -6889,6 +7299,15 @@ async function _autoFeedMockBets(picks) {
   if (_lastAutoFeedDate === today) return; // already fed today
   _lastAutoFeedDate = today;
 
+  // Fallback only: the scheduler seeds top_picks server-side after
+  // the AM and PM chains.  Only fire from the frontend if no
+  // top_picks_page bets exist for today (scheduler missed / server
+  // was down when chain ran).
+  try {
+    const chk = await apiFetch('/api/mock-bets/top-picks-count');
+    if (chk && chk.count > 0) return; // scheduler already seeded
+  } catch (_e) { /* proceed with generation on status fetch failure */ }
+
   const stake = parseFloat(document.getElementById('rec-stake')?.value || 10);
   const n     = parseInt(document.getElementById('rec-n')?.value       || 5);
   await apiFetch('/api/mock-bets/generate', {
@@ -6915,6 +7334,309 @@ async function loadTopPicksAccuracy(forSimPage) {
     renderTopPicksAccuracy(stripEl, perf7);
     if (stripWrap) stripWrap.style.display = 'block';
   }
+}
+
+// ── Top Picks Calibration ──────────────────────────────────────────────────────
+async function loadTopPicksCalibration() {
+  const el = document.getElementById('sim-calibration-content');
+  if (!el) return;
+  const days = document.getElementById('sim-days')?.value || 30;
+  let data = await apiFetch(`/api/mock-bets/top-picks-calibration?days=${days}`);
+  // Retry once on DB lock errors (common at server startup under concurrent load)
+  if (data?.error) {
+    await new Promise(r => setTimeout(r, 2500));
+    data = await apiFetch(`/api/mock-bets/top-picks-calibration?days=${days}`);
+  }
+  renderTopPicksCalibration(el, data);
+}
+
+function renderTopPicksCalibration(el, data) {
+  if (!data || data.error) {
+    el.innerHTML = '<span style="color:var(--muted);font-size:12px">No calibration data available yet.</span>';
+    return;
+  }
+
+  const overall     = data.overall || {};
+  const parlayBkts  = data.parlay_calibration || [];
+  const legBkts     = data.leg_accuracy || [];
+  const mlcBkts     = data.min_leg_conf_buckets || [];
+  const kellyBkts   = data.kelly_roi_buckets || [];
+  const n           = data.n_settled || 0;
+  const interp      = data.interpretation || '';
+  const warn        = data.data_warning;
+
+  // ── Color helpers ──────────────────────────────────────────────────────────
+  const deltaColor = d => Math.abs(d) <= 5 ? 'var(--green)' : (d > 5 ? 'var(--blue)' : 'var(--red)');
+  const roiColor   = r => r == null ? 'var(--muted)' : (r >= 0 ? 'var(--green)' : 'var(--red)');
+  const roiStr     = r => r == null ? '—' : (r >= 0 ? `+${r}%` : `${r}%`);
+
+  // ── Warning banner ─────────────────────────────────────────────────────────
+  const warnHtml = warn ? `
+    <div style="padding:8px 12px;background:rgba(245,158,11,.1);border:1px solid var(--amber);
+                border-radius:6px;font-size:12px;color:var(--amber);margin-bottom:14px">
+      ⚠ ${warn}
+    </div>` : '';
+
+  // ── Overall stat tiles ─────────────────────────────────────────────────────
+  const wrColor  = (overall.win_rate_pct || 0) >= (overall.avg_predicted_wp || 0)
+                    ? 'var(--green)' : 'var(--red)';
+  const legWrColor = (overall.leg_win_rate_pct || 0) >= (overall.avg_leg_wp || 0)
+                    ? 'var(--green)' : 'var(--red)';
+
+  const overallHtml = `
+    <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:18px">
+      <div style="padding:10px;background:var(--surface2);border-radius:8px;text-align:center">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:3px">Settled</div>
+        <div style="font-size:18px;font-weight:700;color:var(--text)">${n}</div>
+        <div style="font-size:10px;color:var(--muted)">parlays</div>
+      </div>
+      <div style="padding:10px;background:var(--surface2);border-radius:8px;text-align:center">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:3px">Actual WR</div>
+        <div style="font-size:18px;font-weight:700;color:${wrColor}">${overall.win_rate_pct ?? '—'}%</div>
+        <div style="font-size:10px;color:var(--muted)">predicted ${overall.avg_predicted_wp ?? '—'}%</div>
+      </div>
+      <div style="padding:10px;background:var(--surface2);border-radius:8px;text-align:center">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:3px">ROI</div>
+        <div style="font-size:18px;font-weight:700;color:${roiColor(overall.roi_pct)}">${roiStr(overall.roi_pct)}</div>
+        <div style="font-size:10px;color:var(--muted)">25% Kelly / $500</div>
+      </div>
+      <div style="padding:10px;background:var(--surface2);border-radius:8px;text-align:center">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:3px">Brier Score</div>
+        <div style="font-size:18px;font-weight:700;color:var(--text)">${overall.brier_score ?? '—'}</div>
+        <div style="font-size:10px;color:var(--muted)">parlay WP · ↓ better</div>
+      </div>
+      <div style="padding:10px;background:var(--surface2);border-radius:8px;text-align:center">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:3px">Leg Win Rate</div>
+        <div style="font-size:18px;font-weight:700;color:${legWrColor}">${overall.leg_win_rate_pct ?? '—'}%</div>
+        <div style="font-size:10px;color:var(--muted)">pred ${overall.avg_leg_wp ?? '—'}%</div>
+      </div>
+      <div style="padding:10px;background:var(--surface2);border-radius:8px;text-align:center">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:3px">Leg Brier</div>
+        <div style="font-size:18px;font-weight:700;color:var(--text)">${overall.leg_brier_score ?? '—'}</div>
+        <div style="font-size:10px;color:var(--muted)">per-leg · ↓ better</div>
+      </div>
+    </div>`;
+
+  // ── Calibration table builder ──────────────────────────────────────────────
+  function calibTable(rows, colLabel, hasBuckets) {
+    if (!rows.length) return '<span style="color:var(--muted);font-size:12px">No data yet.</span>';
+    const cols = hasBuckets
+      ? ['Predicted WP', 'n', 'Actual WR', 'Δ (pp)', 'ROI']
+      : [colLabel, 'n', 'Win Rate', 'ROI'];
+
+    const headerCols = cols.map(c =>
+      `<th style="padding:5px 8px;font-size:10px;color:var(--muted);text-align:right;white-space:nowrap;
+                  font-weight:600;text-transform:uppercase;letter-spacing:.04em">${c}</th>`
+    ).join('');
+
+    const bodyRows = rows.map(r => {
+      const actual = r.actual_win_pct ?? r.actual_win_pct ?? 0;
+      const delta  = r.delta_pp;
+      const roi    = r.avg_roi_pct;
+      // bar: fill = actual_win_pct as % of 100, capped at 100px
+      const barW   = Math.round(Math.min(actual, 100));
+      const barCol = actual >= (r.predicted_mid || 50) ? 'var(--green)' : 'var(--red)';
+
+      const cells = hasBuckets ? [
+        `<td style="padding:5px 8px;font-size:12px;font-weight:600;color:var(--text);white-space:nowrap">${r.bucket}</td>`,
+        `<td style="padding:5px 8px;font-size:12px;color:var(--muted);text-align:right">${r.predicted_mid ?? '—'}%</td>`,
+        `<td style="padding:5px 8px;text-align:right">
+          <div style="display:flex;align-items:center;justify-content:flex-end;gap:6px">
+            <div style="width:60px;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden">
+              <div style="width:${barW}%;height:100%;background:${barCol};border-radius:3px"></div>
+            </div>
+            <span style="font-size:12px;font-weight:700;color:${barCol};min-width:38px;text-align:right">${actual}%</span>
+          </div>
+        </td>`,
+        `<td style="padding:5px 8px;font-size:12px;font-weight:600;color:${delta != null ? deltaColor(delta) : 'var(--muted)'};text-align:right">
+          ${delta != null ? (delta > 0 ? '+' : '') + delta : '—'}
+        </td>`,
+        `<td style="padding:5px 8px;font-size:12px;font-weight:600;color:${roiColor(roi)};text-align:right">${roiStr(roi)}</td>`,
+      ] : [
+        `<td style="padding:5px 8px;font-size:12px;font-weight:600;color:var(--text);white-space:nowrap">${r.bucket}</td>`,
+        `<td style="padding:5px 8px;font-size:12px;color:var(--muted);text-align:right">${r.n ?? r.n_legs ?? 0}</td>`,
+        `<td style="padding:5px 8px;text-align:right">
+          <div style="display:flex;align-items:center;justify-content:flex-end;gap:6px">
+            <div style="width:60px;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden">
+              <div style="width:${barW}%;height:100%;background:${barCol};border-radius:3px"></div>
+            </div>
+            <span style="font-size:12px;font-weight:700;color:${barCol};min-width:38px;text-align:right">${actual}%</span>
+          </div>
+        </td>`,
+        `<td style="padding:5px 8px;font-size:12px;font-weight:600;color:${roiColor(roi)};text-align:right">${roiStr(roi)}</td>`,
+      ];
+
+      const nCell = hasBuckets
+        ? `<td style="padding:5px 8px;font-size:12px;color:var(--muted);text-align:right">${r.n}</td>`
+        : '';
+
+      return `<tr style="border-top:1px solid var(--border)">${cells.join('')}</tr>`;
+    }).join('');
+
+    // Fix: for hasBuckets tables insert n cell between bucket and predicted_mid
+    return `
+      <table style="width:100%;border-collapse:collapse">
+        <thead><tr>${headerCols}</tr></thead>
+        <tbody>${bodyRows}</tbody>
+      </table>`;
+  }
+
+  // Build a cleaner parlay calibration table manually
+  function parlayTable(rows) {
+    if (!rows.length) return '<span style="color:var(--muted);font-size:12px">No data yet.</span>';
+    const header = `
+      <tr>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:left">Bucket</th>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:right">n</th>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:right">Model Pred</th>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:right">Actual WR</th>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:right">Δ pp</th>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:right">ROI</th>
+      </tr>`;
+    const body = rows.map(r => {
+      const actual  = r.actual_win_pct;
+      const pred    = r.predicted_mid;
+      const delta   = r.delta_pp;
+      const roi     = r.avg_roi_pct;
+      const barW    = Math.round(Math.min(actual, 100));
+      const barCol  = actual >= pred ? 'var(--green)' : 'var(--red)';
+      return `
+        <tr style="border-top:1px solid var(--border)">
+          <td style="padding:5px 8px;font-size:12px;font-weight:600;color:var(--text)">${r.bucket}</td>
+          <td style="padding:5px 8px;font-size:12px;color:var(--muted);text-align:right">${r.n}</td>
+          <td style="padding:5px 8px;font-size:12px;color:var(--muted);text-align:right">${pred}%</td>
+          <td style="padding:5px 8px;text-align:right">
+            <div style="display:flex;align-items:center;justify-content:flex-end;gap:6px">
+              <div style="width:60px;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden">
+                <div style="width:${barW}%;height:100%;background:${barCol};border-radius:3px"></div>
+              </div>
+              <span style="font-size:12px;font-weight:700;color:${barCol};min-width:38px;text-align:right">${actual}%</span>
+            </div>
+          </td>
+          <td style="padding:5px 8px;font-size:12px;font-weight:700;color:${deltaColor(delta)};text-align:right">
+            ${delta > 0 ? '+' : ''}${delta}
+          </td>
+          <td style="padding:5px 8px;font-size:12px;font-weight:700;color:${roiColor(roi)};text-align:right">${roiStr(roi)}</td>
+        </tr>`;
+    }).join('');
+    return `<table style="width:100%;border-collapse:collapse"><thead>${header}</thead><tbody>${body}</tbody></table>`;
+  }
+
+  function legTable(rows) {
+    if (!rows.length) return '<span style="color:var(--muted);font-size:12px">No leg data yet.</span>';
+    const header = `
+      <tr>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:left">Win Prob</th>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:right">Legs</th>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:right">Model Pred</th>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:right">Actual WR</th>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:right">Δ pp</th>
+      </tr>`;
+    const body = rows.map(r => {
+      const actual = r.actual_win_pct;
+      const pred   = r.predicted_mid;
+      const delta  = r.delta_pp;
+      const barW   = Math.round(Math.min(actual, 100));
+      const barCol = actual >= pred ? 'var(--green)' : 'var(--red)';
+      return `
+        <tr style="border-top:1px solid var(--border)">
+          <td style="padding:5px 8px;font-size:12px;font-weight:600;color:var(--text)">${r.bucket}</td>
+          <td style="padding:5px 8px;font-size:12px;color:var(--muted);text-align:right">${r.n_legs}</td>
+          <td style="padding:5px 8px;font-size:12px;color:var(--muted);text-align:right">${pred}%</td>
+          <td style="padding:5px 8px;text-align:right">
+            <div style="display:flex;align-items:center;justify-content:flex-end;gap:6px">
+              <div style="width:60px;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden">
+                <div style="width:${barW}%;height:100%;background:${barCol};border-radius:3px"></div>
+              </div>
+              <span style="font-size:12px;font-weight:700;color:${barCol};min-width:38px;text-align:right">${actual}%</span>
+            </div>
+          </td>
+          <td style="padding:5px 8px;font-size:12px;font-weight:700;color:${deltaColor(delta)};text-align:right">
+            ${delta > 0 ? '+' : ''}${delta}
+          </td>
+        </tr>`;
+    }).join('');
+    return `<table style="width:100%;border-collapse:collapse"><thead>${header}</thead><tbody>${body}</tbody></table>`;
+  }
+
+  function simpleTable(rows) {
+    if (!rows.length) return '<span style="color:var(--muted);font-size:12px">No data yet.</span>';
+    const header = `
+      <tr>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:left">Tier</th>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:right">n</th>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:right">Win Rate</th>
+        <th style="padding:5px 8px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-weight:600;text-align:right">ROI</th>
+      </tr>`;
+    const body = rows.map(r => {
+      const actual = r.actual_win_pct;
+      const roi    = r.avg_roi_pct;
+      const barW   = Math.round(Math.min(actual, 100));
+      const barCol = actual >= 20 ? 'var(--green)' : 'var(--red)';
+      return `
+        <tr style="border-top:1px solid var(--border)">
+          <td style="padding:5px 8px;font-size:12px;font-weight:600;color:var(--text)">${r.bucket}</td>
+          <td style="padding:5px 8px;font-size:12px;color:var(--muted);text-align:right">${r.n}</td>
+          <td style="padding:5px 8px;text-align:right">
+            <div style="display:flex;align-items:center;justify-content:flex-end;gap:6px">
+              <div style="width:60px;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden">
+                <div style="width:${barW}%;height:100%;background:${barCol};border-radius:3px"></div>
+              </div>
+              <span style="font-size:12px;font-weight:700;color:${barCol};min-width:38px;text-align:right">${actual}%</span>
+            </div>
+          </td>
+          <td style="padding:5px 8px;font-size:12px;font-weight:700;color:${roiColor(roi)};text-align:right">${roiStr(roi)}</td>
+        </tr>`;
+    }).join('');
+    return `<table style="width:100%;border-collapse:collapse"><thead>${header}</thead><tbody>${body}</tbody></table>`;
+  }
+
+  // ── Interpretation banner ──────────────────────────────────────────────────
+  const interpColor = interp.includes('well-calibrated') ? 'var(--green)'
+    : interp.includes('over-confident') ? 'var(--red)'
+    : interp.includes('under-confident') ? 'var(--blue)'
+    : 'var(--muted)';
+
+  const interpHtml = interp ? `
+    <div style="padding:10px 14px;background:var(--surface2);border-left:3px solid ${interpColor};
+                border-radius:0 6px 6px 0;font-size:12px;color:var(--text);margin-bottom:18px;line-height:1.6">
+      ${interp}
+    </div>` : '';
+
+  el.innerHTML = `
+    ${warnHtml}
+    ${overallHtml}
+    ${interpHtml}
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:14px">
+      <div>
+        <div style="font-size:11px;font-weight:700;color:var(--text);margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em">
+          Parlay WP Calibration
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px">Δ = actual − model predicted</div>
+        ${parlayTable(parlayBkts)}
+      </div>
+      <div>
+        <div style="font-size:11px;font-weight:700;color:var(--text);margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em">
+          Per-Leg Accuracy
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px">Δ = actual − per-leg win prob</div>
+        ${legTable(legBkts)}
+      </div>
+      <div>
+        <div style="font-size:11px;font-weight:700;color:var(--text);margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em">
+          Min Leg Confidence
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px">Higher min conf → better parlay WR?</div>
+        ${simpleTable(mlcBkts)}
+      </div>
+      <div>
+        <div style="font-size:11px;font-weight:700;color:var(--text);margin-bottom:8px;text-transform:uppercase;letter-spacing:.05em">
+          Kelly Stake ROI
+        </div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px">25% Kelly · $500 bankroll</div>
+        ${simpleTable(kellyBkts)}
+      </div>
+    </div>`;
 }
 
 function renderTopPicksAccuracy(el, data) {
@@ -7144,7 +7866,23 @@ async function saveBetEdits(fullId, shortId) {
   }
 }
 
-loadDashboard();
+// Simulation filter state (declared here to avoid TDZ when routing to #simulation on load)
+let _simCatFilter = '';   // '' | 'team' | 'player_prop'
+let _logCatFilter = '';      // '' | 'team' | 'player_prop'
+let _logTierFilter = '';     // '' | 'T1' | 'T2' | 'T3'
+let _logSourceFilter = 'model';  // 'model' (default) | '' (all) | 'exploration' | 'shadow'
+
+// Route to correct page on load based on URL hash
+const _initHash = window.location.hash.replace('#', '');
+if (_initHash && document.getElementById('page-' + _initHash)) {
+  showPage(_initHash, true);
+} else {
+  loadDashboard();
+}
+window.addEventListener('popstate', () => {
+  const h = window.location.hash.replace('#', '');
+  if (h && document.getElementById('page-' + h)) showPage(h, true);
+});
 _startHealthPoll();
 
 // ── Live Bets & Cash Out ───────────────────────────────────────────────────
@@ -8214,6 +8952,131 @@ function _renderSettleStatus() {
 async function loadModelProgress() {
   const el = document.getElementById('model-progress-content');
   if (!el) return;
+  try {
+
+  const mpVal = document.getElementById('mp-days')?.value || '0';
+  const _isSingleDay = mpVal === 'today' || mpVal === 'yesterday';
+  const days  = _isSingleDay ? 1 : parseInt(mpVal, 10);
+
+  // ── Time-filtered view (7 / 30 / 90 days, Today, or Yesterday) ───────────
+  if (days > 0 || _isSingleDay) {
+    const catParam = _simCatFilter ? `&bet_category=${encodeURIComponent(_simCatFilter)}` : '';
+    const perfUrl  = _isSingleDay
+      ? `/api/mock-bets/performance?days=1&game_date=${mpVal}${catParam}`
+      : `/api/mock-bets/performance?days=${days}${catParam}`;
+    const perf = await apiFetch(perfUrl);
+    if (!perf || perf.total_settled == null) {
+      el.innerHTML = '<span style="color:var(--muted);font-size:12px">No data for this period.</span>';
+      return;
+    }
+    // Headline uses production-only stats (prospective/prospective_pm/top_picks_page)
+    const _prodWr  = perf.prospective_win_rate;
+    const _prodPnl = perf.prospective_pnl;
+    const _prodRoi = perf.prospective_roi_pct;
+    const _prodN   = perf.prospective_settled || 0;
+    const wr   = _prodWr != null ? `${_prodWr.toFixed(1)}%` : '—';
+    const pnl  = _prodPnl != null ? `${_prodPnl >= 0 ? '+' : ''}$${_prodPnl.toFixed(2)}` : '—';
+    const pnlC = (_prodPnl || 0) >= 0 ? 'var(--green)' : 'var(--red)';
+    const wrC  = (_prodWr || 0) >= 39 ? 'var(--green)' : (_prodWr || 0) >= 28 ? 'var(--text)' : 'var(--red)';
+
+    function _tierRow(t) {
+      if (!t || !t.n) return `<tr><td style="color:var(--muted)">${t?.label||'—'}</td><td colspan="3" style="color:var(--muted);text-align:center;font-size:12px">no data</td></tr>`;
+      const wrFmt  = t.win_rate != null ? `${t.win_rate.toFixed(1)}%` : '—';
+      const pnlFmt = t.pnl != null ? `${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}` : '—';
+      const c = t.win_rate > 39 ? 'var(--green)' : t.win_rate > 28 ? 'var(--text)' : 'var(--red)';
+      return `<tr>
+        <td style="color:var(--muted);padding:3px 8px 3px 0;font-size:12px">${t.tier} — ${t.label}</td>
+        <td style="text-align:right;padding:3px 8px;font-size:12px">${t.n}</td>
+        <td style="text-align:right;padding:3px 8px;font-size:12px;color:${c}">${wrFmt}</td>
+        <td style="text-align:right;padding:3px 0;font-size:12px">${pnlFmt}</td>
+      </tr>`;
+    }
+    const tierRows = (perf.by_tier || []).map(_tierRow).join('');
+
+    const bySport = (perf.by_sport || []).sort((a, b) => b.bets - a.bets).slice(0, 6);
+    const sportRows = bySport.map(s => {
+      const swr = s.win_rate != null ? `${s.win_rate.toFixed(1)}%` : '—';
+      const sc  = s.win_rate >= 39 ? 'var(--green)' : s.win_rate >= 28 ? 'var(--text)' : 'var(--red)';
+      const spnl = s.pnl != null ? `${s.pnl >= 0 ? '+' : ''}$${s.pnl.toFixed(2)}` : '—';
+      return `<tr>
+        <td style="color:var(--muted);padding:3px 8px 3px 0;font-size:12px">${s.sport}</td>
+        <td style="text-align:right;padding:3px 8px;font-size:12px">${s.bets}</td>
+        <td style="text-align:right;padding:3px 8px;font-size:12px;color:${sc}">${swr}</td>
+        <td style="text-align:right;padding:3px 0;font-size:12px">${spnl}</td>
+      </tr>`;
+    }).join('');
+    const byModel = (perf.by_model || []).slice(0, 4);
+    const modelRows = byModel.map(m => {
+      const mwr = m.win_rate != null ? `${m.win_rate.toFixed(1)}%` : '—';
+      const mc  = m.win_rate >= 39 ? 'var(--green)' : m.win_rate >= 28 ? 'var(--text)' : 'var(--red)';
+      return `<tr>
+        <td style="color:var(--muted);padding:3px 8px 3px 0;font-size:12px">${m.model_used || '—'}</td>
+        <td style="text-align:right;padding:3px 8px;font-size:12px">${m.bets}</td>
+        <td style="text-align:right;padding:3px 8px;font-size:12px;color:${mc}">${mwr}</td>
+        <td style="text-align:right;padding:3px 0;font-size:12px">AUC ${m.auc != null ? m.auc.toFixed(4) : '—'}</td>
+      </tr>`;
+    }).join('');
+    el.innerHTML = `
+      <div style="display:grid;grid-template-columns:auto 1fr 1fr;gap:20px;align-items:start">
+        <div>
+          <div style="display:flex;gap:24px;margin-bottom:12px">
+            <div>
+              <div style="font-size:11px;color:var(--muted)">Win Rate</div>
+              <div style="font-size:22px;font-weight:700;color:${wrC}">${wr}</div>
+              <div style="font-size:11px;color:var(--muted)">n=${_prodN} production bets</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:var(--muted)">P&amp;L</div>
+              <div style="font-size:22px;font-weight:700;color:${pnlC}">${pnl}</div>
+              <div style="font-size:11px;color:var(--muted)">paper $</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:var(--muted)">ROI</div>
+              <div style="font-size:22px;font-weight:700;color:${pnlC}">${_prodRoi != null ? (_prodRoi >= 0 ? '+' : '') + _prodRoi.toFixed(1) + '%' : '—'}</div>
+              <div style="font-size:11px;color:var(--muted)">on stake</div>
+            </div>
+          </div>
+          <table style="border-collapse:collapse;width:100%">
+            <thead><tr style="font-size:10px;color:var(--muted)">
+              <th style="text-align:left;padding:2px 8px 4px 0">Tier</th>
+              <th style="text-align:right;padding:2px 8px">n</th>
+              <th style="text-align:right;padding:2px 8px">WR</th>
+              <th style="text-align:right;padding:2px 0">P&amp;L</th>
+            </tr></thead>
+            <tbody>${tierRows || '<tr><td colspan="4" style="color:var(--muted);font-size:12px">No data</td></tr>'}</tbody>
+          </table>
+          <div style="font-size:10px;color:var(--muted);margin-top:6px">All sources: ${perf.total_settled || 0} bets · ${perf.win_rate != null ? perf.win_rate.toFixed(1)+'%' : '—'} WR · ${perf.pnl != null ? (perf.pnl >= 0 ? '+' : '') + '$' + perf.pnl.toFixed(2) : '—'}</div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--muted);margin-bottom:6px">By Sport</div>
+          <table style="border-collapse:collapse;width:100%">
+            <thead><tr style="font-size:10px;color:var(--muted)">
+              <th style="text-align:left;padding:2px 8px 4px 0">Sport</th>
+              <th style="text-align:right;padding:2px 8px">n</th>
+              <th style="text-align:right;padding:2px 8px">WR</th>
+              <th style="text-align:right;padding:2px 0">P&amp;L</th>
+            </tr></thead>
+            <tbody>${sportRows || '<tr><td colspan="4" style="color:var(--muted);font-size:12px">No data</td></tr>'}</tbody>
+          </table>
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--muted);margin-bottom:6px">By Model</div>
+          <table style="border-collapse:collapse;width:100%">
+            <thead><tr style="font-size:10px;color:var(--muted)">
+              <th style="text-align:left;padding:2px 8px 4px 0">Model</th>
+              <th style="text-align:right;padding:2px 8px">n</th>
+              <th style="text-align:right;padding:2px 8px">WR</th>
+              <th style="text-align:right;padding:2px 0">AUC</th>
+            </tr></thead>
+            <tbody>${modelRows || '<tr><td colspan="4" style="color:var(--muted);font-size:12px">No data</td></tr>'}</tbody>
+          </table>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  // ── Overall / snapshot view (default) ────────────────────────────────────
   const data = await apiFetch('/api/model/progress');
   if (!data || !data.current_week) {
     el.innerHTML = '<span style="color:var(--muted);font-size:12px">No snapshots yet — run signal_analysis.py to generate the first snapshot.</span>';
@@ -8317,9 +9180,9 @@ async function loadModelProgress() {
             </tr>
           </thead>
           <tbody>
-            ${tierRow('T1 — PM / Top Picks', latest.tier1_bets, latest.tier1_wr, latest.tier1_pnl)}
-            ${tierRow('T2 — Morning picks',  latest.tier2_bets, latest.tier2_wr, latest.tier2_pnl)}
-            ${tierRow('T3 — Retro / forced', latest.tier3_bets, latest.tier3_wr, latest.tier3_pnl)}
+            ${tierRow('T1 — High conviction', latest.tier1_bets, latest.tier1_wr, latest.tier1_pnl)}
+            ${tierRow('T2 — Moderate',       latest.tier2_bets, latest.tier2_wr, latest.tier2_pnl)}
+            ${tierRow('T3 — Monitor only',   latest.tier3_bets, latest.tier3_wr, latest.tier3_pnl)}
           </tbody>
         </table>
         <div style="font-size:10px;color:var(--muted);margin-top:8px">Snapshot: ${computedDate}</div>
@@ -8350,11 +9213,13 @@ async function loadModelProgress() {
       </div>
     </div>
   `;
+  } catch (e) { el.innerHTML = `<span style="color:var(--muted);font-size:12px">Failed to load — click ↻ to retry. (${e.message})</span>`; }
 }
 
 async function loadLineQuality() {
   const el = document.getElementById('line-quality-content');
   if (!el) return;
+  try {
   const data = await apiFetch(`/api/mock-bets/line-quality`);
   if (!data || data.n === 0 || data.insufficient_data) {
     el.innerHTML = '<span style="color:var(--muted);font-size:12px">No line-quality data yet — settle more bets to populate.</span>';
@@ -8561,6 +9426,7 @@ async function loadLineQuality() {
   const sinceLabel = data.since || '2026-04-29';
   html += `<div style="font-size:10px;color:var(--muted);margin-top:8px">Based on ${data.n} settled legs with line-quality data · since ${sinceLabel}</div>`;
   el.innerHTML = html;
+  } catch (e) { el.innerHTML = `<span style="color:var(--muted);font-size:12px">Failed to load — click ↻ to retry. (${e.message})</span>`; }
 }
 
 // Returns a formatted next-settlement time string for the picks page (sync, uses cached state)
@@ -8575,25 +9441,333 @@ function _settleInfoLine() {
     : 'Settlement checks every 30 min · running soon';
 }
 
+// (declarations moved before init block to avoid TDZ)
+
+function setSimCatFilter(cat) {
+  _simCatFilter = cat;
+  ['all','team','prop'].forEach(k => {
+    const el = document.getElementById(`sim-cat-${k}`);
+    if (!el) return;
+    const active = (k === 'all' && cat === '') || (k !== 'all' && cat === (k === 'prop' ? 'player_prop' : k));
+    el.style.background = active ? 'var(--blue)' : 'var(--surface2)';
+    el.style.color = active ? '#fff' : 'var(--text)';
+  });
+  loadSimulationDebounced();
+}
+
+function setLogCatFilter(cat) {
+  _logCatFilter = cat;
+  ['all','team','prop'].forEach(k => {
+    const el = document.getElementById(`log-cat-${k}`);
+    if (!el) return;
+    const active = (k === 'all' && cat === '') || (k !== 'all' && cat === (k === 'prop' ? 'player_prop' : k));
+    el.style.background = active ? 'var(--blue)' : 'var(--surface2)';
+    el.style.color = active ? '#fff' : 'var(--text)';
+  });
+  _mockPage = 0;
+  loadMockBetLogDebounced();
+}
+
+function setLogSourceFilter(src) {
+  _logSourceFilter = src;
+  ['model','all','expl','shadow'].forEach(k => {
+    const el = document.getElementById(`log-src-${k}`);
+    if (!el) return;
+    const active = (k === 'model' && src === 'model')
+                || (k === 'all' && src === '')
+                || (k === 'expl' && src === 'exploration')
+                || (k === 'shadow' && src === 'shadow');
+    el.style.background = active ? 'var(--blue)' : 'var(--surface2)';
+    el.style.color = active ? '#fff' : 'var(--text)';
+  });
+  _mockPage = 0;
+  loadMockBetLogDebounced();
+}
+
+// ── Place Bet from Mock ─────────────────────────────────────────────────────
+let _placeBetMockId = null;
+let _placeBetLegOdds = [];  // per-leg American odds from model
+
+function _openPlaceBetModal(mockBet) {
+  _placeBetMockId = mockBet.id;
+  const legs = mockBet.leg_details || [];
+  _placeBetLegOdds = legs.map(l => l.open_odds || null);
+
+  // Header
+  const legDescs = (mockBet.bet_info || '').split('|').map(s => {
+    const sep = s.indexOf(' — ');
+    return sep !== -1 ? s.slice(0, sep).trim() : s.trim();
+  }).filter(Boolean);
+  document.getElementById('place-bet-header').textContent =
+    'PLACE BET — ' + (legDescs.length > 2 ? legDescs.slice(0,2).join(' / ') + ` +${legDescs.length-2}` : legDescs.join(' / '));
+
+  // Legs list
+  document.getElementById('place-bet-legs').innerHTML = legs.map((l, i) => {
+    const desc = l.description || '';
+    const odds = l.open_odds ? (l.open_odds > 0 ? '+' + l.open_odds : l.open_odds) : '—';
+    return `<div style="padding:2px 0"><span style="color:var(--amber);margin-right:6px">✦</span>${desc} <span style="color:var(--muted)">[${odds}]</span></div>`;
+  }).join('');
+
+  // Combined odds: convert model decimal to American for default
+  const modelOdds = mockBet.odds || 2.0;
+  let americanDefault;
+  if (modelOdds >= 2.0) americanDefault = Math.round((modelOdds - 1) * 100);
+  else americanDefault = Math.round(-100 / (modelOdds - 1));
+  document.getElementById('place-bet-odds').value = americanDefault;
+  document.getElementById('place-bet-stake').value = '10.00';
+  _updatePlaceBetPayout();
+
+  // Show modal
+  document.getElementById('place-bet-modal').style.display = 'flex';
+}
+
+function _closePlaceBetModal() {
+  document.getElementById('place-bet-modal').style.display = 'none';
+  _placeBetMockId = null;
+}
+
+function _updatePlaceBetPayout() {
+  const odds = parseInt(document.getElementById('place-bet-odds').value) || 0;
+  const stake = parseFloat(document.getElementById('place-bet-stake').value) || 0;
+  let dec;
+  if (odds > 0) dec = 1 + odds / 100;
+  else if (odds < 0) dec = 1 + 100 / Math.abs(odds);
+  else dec = 1;
+  const payout = (stake * dec).toFixed(2);
+  const profit = (stake * (dec - 1)).toFixed(2);
+  document.getElementById('place-bet-payout').innerHTML =
+    `Payout: <strong>$${payout}</strong> (profit: $${profit})`;
+}
+
+async function _confirmPlaceBet() {
+  if (!_placeBetMockId) return;
+  const btn = document.getElementById('place-bet-confirm');
+  btn.disabled = true;
+  btn.textContent = 'Placing…';
+  try {
+    const result = await apiFetch('/api/user-picks/place-from-mock', {
+      method: 'POST',
+      body: JSON.stringify({
+        mock_bet_id: _placeBetMockId,
+        actual_stake: parseFloat(document.getElementById('place-bet-stake').value) || 10,
+        book: document.getElementById('place-bet-book').value || 'FanDuel',
+      }),
+    });
+    _closePlaceBetModal();
+    if (result) toast(`Placed! $${result.stake} on ${result.legs}L at ${result.combined_odds?.toFixed(2)}x — tracked in A/B test`);
+    loadMockBetLog();
+  } catch (e) {
+    toast('Error placing bet: ' + e.message, false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Confirm Placed';
+  }
+}
+
+// Wire up live payout updates
+document.addEventListener('DOMContentLoaded', () => {
+  const oddsInput = document.getElementById('place-bet-odds');
+  const stakeInput = document.getElementById('place-bet-stake');
+  if (oddsInput) oddsInput.addEventListener('input', _updatePlaceBetPayout);
+  if (stakeInput) stakeInput.addEventListener('input', _updatePlaceBetPayout);
+});
+
+function setTierFilter(tier) {
+  _logTierFilter = tier;
+  const mapping = {'': 'all', 'T1': 't1', 'T2': 't2', 'T3': 't3'};
+  Object.entries(mapping).forEach(([val, id]) => {
+    const el = document.getElementById(`tier-${id}`);
+    if (!el) return;
+    const active = tier === val;
+    if (val === 'T1' && active) {
+      el.style.background = 'var(--green)';
+      el.style.color = '#fff';
+      el.style.borderColor = 'var(--green)';
+    } else {
+      el.style.background = active ? 'var(--blue)' : 'var(--surface2)';
+      el.style.color = active ? '#fff' : 'var(--text)';
+      el.style.borderColor = '';  // reset to CSS default
+    }
+  });
+  _mockPage = 0;
+  loadMockBetLogDebounced();
+}
+
+let _mockLogDebounceTimer = null;
+function loadMockBetLogDebounced() {
+  clearTimeout(_mockLogDebounceTimer);
+  _mockLogDebounceTimer = setTimeout(() => loadMockBetLog(), 300);
+}
+
+// ── Live Picks card ──────────────────────────────────────────────────────────
+async function loadLivePicks() {
+  const el = document.getElementById('live-picks-content');
+  const badge = document.getElementById('live-picks-badge');
+  const countEl = document.getElementById('live-picks-count');
+  if (!el) return;
+  try {
+    const data = await apiFetch('/api/recommend/live-picks');
+    if (!data) { el.innerHTML = '<span style="color:var(--muted);font-size:12px">Failed to load — click &#8635; to retry.</span>'; return; }
+    const conf = data.slate_confidence || 'PASS';
+    const confColors = {STRONG:'#22c55e',MODERATE:'#eab308',WEAK:'#f97316',PASS:'#ef4444'};
+    const confBg = {STRONG:'rgba(34,197,94,0.13)',MODERATE:'rgba(234,179,8,0.13)',WEAK:'rgba(249,115,22,0.13)',PASS:'rgba(239,68,68,0.13)'};
+    badge.textContent = conf;
+    badge.style.color = confColors[conf] || '#ef4444';
+    badge.style.background = confBg[conf] || 'rgba(239,68,68,0.13)';
+    const qp = data.qualifying_picks || [];
+    const ss = data.slate_summary || {};
+    countEl.textContent = data.recommended_bet_count || '';
+
+    if (conf === 'PASS' || qp.length === 0) {
+      const flags = (ss.flags || []).map(f => `<div style="padding:4px 0;color:var(--muted)">&#8226; ${f}</div>`).join('');
+      let nmHtml = '';
+      const nm = data.near_misses || [];
+      if (nm.length) {
+        nmHtml = `<details style="text-align:left;max-width:600px;margin:12px auto 0;font-size:12px">
+          <summary style="cursor:pointer;color:var(--muted);font-size:11px;margin-bottom:8px">
+            Top ${nm.length} candidates &mdash; why they didn't qualify
+          </summary>`;
+        for (const c of nm) {
+          const legParts = (c.legs || '').split(' | ').filter(Boolean);
+          const checkRows = (c.checks || []).map(ch => {
+            const icon = ch.passed ? '<span style="color:var(--green)">&#10003;</span>' : '<span style="color:var(--red)">&#10007;</span>';
+            return `<tr><td style="padding:2px 6px">${icon}</td><td style="padding:2px 6px">${ch.criterion}</td><td style="padding:2px 6px;color:var(--muted)">${ch.detail}</td></tr>`;
+          }).join('');
+          nmHtml += `<div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:8px">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+              <div style="font-size:11px;font-weight:600">${c.combined_odds || ''}</div>
+              <div style="font-size:11px;color:var(--muted)">Composite: ${(c.composite||0).toFixed(3)} &bull; WP: ${c.model_wp != null ? c.model_wp+'%' : 'N/A'}</div>
+            </div>
+            <div style="font-size:11px;color:var(--muted);margin-bottom:6px">${legParts.map(l => `<div>${l}</div>`).join('')}</div>
+            <div style="font-size:11px;margin-bottom:4px;color:var(--amber)">${c.gap}</div>
+            <table style="width:100%;font-size:11px;border-collapse:collapse">${checkRows}</table>
+          </div>`;
+        }
+        nmHtml += `</details>`;
+      }
+      el.innerHTML = `
+        <div style="text-align:center;padding:20px 0">
+          <div style="font-size:14px;color:var(--muted);margin-bottom:10px">No qualifying picks today. Signals don't support live betting.</div>
+          ${flags ? `<div style="text-align:left;max-width:500px;margin:0 auto;font-size:12px">${flags}</div>` : ''}
+          ${nmHtml}
+        </div>`;
+      return;
+    }
+
+    let html = `<div style="display:flex;gap:8px;margin-bottom:14px;font-size:11px;color:var(--muted)">
+      <span>${ss.total_production_picks || 0} production picks</span>
+      <span>&#183;</span>
+      <span>${ss.passing_live_filter || 0} passing filter</span>
+      ${ss.avg_composite_qualifying ? `<span>&#183;</span><span>Avg composite: ${ss.avg_composite_qualifying.toFixed(1)}</span>` : ''}
+    </div>`;
+
+    for (const p of qp) {
+      const legsRaw = p.legs || '';
+      const legParts = legsRaw.split(' | ').filter(Boolean);
+      const scouts = p.scout_grades || [];
+      const covers = p.cover_rates || [];
+      const piVal = p.avg_pi != null ? (p.avg_pi >= 0 ? '+' : '') + p.avg_pi.toFixed(2) : 'N/A';
+      const piColor = p.avg_pi != null ? (p.avg_pi >= 0 ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
+      const statusColors = {PENDING_SETTLEMENT:'var(--blue)',SETTLED_WIN:'var(--green)',SETTLED_LOSS:'var(--red)'};
+      const statusLabel = (p.status||'').replace('PENDING_SETTLEMENT','PENDING').replace('SETTLED_','');
+
+      html += `<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:10px">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
+          <div>
+            <div style="font-size:13px;font-weight:600;margin-bottom:4px">${p.combined_odds || ''}</div>
+            <span style="font-size:11px;padding:2px 8px;border-radius:10px;background:${statusColors[p.status]||'var(--surface2)'};color:#fff">${statusLabel}</span>
+            ${p.actual_profit != null ? `<span style="font-size:11px;margin-left:6px;color:${p.actual_profit>=0?'var(--green)':'var(--red)'}">$${p.actual_profit.toFixed(2)}</span>` : ''}
+          </div>
+          <div style="text-align:right;font-size:11px;color:var(--muted)">
+            <div>Composite: <span style="color:var(--text);font-weight:600">${(p.composite||0).toFixed(1)}</span></div>
+            <div>Pi diff: <span style="color:${piColor}">${piVal}</span></div>
+          </div>
+        </div>
+        <table style="width:100%;font-size:12px;border-collapse:collapse">
+          <thead><tr style="color:var(--muted);text-align:left;border-bottom:1px solid var(--border)">
+            <th style="padding:4px 6px">Leg</th>
+            <th style="padding:4px 6px">Scout</th>
+            <th style="padding:4px 6px">14d Cover</th>
+          </tr></thead>
+          <tbody>${legParts.map((leg, i) => {
+            const sg = scouts[i] || '?';
+            const sgColor = sg === 'A' ? 'var(--green)' : sg === 'B' ? 'var(--blue)' : 'var(--muted)';
+            const cr = covers[i];
+            const crText = cr === 'N/A' || cr == null ? 'N/A' : cr.toFixed(0) + '%';
+            const crColor = cr != null && cr !== 'N/A' ? (cr >= 60 ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
+            return `<tr style="border-bottom:1px solid var(--border)">
+              <td style="padding:5px 6px">${leg}</td>
+              <td style="padding:5px 6px;color:${sgColor};font-weight:600">${sg}</td>
+              <td style="padding:5px 6px;color:${crColor}">${crText}</td>
+            </tr>`;
+          }).join('')}</tbody>
+        </table>
+        <div style="display:flex;gap:16px;margin-top:10px;font-size:11px;color:var(--muted)">
+          <span>Kelly edge: <span style="color:var(--text)">${p.kelly_edge != null ? p.kelly_edge.toFixed(1)+'%' : 'N/A'}</span></span>
+          <span>Shadow bet: <span style="color:var(--text)">${p.kelly_bet_size != null ? '$'+p.kelly_bet_size.toFixed(2) : 'N/A'}</span></span>
+          <span style="font-style:italic;color:var(--muted)">(shadow sizing, not live)</span>
+        </div>
+        ${p.why ? `<div style="margin-top:8px;font-size:11px;color:var(--muted);font-style:italic">${p.why}</div>` : ''}
+      </div>`;
+    }
+
+    const flags = (ss.flags || []);
+    if (flags.length) {
+      html += `<div style="margin-top:8px;font-size:11px;color:var(--amber)">
+        ${flags.map(f => `<div>&#9888; ${f}</div>`).join('')}
+      </div>`;
+    }
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = `<div style="color:var(--muted);font-size:12px">Failed to load live picks: ${e.message}</div>`;
+  }
+
+}
+
+// Debounce utility for toggle clicks
+let _simDebounceTimer = null;
+function loadSimulationDebounced() {
+  clearTimeout(_simDebounceTimer);
+  _simDebounceTimer = setTimeout(() => loadSimulation(), 300);
+}
+
 async function loadSimulation() {
-  const days = document.getElementById('sim-days')?.value || 30;
-  const [perf, signal] = await Promise.all([
-    apiFetch(`/api/mock-bets/performance?days=${days}`),
+  // Show loading indicators on all cards
+  const _loadingHtml = '<div class="loading" style="padding:12px;color:var(--muted);font-size:12px">Loading\u2026</div>';
+  ['trust-meter-content','sim-perf-summary','sim-by-confidence','sim-by-sport',
+   'sim-by-model','sim-by-lqs','sim-training-signal','mock-bet-log',
+   'line-quality-content','model-progress-content','live-picks-content'].forEach(id => {
+    const _el = document.getElementById(id);
+    if (_el) _el.innerHTML = _loadingHtml;
+  });
+
+  const daysVal = document.getElementById('sim-days')?.value || '30';
+  const catParam = _simCatFilter ? `&bet_category=${encodeURIComponent(_simCatFilter)}` : '';
+  const perfParam = (daysVal === 'today' || daysVal === 'yesterday')
+    ? `/api/mock-bets/performance?days=1&game_date=${daysVal}${catParam}`
+    : `/api/mock-bets/performance?days=${daysVal}${catParam}`;
+  const legAccParam = (daysVal === 'today' || daysVal === 'yesterday')
+    ? `/api/mock-bets/leg-accuracy?days=1&game_date=${daysVal}&source=simulation`
+    : `/api/mock-bets/leg-accuracy?days=${daysVal}&source=simulation`;
+  // Batch 1: core performance data (3 parallel calls)
+  const [perf, signal, legAcc] = await Promise.all([
+    apiFetch(perfParam),
     apiFetch('/api/mock-bets/training-signal'),
+    apiFetch(legAccParam),
   ]);
 
   renderTrustMeter(perf);
-  renderSimPerfSummary(perf);
+  renderSimPerfSummary(perf, legAcc, daysVal);
   renderSimTrendChart(perf?.daily_trend || [], perf?.retro_trend || []);
   renderSimBreakdowns(perf);
   renderTrainingSignal(signal);
   renderBackfillProgress(perf?.active_backfills || []);
-  loadMockBetLog();
-  loadBackfillJobs();
-  loadTopPicksAccuracy(true);
-  loadSettleStatus();
-  loadModelProgress();
-  loadLineQuality();
+
+  // Batch 2: secondary cards (staggered to avoid connection pool exhaustion)
+  await Promise.all([loadMockBetLog(), loadBackfillJobs()]);
+  await Promise.all([loadTopPicksAccuracy(true), loadTopPicksCalibration()]);
+  await Promise.all([loadSettleStatus(), loadModelProgress()]);
+  await Promise.all([loadLineQuality(), loadLivePicks()]);
 }
 
 function renderTrustMeter(data) {
@@ -8695,10 +9869,20 @@ function renderTrustMeter(data) {
   }
 }
 
-function renderSimPerfSummary(data) {
+function renderSimPerfSummary(data, legAcc, daysVal) {
   const el = document.getElementById('sim-perf-summary');
   if (!el) return;
   if (!data) { el.innerHTML = '<span style="color:var(--muted)">No data</span>'; return; }
+
+  // Build a human-readable label for the selected date window
+  const _daysLabel = d => {
+    if (d === 'today') return 'today';
+    if (d === 'yesterday') return 'yesterday';
+    const n = parseInt(d, 10);
+    if (n === 1) return 'last 1 day';
+    return `last ${n} days`;
+  };
+  const windowLabel = _daysLabel(daysVal || '30');
 
   // ── Line Quality Signal section (from embedded line_quality in performance response) ──
   const lq = data.line_quality;
@@ -8727,7 +9911,7 @@ function renderSimPerfSummary(data) {
     lqSection = `
       <div style="margin-top:14px;padding:10px 12px;background:var(--surface2);border-radius:8px;border-left:3px solid var(--blue)">
         <div style="font-size:11px;font-weight:600;color:var(--text);margin-bottom:8px">Line Quality Signal
-          <span style="font-weight:400;color:var(--muted);margin-left:6px">${lq.legs_evaluated} settled legs · since Apr 29</span>
+          <span style="font-weight:400;color:var(--muted);margin-left:6px">${lq.legs_evaluated} settled legs · ${windowLabel}</span>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1.5fr 1fr 1fr;gap:8px;align-items:start">
           <div style="text-align:center">
@@ -8756,6 +9940,53 @@ function renderSimPerfSummary(data) {
       </div>`;
   }
 
+  // ── Per-leg accuracy section ──────────────────────────────────────────────
+  let legAccSection = '';
+  if (legAcc && legAcc.total_legs > 0) {
+    const _wrColor = wr => wr == null ? 'var(--muted)' : wr >= 65 ? 'var(--green)' : wr >= 55 ? 'var(--amber)' : 'var(--red)';
+    const _wrFmt   = wr => wr != null ? wr.toFixed(1) + '%' : '—';
+
+    // Market type display map
+    const _mktLabel = m => ({
+      alternate_spreads: 'Alt Spread', alternate_totals: 'Alt Total',
+      spreads: 'Spread', totals: 'Total', h2h: 'ML',
+      player_hits: 'Hits', player_total_bases: 'TB', player_shots_on_goal: 'SOG',
+    }[m] || m);
+
+    const tableRows = (legAcc.by_sport_market || []).map(row => {
+      const overallColor = _wrColor(row.win_rate);
+      return `<tr style="border-bottom:1px solid var(--border)">
+        <td style="padding:3px 6px;white-space:nowrap">${row.sport}</td>
+        <td style="padding:3px 6px;white-space:nowrap">${_mktLabel(row.market_type)}</td>
+        <td style="padding:3px 6px;text-align:center;color:var(--muted)">${row.total}</td>
+        <td style="padding:3px 6px;text-align:center;font-weight:700;color:${overallColor}">${_wrFmt(row.win_rate)}</td>
+      </tr>`;
+    }).join('');
+
+    const overallColor = _wrColor(legAcc.overall_win_rate);
+    legAccSection = `
+      <div style="margin-top:14px;padding:10px 12px;background:var(--surface2);border-radius:8px;border-left:3px solid var(--amber)">
+        <div style="font-size:11px;font-weight:600;color:var(--text);margin-bottom:8px;display:flex;align-items:center;gap:10px">
+          Per-leg Accuracy · Simulation
+          <span style="font-weight:400;color:var(--muted)">${legAcc.total_legs} legs · ${windowLabel}</span>
+          <span style="font-weight:700;color:${overallColor};margin-left:auto">${_wrFmt(legAcc.overall_win_rate)} overall</span>
+        </div>
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:10px">
+            <thead>
+              <tr style="border-bottom:1px solid var(--border)">
+                <th style="padding:3px 6px;text-align:left;color:var(--muted)">Sport</th>
+                <th style="padding:3px 6px;text-align:left;color:var(--muted)">Market</th>
+                <th style="padding:3px 6px;text-align:center;color:var(--muted)">Legs</th>
+                <th style="padding:3px 6px;text-align:center;color:var(--muted)">Win Rate</th>
+              </tr>
+            </thead>
+            <tbody>${tableRows}</tbody>
+          </table>
+        </div>
+      </div>`;
+  }
+
   el.innerHTML = `
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:10px">
       <div class="stat-card">
@@ -8777,7 +10008,8 @@ function renderSimPerfSummary(data) {
         <div class="stat-value">${data.total_pending || 0}</div>
       </div>
     </div>
-    ${lqSection}`;
+    ${lqSection}
+    ${legAccSection}`;
 }
 
 function renderSimTrendChart(liveTrend, retroTrend) {
@@ -9113,8 +10345,9 @@ function renderBackfillProgress(activeJobs) {
 
 // ── Mock Bet Log pagination state ─────────────────────────────────────────────
 let _mockPage = 0;
-const _PAGE_SIZE = 50;
+const _PAGE_SIZE = 20;
 let _mockSort = 'desc';
+let _mockLogSeq = 0;  // sequence counter to prevent stale responses
 
 function toggleMockSort() {
   _mockSort = _mockSort === 'desc' ? 'asc' : 'desc';
@@ -9150,18 +10383,24 @@ async function loadMockBetLog() {
   if (!el) return;
   el.innerHTML = '<div class="loading">Loading…</div>';
 
+  const thisSeq = ++_mockLogSeq;  // stamp this request
   const status = document.getElementById('mock-log-status')?.value || '';
   const offset = _mockPage * _PAGE_SIZE;
   let url = `/api/mock-bets?limit=${_PAGE_SIZE}&offset=${offset}&sort=${_mockSort}`;
   if (status) url += `&status=${encodeURIComponent(status)}`;
+  if (_logCatFilter) url += `&bet_category=${encodeURIComponent(_logCatFilter)}`;
+  if (_logTierFilter) url += `&bet_tier=${encodeURIComponent(_logTierFilter)}`;
+  if (_logSourceFilter) url += `&source=${encodeURIComponent(_logSourceFilter)}`;
 
   let data;
   try {
     data = await apiFetch(url);
   } catch(e) {
+    if (thisSeq !== _mockLogSeq) return;  // stale response
     el.innerHTML = `<span style="color:var(--red)">Error loading bets: ${e.message}</span>`;
     return;
   }
+  if (thisSeq !== _mockLogSeq) return;  // newer request superseded this one
 
   if (!data?.mock_bets) {
     el.innerHTML = '<span style="color:var(--muted)">No mock bets yet · Click Generate to create some</span>';
@@ -9171,6 +10410,10 @@ async function loadMockBetLog() {
     el.innerHTML = `<span style="color:var(--muted)">No mock bets${status ? ' with status ' + status : ''}</span>`;
     return;
   }
+
+  // Stash for Place Bet modal
+  window._mockBetsCache = {};
+  data.mock_bets.forEach(m => { window._mockBetsCache[m.id] = m; });
 
   try {
     const total      = data.total || 0;
@@ -9227,7 +10470,7 @@ async function loadMockBetLog() {
         const statusColor = mStatus === 'SETTLED_WIN' ? 'var(--green)' : mStatus === 'SETTLED_LOSS' ? 'var(--red)' : mStatus === 'EXPIRED' ? 'var(--muted)' : 'var(--amber)';
         const pnlFmt     = m.actual_profit != null ? ((m.actual_profit >= 0 ? '+' : '') + '$' + Math.abs(m.actual_profit).toFixed(2)) : '—';
         const pnlColor   = (m.actual_profit || 0) >= 0 ? 'var(--green)' : 'var(--red)';
-        const dateStr    = m.generated_at ? m.generated_at.slice(0,10) : '—';
+        const dateStr    = m.game_date || (m.generated_at ? m.generated_at.slice(0,10) : '—');
         const isPower    = (m.legs || 0) >= 4 || (m.notes || '').includes('is_power_pick');
         const legsArr    = (m.bet_info || '').split('|').map(s => s.trim()).filter(Boolean);
         const lqsVal     = m.avg_lqs != null ? Math.round(m.avg_lqs) : null;
@@ -9260,6 +10503,15 @@ async function loadMockBetLog() {
           }
           const evPart = m.promo_ev_lift ? ` <span style="color:var(--muted);font-weight:400">+$${m.promo_ev_lift.toFixed(2)}</span>` : '';
           boostTag = `<span style="font-size:9px;background:${boostBg};color:${boostColor};border:1px solid ${boostColor};border-radius:4px;padding:1px 5px;margin-left:4px;white-space:nowrap;font-weight:600">${boostLabel}</span>${evPart}`;
+        }
+        // Tier badge
+        let tierTag = '';
+        if (m.bet_tier === 'T1') {
+          tierTag = `<span style="font-size:9px;background:rgba(34,197,94,.15);color:var(--green);border:1px solid var(--green);border-radius:4px;padding:1px 5px;margin-left:4px;font-weight:700">T1</span>`;
+        } else if (m.bet_tier === 'T2') {
+          tierTag = `<span style="font-size:9px;background:rgba(59,130,246,.1);color:var(--blue);border:1px solid var(--blue);border-radius:4px;padding:1px 5px;margin-left:4px;font-weight:600">T2</span>`;
+        } else if (m.bet_tier === 'T3') {
+          tierTag = `<span style="font-size:9px;background:rgba(136,144,168,.1);color:var(--muted);border:1px solid var(--border);border-radius:4px;padding:1px 5px;margin-left:4px">T3</span>`;
         }
         // Build a lookup from leg_details (if available) keyed by leg_index
         const legDetails = {};
@@ -9314,7 +10566,7 @@ async function loadMockBetLog() {
           <td style="padding:6px 8px">
             <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
               <span style="font-weight:600;color:var(--text)">${m.bet_type || 'parlay'}</span>
-              ${powerTag}${sourceTag}${boostTag}
+              ${powerTag}${sourceTag}${tierTag}${boostTag}
             </div>
             <div style="margin-top:4px">${legRows}</div>
           </td>
@@ -9323,7 +10575,11 @@ async function loadMockBetLog() {
           </td>
           <td style="padding:6px 8px;text-align:center;color:${lqsColor};font-weight:${lqsVal != null ? '600' : '400'}">${lqsDisp}</td>
           <td style="padding:6px 8px;text-align:center;color:${statusColor};font-weight:600;font-size:11px">${mStatus.replace('SETTLED_','')}</td>
-          <td style="padding:6px 8px;text-align:right;color:${pnlColor}">${pnlFmt}</td>
+          <td style="padding:6px 8px;text-align:right;color:${pnlColor}">${pnlFmt}${
+            mStatus === 'PENDING' && (m.bet_tier === 'T1' || m.bet_tier === 'T2')
+            ? `<br><button onclick="_openPlaceBetModal(window._mockBetsCache['${m.id}'])" style="margin-top:4px;padding:2px 8px;font-size:10px;background:var(--green);color:#fff;border:none;border-radius:4px;cursor:pointer;font-weight:600">Place</button>`
+            : ''
+          }</td>
         </tr>`;
       }).join('')}
       </tbody>
@@ -11872,7 +13128,934 @@ window.showPage = function(name) {
   _origShowPage(name);
   if (name === 'scout')     { loadScoutProps(); loadScoutAccuracy(); loadSettledProps(); loadMarketCompare(); }
   if (name === 'placement') loadPlacement();
+  if (name === 'admin')     loadAdminStatus();
 };
+
+// ── Admin page logic ───────────────────────────────────────────────────────
+(function() {
+  // Inject keyframe animation once
+  const style = document.createElement('style');
+  style.textContent = '@keyframes adminSpin { to { transform: translateY(-50%) rotate(360deg); } }';
+  document.head.appendChild(style);
+})();
+
+async function loadAdminStatus() {
+  const set = (id, val) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = val;
+    el.style.color = 'var(--text)';
+  };
+  // Reset to loading state
+  ['admin-stat-settled','admin-stat-wr','admin-stat-picks','admin-stat-pending','admin-stat-uptime']
+    .forEach(id => { const el = document.getElementById(id); if(el){ el.textContent='…'; el.style.color='var(--muted)'; } });
+
+  try {
+    const [perfRes, picksRes, healthRes] = await Promise.allSettled([
+      fetch('/api/mock-bets/performance'),
+      fetch('/api/recommend/today'),
+      fetch('/api/health'),
+    ]);
+    if (perfRes.status === 'fulfilled' && perfRes.value.ok) {
+      const d = await perfRes.value.json();
+      set('admin-stat-settled', d.total_settled ?? '—');
+      set('admin-stat-wr', d.win_rate != null ? (d.win_rate * 100).toFixed(1) + '%' : '—');
+      set('admin-stat-pending', d.total_pending ?? '—');
+    }
+    if (picksRes.status === 'fulfilled' && picksRes.value.ok) {
+      const d = await picksRes.value.json();
+      const picks = d.picks ?? d.recommendations ?? d.bets ?? [];
+      set('admin-stat-picks', Array.isArray(picks) ? picks.length : (d.count ?? '—'));
+    }
+    if (healthRes.status === 'fulfilled' && healthRes.value.ok) {
+      const d = await healthRes.value.json();
+      set('admin-stat-uptime', d.time ?? d.uptime ?? d.status ?? '—');
+    }
+  } catch(e) { /* non-fatal */ }
+}
+
+async function runAdminAction(btn, method, url, label, resultId) {
+  const spinner = btn.querySelector('.admin-spinner');
+  if (spinner) spinner.style.display = 'block';
+  btn.style.opacity = '0.7';
+  btn.style.pointerEvents = 'none';
+
+  const el  = document.getElementById(resultId);
+  const lb  = document.getElementById(resultId + '-label');
+  const rb  = document.getElementById(resultId + '-body');
+  if (el) el.style.display = 'block';
+  if (lb) lb.textContent = label + ' — running…';
+  if (rb) rb.textContent = '';
+  if (el) el.style.borderColor = 'var(--border)';
+
+  try {
+    const res = await fetch(url, { method, headers: { 'Content-Type': 'application/json' } });
+    const text = await res.text();
+    let pretty = text;
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+    if (lb) lb.textContent = label + (res.ok ? ' — OK ' + res.status : ' — ERROR ' + res.status);
+    if (rb) rb.textContent = pretty;
+    if (el) el.style.borderColor = res.ok ? 'var(--green)' : 'var(--red,#ef4444)';
+  } catch(e) {
+    if (lb) lb.textContent = label + ' — FAILED';
+    if (rb) rb.textContent = e.toString();
+    if (el) el.style.borderColor = 'var(--red,#ef4444)';
+  } finally {
+    if (spinner) spinner.style.display = 'none';
+    btn.style.opacity = '1';
+    btn.style.pointerEvents = '';
+  }
+}
+
+function adminOnFileChosen(input) {
+  const fn  = document.getElementById('admin-file-name');
+  const btn = document.getElementById('admin-upload-btn');
+  if (input.files && input.files[0]) {
+    if (fn) fn.textContent = input.files[0].name;
+    if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+  } else {
+    if (fn) fn.textContent = '';
+    if (btn) { btn.disabled = true; btn.style.opacity = '0.4'; }
+  }
+  const tsBlock = document.getElementById('admin-ts-block');
+  const upRes   = document.getElementById('admin-upload-result');
+  if (tsBlock) tsBlock.style.display = 'none';
+  if (upRes)   upRes.style.display   = 'none';
+}
+
+async function adminUploadScreenshot(btn) {
+  const fileInput = document.getElementById('admin-slip-file');
+  if (!fileInput || !fileInput.files || !fileInput.files[0]) return;
+
+  const spinner = btn.querySelector('.admin-spinner');
+  if (spinner) spinner.style.display = 'block';
+  btn.style.opacity = '0.7';
+  btn.style.pointerEvents = 'none';
+
+  const parseResult = document.getElementById('admin-parse-result');
+  const statusEl    = document.getElementById('admin-parse-status');
+  const tsBlock     = document.getElementById('admin-ts-block');
+
+  if (parseResult) parseResult.style.display = 'none';
+  if (tsBlock)     tsBlock.style.display = 'none';
+  if (statusEl)    statusEl.textContent = 'Uploading…';
+
+  try {
+    const form = new FormData();
+    form.append('image', fileInput.files[0]);
+    const res  = await fetch('/api/fanduel/parse-screenshot', { method: 'POST', body: form });
+    const text = await res.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch {}
+
+    if (!res.ok || !data) {
+      const msg = (data && (data.detail || data.error)) || ('HTTP ' + res.status);
+      if (statusEl) {
+        statusEl.textContent = 'Error: ' + msg;
+        statusEl.style.borderColor = 'var(--red,#ef4444)';
+        statusEl.style.color = '#fca5a5';
+      }
+      if (parseResult) parseResult.style.display = 'block';
+      return;
+    }
+
+    // Populate result UI
+    adminPopulateParseResult(data);
+
+    // Timestamp block
+    if (data.timestamp_display && tsBlock) {
+      const disp     = document.getElementById('admin-ts-display');
+      const override = document.getElementById('admin-ts-override');
+      if (disp)     disp.textContent = data.timestamp_display;
+      if (override) override.value   = data.timestamp_iso || '';
+      tsBlock.style.display = 'block';
+    }
+
+  } catch(e) {
+    if (statusEl) {
+      statusEl.textContent = 'Request failed: ' + e.message;
+      statusEl.style.borderColor = 'var(--red,#ef4444)';
+      statusEl.style.color = '#fca5a5';
+    }
+    if (parseResult) parseResult.style.display = 'block';
+  } finally {
+    if (spinner) spinner.style.display = 'none';
+    btn.style.opacity = '1';
+    btn.style.pointerEvents = '';
+  }
+}
+
+// ── Route to the right result UI based on page_type ──────────────────────────
+function adminPopulateParseResult(data) {
+  // Hide both panels first
+  const slip = document.getElementById('admin-parse-result');
+  const game = document.getElementById('admin-game-result');
+  if (slip) slip.style.display = 'none';
+  if (game) game.style.display = 'none';
+
+  if (data.page_type === 'browsing_page') {
+    adminPopulateBrowsingPage(data);
+  } else {
+    adminPopulateBetSlip(data);
+  }
+}
+
+// ── Browsing-page game-card UI ─────────────────────────────────────────────────
+let _adminSelectedLines = [];   // array of line objects the user has checked
+
+function adminPopulateBrowsingPage(data) {
+  const wrap = document.getElementById('admin-game-result');
+  if (!wrap) return;
+  wrap.style.display = 'block';
+  _adminSelectedLines = [];
+
+  // Status bar
+  const statusEl = document.getElementById('admin-game-status');
+  const ng = (data.games || []).length;
+  const nl = (data.games || []).reduce((s, g) => s + g.lines.length, 0);
+  if (statusEl) {
+    statusEl.style.borderColor = ng > 0 ? 'var(--green)' : 'var(--amber,#f59e0b)';
+    statusEl.style.color = 'var(--text)';
+    statusEl.innerHTML = `<strong>🔍 OCR Free — Game Lines</strong> &nbsp;·&nbsp; ${ng} game${ng !== 1 ? 's' : ''} · ${nl} selectable lines`;
+  }
+
+  // Raw OCR text
+  const rawPre = document.getElementById('admin-game-raw-text');
+  if (rawPre) rawPre.textContent = data.raw_text || '';
+  const rawDet = document.getElementById('admin-game-raw-details');
+  if (rawDet) rawDet.open = ng === 0;
+
+  // Game cards
+  const cards = document.getElementById('admin-game-cards');
+  if (cards) {
+    cards.innerHTML = '';
+    (data.games || []).forEach(game => adminRenderGameCard(cards, game));
+    if (!data.games || !data.games.length) {
+      cards.innerHTML = '<div style="color:var(--muted);font-size:0.82rem;padding:8px 0 16px">No games detected — check raw OCR text. Try a cleaner screenshot of the Game Lines tab.</div>';
+    }
+  }
+
+  // Warnings
+  const warnEl = document.getElementById('admin-game-warnings');
+  if (warnEl) {
+    const warns = data.warnings || [];
+    warnEl.style.display = warns.length ? 'block' : 'none';
+    warnEl.innerHTML = warns.map(w => `⚠️ ${w}`).join('<br>');
+  }
+
+  // Reset sticky bar
+  adminUpdateStickyBar();
+}
+
+function adminRenderGameCard(container, game) {
+  const card = document.createElement('div');
+  card.style.cssText = 'background:var(--surface2);border:1px solid var(--border);border-radius:12px;margin-bottom:12px;overflow:hidden';
+
+  const header = `
+    <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+      <div style="font-weight:700;font-size:0.9rem">${game.away} @ ${game.home}</div>
+      <div style="font-size:0.75rem;color:var(--muted)">${game.time || ''}</div>
+    </div>`;
+
+  const rowsHtml = (game.lines || []).map((line, idx) => {
+    const oddsStr = line.odds != null ? (line.odds > 0 ? '+' : '') + line.odds : '';
+    return `
+      <div class="admin-game-line" data-line='${JSON.stringify(line).replace(/'/g, "&#39;")}'
+        onclick="adminToggleLine(this)"
+        style="display:flex;justify-content:space-between;align-items:center;padding:11px 14px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .1s;-webkit-tap-highlight-color:transparent">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div class="admin-line-check" style="width:18px;height:18px;border:2px solid var(--border);border-radius:4px;flex-shrink:0;transition:all .1s"></div>
+          <div style="font-size:0.88rem">${line.description}</div>
+        </div>
+        <div style="font-size:0.88rem;font-weight:700;color:var(--muted);min-width:48px;text-align:right">${oddsStr}</div>
+      </div>`;
+  }).join('');
+
+  card.innerHTML = header + rowsHtml;
+  container.appendChild(card);
+}
+
+function adminToggleLine(rowEl) {
+  const isSelected = rowEl.classList.contains('admin-line-selected');
+  const check = rowEl.querySelector('.admin-line-check');
+
+  if (isSelected) {
+    rowEl.classList.remove('admin-line-selected');
+    rowEl.style.background = '';
+    if (check) { check.style.background = ''; check.style.borderColor = 'var(--border)'; check.innerHTML = ''; }
+    // Remove from selection
+    try {
+      const line = JSON.parse(rowEl.dataset.line);
+      _adminSelectedLines = _adminSelectedLines.filter(
+        l => !(l.description === line.description && l.odds === line.odds)
+      );
+    } catch {}
+  } else {
+    rowEl.classList.add('admin-line-selected');
+    rowEl.style.background = 'rgba(245,158,11,0.08)';
+    rowEl.style.borderLeft = '3px solid var(--amber,#f59e0b)';
+    if (check) { check.style.background = 'var(--amber,#f59e0b)'; check.style.borderColor = 'var(--amber,#f59e0b)'; check.innerHTML = '<svg viewBox="0 0 10 8" style="width:10px;height:8px;fill:none;stroke:#000;stroke-width:1.5"><polyline points="1,4 4,7 9,1"/></svg>'; }
+    try {
+      _adminSelectedLines.push(JSON.parse(rowEl.dataset.line));
+    } catch {}
+  }
+  adminUpdateStickyBar();
+}
+
+function adminUpdateStickyBar() {
+  const sticky = document.getElementById('admin-game-sticky');
+  const countEl = document.getElementById('admin-sel-count');
+  const oddsEl  = document.getElementById('admin-sel-odds');
+  if (!sticky) return;
+
+  const n = _adminSelectedLines.length;
+  sticky.style.display = n > 0 ? 'block' : 'none';
+  if (countEl) countEl.textContent = `${n} leg${n !== 1 ? 's' : ''}`;
+
+  // Compute combined American odds
+  if (oddsEl && n > 0) {
+    const prices = _adminSelectedLines.map(l => l.odds).filter(o => o != null);
+    if (prices.length) {
+      const combined = prices.reduce((acc, am) => {
+        const dec = am > 0 ? 1 + am / 100 : 1 + 100 / Math.abs(am);
+        return acc * dec;
+      }, 1.0);
+      const am = combined >= 2 ? Math.round((combined - 1) * 100) : Math.round(-100 / (combined - 1));
+      oddsEl.textContent = (am > 0 ? '+' : '') + am;
+    } else {
+      oddsEl.textContent = '';
+    }
+  }
+}
+
+async function adminSubmitGameLines(btn) {
+  if (!_adminSelectedLines.length) {
+    alert('Select at least one line before submitting.');
+    return;
+  }
+  const spinner  = btn.querySelector('.admin-spinner');
+  if (spinner) spinner.style.display = 'block';
+  btn.style.opacity = '0.7'; btn.style.pointerEvents = 'none';
+
+  const stakeEl = document.getElementById('admin-game-stake');
+  const stake   = parseFloat(stakeEl?.value || '10') || 10;
+  const subRes  = document.getElementById('admin-game-submit-result');
+  if (subRes) { subRes.style.display = 'block'; subRes.textContent = 'Submitting…'; subRes.style.borderColor = 'var(--border)'; }
+
+  // Build combined odds
+  const prices = _adminSelectedLines.map(l => l.odds).filter(o => o != null);
+  let combinedAm = null;
+  if (prices.length) {
+    const dec = prices.reduce((acc, am) => acc * (am > 0 ? 1 + am/100 : 1 + 100/Math.abs(am)), 1.0);
+    combinedAm = dec >= 2 ? Math.round((dec-1)*100) : Math.round(-100/(dec-1));
+  }
+
+  const payload = {
+    legs:                  _adminSelectedLines.map(l => ({ bet_info: l.description, extracted_price: l.odds, leg_status: 'PENDING', market_type: l.market_type })),
+    combined_odds_american: combinedAm,
+    stake,
+    potential_payout:      combinedAm != null ? parseFloat(((combinedAm > 0 ? 1+combinedAm/100 : 1+100/Math.abs(combinedAm)) * stake).toFixed(2)) : null,
+    bet_status:            'PENDING',
+    source:                'user_screenshot_sim',
+  };
+
+  try {
+    const res  = await fetch('/api/user-picks/submit-manual', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const text = await res.text();
+    let pretty = text;
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+    if (subRes) { subRes.textContent = pretty; subRes.style.borderColor = res.ok ? 'var(--green)' : 'var(--red,#ef4444)'; }
+  } catch(e) {
+    if (subRes) { subRes.textContent = 'Error: ' + e.message; subRes.style.borderColor = 'var(--red,#ef4444)'; }
+  } finally {
+    if (spinner) spinner.style.display = 'none';
+    btn.style.opacity = '1'; btn.style.pointerEvents = '';
+  }
+}
+
+// ── Bet-slip result UI ────────────────────────────────────────────────────────
+function adminPopulateBetSlip(data) {
+  const wrap = document.getElementById('admin-parse-result');
+  if (!wrap) return;
+  wrap.style.display = 'block';
+
+  // Status bar
+  const statusEl = document.getElementById('admin-parse-status');
+  const method   = data.parse_method || 'ocr_free';
+  const nLegs    = (data.parsed_legs || []).length;
+  const methodLabel = method === 'anthropic_vision' ? '🤖 Claude Vision' : '🔍 OCR Free';
+  if (statusEl) {
+    statusEl.style.borderColor = nLegs > 0 ? 'var(--green)' : 'var(--amber,#f59e0b)';
+    statusEl.style.color = 'var(--text)';
+    statusEl.innerHTML =
+      `<strong>${methodLabel}</strong> &nbsp;·&nbsp; ${nLegs} leg${nLegs !== 1 ? 's' : ''} extracted` +
+      (data.bet_date ? ` &nbsp;·&nbsp; ${data.bet_date}` : '');
+  }
+
+  // Raw OCR text
+  const rawPre = document.getElementById('admin-raw-text');
+  const rawDet = document.getElementById('admin-raw-text-details');
+  if (rawPre) rawPre.textContent = data.raw_text || '(no OCR text — vision mode)';
+  if (rawDet) rawDet.open = !nLegs;
+
+  // Legs
+  const container = document.getElementById('admin-legs-container');
+  if (container) {
+    container.innerHTML = '';
+    const legs = data.parsed_legs || [];
+    legs.forEach((leg, idx) => adminRenderLeg(container, leg, idx));
+    if (!legs.length) {
+      container.innerHTML = '<div style="color:var(--muted);font-size:0.82rem;padding:8px 0 12px">No legs extracted automatically — add them manually below.</div>';
+    }
+  }
+
+  // Summary fields
+  const setVal = (id, v) => { const el = document.getElementById(id); if (el && v != null) el.value = v; };
+  setVal('admin-summary-odds',   data.combined_odds_american != null ? (data.combined_odds_american > 0 ? '+' : '') + data.combined_odds_american : '');
+  setVal('admin-summary-stake',  data.stake  || '');
+  setVal('admin-summary-payout', data.potential_payout || '');
+  const statusSel = document.getElementById('admin-summary-status');
+  if (statusSel && data.bet_status) statusSel.value = data.bet_status;
+
+  // Warnings
+  const warnEl = document.getElementById('admin-warnings');
+  if (warnEl) {
+    const warns = data.warnings || [];
+    if (warns.length) {
+      warnEl.style.display = 'block';
+      warnEl.innerHTML = warns.map(w => `⚠️ ${w}`).join('<br>');
+    } else {
+      warnEl.style.display = 'none';
+    }
+  }
+
+  // Clear previous submit result
+  const subRes = document.getElementById('admin-submit-result');
+  if (subRes) { subRes.style.display = 'none'; subRes.textContent = ''; }
+}
+
+function adminRenderLeg(container, leg, idx) {
+  const div = document.createElement('div');
+  div.dataset.legIdx = idx;
+  div.style.cssText = 'background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:12px 12px 10px;margin-bottom:8px;position:relative';
+
+  const statusColor = { WON: 'var(--green)', LOST: 'var(--red,#ef4444)', PUSH: 'var(--amber,#f59e0b)' };
+  const sc = statusColor[leg.leg_status] || 'var(--muted)';
+
+  div.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px">
+      <div style="font-size:0.68rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">Leg ${idx + 1}</div>
+      <div style="font-size:0.7rem;font-weight:700;color:${sc}">${leg.leg_status || 'PENDING'}</div>
+    </div>
+    <div style="font-size:0.68rem;color:var(--muted);margin-bottom:3px">Description</div>
+    <input type="text" value="${_escVal(leg.bet_info)}" placeholder="e.g. Jalen Brunson Over 24.5 Points"
+      style="width:100%;background:var(--surface1,#0f1117);border:1px solid var(--border);border-radius:7px;color:var(--text);padding:8px 10px;font-size:0.85rem;margin-bottom:8px" data-field="bet_info">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      <div>
+        <div style="font-size:0.68rem;color:var(--muted);margin-bottom:3px">Odds (American)</div>
+        <input type="text" value="${leg.extracted_price != null ? (leg.extracted_price > 0 ? '+' : '') + leg.extracted_price : ''}" placeholder="-110"
+          style="width:100%;background:var(--surface1,#0f1117);border:1px solid var(--border);border-radius:7px;color:var(--text);padding:8px 10px;font-size:0.85rem" data-field="extracted_price">
+      </div>
+      <div>
+        <div style="font-size:0.68rem;color:var(--muted);margin-bottom:3px">Status</div>
+        <select data-field="leg_status"
+          style="width:100%;background:var(--surface1,#0f1117);border:1px solid var(--border);border-radius:7px;color:var(--text);padding:8px 10px;font-size:0.85rem">
+          ${['PENDING','WON','LOST','PUSH','VOID'].map(s => `<option value="${s}"${s === (leg.leg_status || 'PENDING') ? ' selected' : ''}>${s}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;margin-top:8px">
+      <button onclick="this.closest('[data-leg-idx]').remove()"
+        style="background:transparent;border:none;color:var(--muted);font-size:0.75rem;cursor:pointer;padding:2px 6px">✕ Remove</button>
+    </div>`;
+  container.appendChild(div);
+}
+
+function _escVal(s) {
+  return (s || '').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function adminAddLeg() {
+  const container = document.getElementById('admin-legs-container');
+  if (!container) return;
+  // Clear the "no legs" placeholder if present
+  if (container.querySelector('div[style*="No legs"]')) container.innerHTML = '';
+  const idx = container.querySelectorAll('[data-leg-idx]').length;
+  adminRenderLeg(container, { bet_info: '', extracted_price: null, leg_status: 'PENDING' }, idx);
+  // Wrap: make admin-parse-result visible if it wasn't
+  const wrap = document.getElementById('admin-parse-result');
+  if (wrap) wrap.style.display = 'block';
+}
+
+function adminCollectLegs() {
+  const container = document.getElementById('admin-legs-container');
+  if (!container) return [];
+  const legDivs = container.querySelectorAll('[data-leg-idx]');
+  return Array.from(legDivs).map(div => {
+    const get = field => {
+      const el = div.querySelector(`[data-field="${field}"]`);
+      return el ? el.value.trim() : '';
+    };
+    const rawOdds = get('extracted_price').replace(/\s/g, '');
+    return {
+      bet_info:        get('bet_info'),
+      extracted_price: rawOdds ? parseInt(rawOdds, 10) : null,
+      leg_status:      get('leg_status') || 'PENDING',
+    };
+  });
+}
+
+async function adminSubmitParsed(btn) {
+  const legs  = adminCollectLegs();
+  const odds  = document.getElementById('admin-summary-odds')?.value.trim();
+  const stake = parseFloat(document.getElementById('admin-summary-stake')?.value || '0') || null;
+  const payout = parseFloat(document.getElementById('admin-summary-payout')?.value || '0') || null;
+  const status = document.getElementById('admin-summary-status')?.value || 'PENDING';
+  const tsOverride = document.getElementById('admin-ts-override')?.value || '';
+
+  if (!legs.length) {
+    alert('Add at least one leg before submitting.');
+    return;
+  }
+
+  const spinner = btn.querySelector('.admin-spinner');
+  if (spinner) spinner.style.display = 'block';
+  btn.style.opacity = '0.7'; btn.style.pointerEvents = 'none';
+
+  const subRes = document.getElementById('admin-submit-result');
+  if (subRes) { subRes.style.display = 'block'; subRes.textContent = 'Submitting…'; subRes.style.borderColor = 'var(--border)'; }
+
+  const payload = {
+    legs,
+    combined_odds_american: odds ? parseInt(odds.replace(/\+/, ''), 10) : null,
+    stake,
+    potential_payout: payout,
+    bet_status: status,
+    bet_date: tsOverride ? tsOverride.split('T')[0] : (document.getElementById('admin-ts-override')?.value?.split('T')[0] || null),
+    source: 'ocr_admin_manual',
+  };
+
+  try {
+    const res  = await fetch('/api/user-picks/submit-manual', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    let pretty = text;
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+    if (subRes) {
+      subRes.textContent = pretty;
+      subRes.style.borderColor = res.ok ? 'var(--green)' : 'var(--red,#ef4444)';
+    }
+  } catch(e) {
+    if (subRes) { subRes.textContent = 'Error: ' + e.message; subRes.style.borderColor = 'var(--red,#ef4444)'; }
+  } finally {
+    if (spinner) spinner.style.display = 'none';
+    btn.style.opacity = '1'; btn.style.pointerEvents = '';
+  }
+}
+
+// ── NegBin Shadow Tracker ──────────────────────────────────────────────────
+var _nbCohort = 'clean';
+var _nbView = 'measurement';  // 'measurement' or 'live_realistic'
+var _nbData = null;  // cached API response
+
+function setNbCohort(c) {
+  _nbCohort = c;
+  document.querySelectorAll('#nb-cohort-filter button').forEach(b => {
+    b.style.background = 'var(--surface2)'; b.style.color = 'var(--text)';
+  });
+  const active = document.getElementById('nb-coh-' + (c === 'prospective_legacy' ? 'legacy' : c));
+  if (active) { active.style.background = 'var(--blue)'; active.style.color = '#fff'; }
+  loadNegbin();
+}
+
+function setNbView(v) {
+  _nbView = v;
+  document.querySelectorAll('#nb-view-filter button').forEach(b => {
+    b.style.background = 'var(--surface2)'; b.style.color = 'var(--text)';
+  });
+  const active = document.getElementById('nb-view-' + (v === 'live_realistic' ? 'live' : 'meas'));
+  if (active) { active.style.background = 'var(--blue)'; active.style.color = '#fff'; }
+  loadNegbin();
+}
+
+async function loadNegbin() {
+  const days = document.getElementById('nb-days')?.value || '30';
+  ['nb-band-table','nb-cell-grid','nb-structure','nb-daily','nb-parlay-log'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '<div class="loading">Loading...</div>';
+  });
+  try {
+    _nbData = await apiFetch(`/api/negbin/tracker?days=${days}&cohort=${_nbCohort}&view=${_nbView}`);
+    renderNbStatus();
+    renderNbBands();
+    renderNbCells();
+    renderNbStructure();
+    renderNbDaily();
+    renderNbLog();
+  } catch(e) {
+    document.getElementById('nb-status-strip').innerHTML =
+      `<span style="color:var(--red)">Error loading: ${e.message}</span>`;
+  }
+}
+
+function renderNbStatus() {
+  const d = _nbData; if (!d) return;
+  const strip = document.getElementById('nb-status-strip');
+  const statusColor = d.status === 'EVALUABLE' ? 'var(--green)' : 'var(--amber)';
+  const cohortLabel = _nbCohort === 'clean' ? 'Clean (forward eval)' :
+                      _nbCohort === 'prospective_legacy' ? 'Legacy (pre-clean)' : 'All';
+  const viewLabel = _nbView === 'live_realistic' ? 'Live-Realistic' : 'Measurement';
+  strip.innerHTML = `
+    <span>Cohort: <strong>${cohortLabel}</strong> |
+    View: <strong>${viewLabel}</strong> |
+    ${d.settled_count} settled, ${d.pending_count} pending |
+    Status: <span style="color:${statusColor};font-weight:600">${d.status}</span>
+    ${d.status === 'COLLECTING' ? ` (need 50+ settled, have ${d.settled_count})` : ''}</span>
+    <span>${d.first_clean_date ? `Since ${d.first_clean_date} (${d.days_since_start}d)` : 'No data'}</span>`;
+}
+
+function _nbFmt(v, dec=1) { return v != null ? v.toFixed(dec) : '\u2014'; }
+function _nbPnl(v) { return v != null ? `${v >= 0 ? '+' : ''}$${v.toFixed(2)}` : '\u2014'; }
+function _nbPct(v) { return v != null ? `${v.toFixed(1)}%` : '\u2014'; }
+function _nbEdge(v) { return v != null ? `${v >= 0 ? '+' : ''}${v.toFixed(1)}pp` : '\u2014'; }
+
+function _nbQualityBadge(q) {
+  const colors = { 'RELIABLE': 'var(--green)', 'DIRECTIONAL': 'var(--amber)', 'TOO THIN': 'var(--red)' };
+  return `<span style="color:${colors[q]||'var(--muted)'};font-weight:600;font-size:11px">${q||'\u2014'}</span>`;
+}
+
+function renderNbBands() {
+  const d = _nbData; if (!d) return;
+  const el = document.getElementById('nb-band-table');
+  const bands = d.bands || [];
+  const anchor = '1.7-2.2x';
+
+  let html = `<table style="width:100%;border-collapse:collapse;font-size:12px">
+    <thead><tr style="border-bottom:2px solid var(--border)">
+      <th style="text-align:left;padding:6px 8px">Band</th>
+      <th style="text-align:right;padding:6px 4px">N</th>
+      <th style="text-align:right;padding:6px 4px">Eff-N</th>
+      <th style="text-align:center;padding:6px 4px">Quality</th>
+      <th style="text-align:right;padding:6px 4px">WR</th>
+      <th style="text-align:right;padding:6px 4px">ROI</th>
+      <th style="text-align:right;padding:6px 4px">Edge</th>
+      <th style="text-align:right;padding:6px 4px;color:var(--muted)">ATS N</th>
+      <th style="text-align:right;padding:6px 4px;color:var(--muted)">ATS WR</th>
+      <th style="text-align:right;padding:6px 4px;color:var(--muted)">ATS Edge</th>
+      <th style="text-align:right;padding:6px 4px">NB-ATS</th>
+    </tr></thead><tbody>`;
+
+  for (const b of bands) {
+    const isAnchor = b.band === anchor;
+    const rowStyle = isAnchor ? 'background:rgba(99,102,241,0.08);font-weight:600' : '';
+    const wrColor = b.nb_wr != null ? (b.nb_edge > 0 ? 'var(--green)' : b.nb_edge > -5 ? 'var(--text)' : 'var(--red)') : 'var(--muted)';
+    const deltaColor = b.nb_vs_ats_edge != null ? (b.nb_vs_ats_edge > 0 ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
+
+    html += `<tr style="border-bottom:1px solid var(--border);${rowStyle}">
+      <td style="padding:6px 8px">${b.band}${isAnchor ? ' <span style="font-size:10px;color:var(--blue)">(anchor)</span>' : ''}</td>
+      <td style="text-align:right;padding:6px 4px">${b.nb_n}</td>
+      <td style="text-align:right;padding:6px 4px">${_nbFmt(b.nb_eff_n, 0)}</td>
+      <td style="text-align:center;padding:6px 4px">${_nbQualityBadge(b.nb_quality)}</td>
+      <td style="text-align:right;padding:6px 4px;color:${wrColor}">${_nbPct(b.nb_wr)}</td>
+      <td style="text-align:right;padding:6px 4px">${_nbPct(b.nb_roi)}</td>
+      <td style="text-align:right;padding:6px 4px;color:${wrColor}">${_nbEdge(b.nb_edge)}</td>
+      <td style="text-align:right;padding:6px 4px;color:var(--muted)">${b.ats_n}</td>
+      <td style="text-align:right;padding:6px 4px;color:var(--muted)">${_nbPct(b.ats_wr)}</td>
+      <td style="text-align:right;padding:6px 4px;color:var(--muted)">${_nbEdge(b.ats_edge)}</td>
+      <td style="text-align:right;padding:6px 4px;color:${deltaColor};font-weight:600">${_nbEdge(b.nb_vs_ats_edge)}</td>
+    </tr>`;
+
+    // Leg count sub-rows (collapsed by default, expandable)
+    if (b.by_legs && b.by_legs.length > 0) {
+      for (const lg of b.by_legs) {
+        html += `<tr style="border-bottom:1px solid var(--border);background:var(--surface2);font-size:11px">
+          <td style="padding:3px 8px 3px 24px;color:var(--muted)">${lg.legs}-leg ${lg.comparable ? '' : '<span style="color:var(--red)">(unvalidated)</span>'}</td>
+          <td style="text-align:right;padding:3px 4px">${lg.n}</td>
+          <td colspan="2"></td>
+          <td style="text-align:right;padding:3px 4px">${_nbPct(lg.wr)}</td>
+          <td></td>
+          <td style="text-align:right;padding:3px 4px">${_nbEdge(lg.edge)}</td>
+          <td colspan="4"></td>
+        </tr>`;
+      }
+    }
+  }
+
+  // Totals row
+  const nb = d.nb_total || {};
+  const ats = d.ats_total || {};
+  html += `<tr style="border-top:2px solid var(--border);font-weight:700">
+    <td style="padding:6px 8px">Total</td>
+    <td style="text-align:right;padding:6px 4px">${nb.n||0}</td>
+    <td colspan="2"></td>
+    <td style="text-align:right;padding:6px 4px">${_nbPct(nb.wr)}</td>
+    <td style="text-align:right;padding:6px 4px">${_nbPct(nb.roi)}</td>
+    <td></td>
+    <td style="text-align:right;padding:6px 4px;color:var(--muted)">${ats.n||0}</td>
+    <td style="text-align:right;padding:6px 4px;color:var(--muted)">${_nbPct(ats.wr)}</td>
+    <td colspan="2"></td>
+  </tr>`;
+
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function renderNbCells() {
+  const d = _nbData; if (!d) return;
+  const el = document.getElementById('nb-cell-grid');
+  const cells = d.cells || [];
+
+  let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">';
+  for (const c of cells) {
+    const edgeColor = c.edge != null ? (c.edge > 0 ? 'var(--green)' : c.edge > -5 ? 'var(--text)' : 'var(--red)') : 'var(--muted)';
+    const adjColor = c.cell_adj > 1.0 ? 'var(--green)' : c.cell_adj < 1.0 ? 'var(--red)' : 'var(--muted)';
+    html += `<div style="background:var(--surface2);border-radius:8px;padding:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <span style="font-weight:600;font-size:12px">${c.label}</span>
+        <span style="font-size:10px;color:${adjColor}">${c.adj_label}</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:11px">
+        <div><span style="color:var(--muted)">N:</span> ${c.n}</div>
+        <div><span style="color:var(--muted)">WR:</span> <span style="color:${edgeColor}">${_nbPct(c.wr)}</span></div>
+        <div><span style="color:var(--muted)">ROI:</span> ${_nbPct(c.roi)}</div>
+        <div><span style="color:var(--muted)">Edge:</span> <span style="color:${edgeColor}">${_nbEdge(c.edge)}</span></div>
+      </div>
+    </div>`;
+  }
+  html += '</div>';
+
+  // Fav@Home carve-out card
+  const fh = _nbData.fav_home_carveout;
+  if (fh) {
+    const fhEdgeColor = fh.roi != null ? (fh.roi > 0 ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
+    html += `<div style="margin-top:10px;background:var(--surface2);border-radius:8px;padding:12px;border-left:3px solid var(--amber)">
+      <div style="font-weight:600;font-size:12px;margin-bottom:6px">Fav@Home Carve-Out
+        <span style="font-weight:400;font-size:10px;color:var(--muted)">(isolated allocation test)</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;font-size:11px">
+        <div><span style="color:var(--muted)">N:</span> ${fh.settled}${fh.pending ? ` <span style="color:var(--muted)">(+${fh.pending}p)</span>` : ''}</div>
+        <div><span style="color:var(--muted)">W:</span> ${fh.wins}</div>
+        <div><span style="color:var(--muted)">WR:</span> <span style="color:${fhEdgeColor}">${_nbPct(fh.wr)}</span></div>
+        <div><span style="color:var(--muted)">ROI:</span> <span style="color:${fhEdgeColor}">${_nbPct(fh.roi)}</span></div>
+      </div>
+      <div style="font-size:10px;color:var(--muted);margin-top:4px">P&L: ${_nbPnl(fh.pnl)} | Question: does positive candidate edge convert to parlay profit?</div>
+    </div>`;
+  }
+
+  el.innerHTML = html;
+}
+
+function renderNbStructure() {
+  const d = _nbData; if (!d) return;
+  const el = document.getElementById('nb-structure');
+  const s = d.structure || {};
+
+  let html = '';
+  // Leg distribution
+  html += '<div style="margin-bottom:12px"><div style="font-size:11px;font-weight:600;margin-bottom:4px;color:var(--muted)">Leg Distribution</div>';
+  html += '<div style="display:flex;gap:8px">';
+  for (const ld of (s.leg_distribution || [])) {
+    const bg = ld.validated ? 'var(--green)' : 'var(--red)';
+    html += `<div style="background:var(--surface2);border-radius:6px;padding:6px 10px;font-size:11px;border-left:3px solid ${bg}">
+      <strong>${ld.legs}-leg</strong>: ${ld.n} (${ld.pct.toFixed(0)}%)${ld.validated ? '' : ' <span style="color:var(--red)">unvalidated</span>'}
+    </div>`;
+  }
+  html += '</div></div>';
+
+  // Reuse profile
+  html += '<div style="margin-bottom:12px"><div style="font-size:11px;font-weight:600;margin-bottom:4px;color:var(--muted)">Leg Reuse</div>';
+  const rh = s.reuse_histogram || {};
+  const maxReuse = Math.max(...Object.values(rh), 1);
+  html += '<div style="display:flex;gap:2px;align-items:end;height:40px">';
+  for (const [k, v] of Object.entries(rh).sort((a,b) => Number(a[0]) - Number(b[0]))) {
+    const h = Math.max(4, (v / maxReuse) * 36);
+    html += `<div style="display:flex;flex-direction:column;align-items:center;font-size:9px">
+      <div style="width:16px;height:${h}px;background:var(--blue);border-radius:2px" title="${k}x: ${v} legs"></div>
+      <span style="color:var(--muted)">${k}x</span>
+    </div>`;
+  }
+  html += `</div><div style="font-size:10px;color:var(--muted);margin-top:4px">${s.total_distinct_legs||0} distinct legs, ${s.at_cap||0} at cap (3x)</div></div>`;
+
+  // Underfill
+  const uf = s.underfill_by_band || [];
+  if (uf.length > 0) {
+    html += '<div><div style="font-size:11px;font-weight:600;margin-bottom:4px;color:var(--muted)">Underfill</div>';
+    for (const u of uf) {
+      const reasonColor = u.reason === 'NO_CONSTRUCTABLE' ? 'var(--red)' : 'var(--amber)';
+      html += `<div style="font-size:10px;padding:3px 0;color:${reasonColor}">${u.band}: ${u.filled}/${u.target} &mdash; ${u.reason} (${u.available_combos} combos)</div>`;
+    }
+    html += '</div>';
+  }
+
+  el.innerHTML = html;
+}
+
+function renderNbDaily() {
+  const d = _nbData; if (!d) return;
+  const el = document.getElementById('nb-daily');
+  const daily = d.daily || [];
+  if (!daily.length) { el.innerHTML = '<div style="color:var(--muted);font-size:12px">No daily data</div>'; return; }
+
+  let html = `<table style="width:100%;border-collapse:collapse;font-size:12px">
+    <thead><tr style="border-bottom:2px solid var(--border)">
+      <th style="text-align:left;padding:4px 8px">Date</th>
+      <th style="text-align:right;padding:4px">Gen</th>
+      <th style="text-align:right;padding:4px">Settled</th>
+      <th style="text-align:right;padding:4px">Pending</th>
+      <th style="text-align:right;padding:4px">WR</th>
+      <th style="text-align:right;padding:4px">P&L</th>
+    </tr></thead><tbody>`;
+  for (const day of daily.slice().reverse()) {
+    const wrColor = day.wr != null ? (day.wr >= 50 ? 'var(--green)' : day.wr >= 30 ? 'var(--text)' : 'var(--red)') : 'var(--muted)';
+    html += `<tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:4px 8px">${day.date}</td>
+      <td style="text-align:right;padding:4px">${day.generated}</td>
+      <td style="text-align:right;padding:4px">${day.settled}</td>
+      <td style="text-align:right;padding:4px;color:var(--muted)">${day.pending}</td>
+      <td style="text-align:right;padding:4px;color:${wrColor}">${day.wr != null ? day.wr.toFixed(1) + '%' : 'pending'}</td>
+      <td style="text-align:right;padding:4px">${day.pnl != null ? _nbPnl(day.pnl) : '\u2014'}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+
+  // Daily chart if multiple days
+  const canvas = document.getElementById('nb-daily-chart');
+  if (daily.length > 1 && daily.some(d => d.settled > 0)) {
+    canvas.style.display = 'block';
+    const ctx = canvas.getContext('2d');
+    if (window._nbDailyChart) window._nbDailyChart.destroy();
+    const settledDays = daily.filter(d => d.settled > 0);
+    window._nbDailyChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: settledDays.map(d => d.date),
+        datasets: [{
+          label: 'Win Rate %',
+          data: settledDays.map(d => d.wr),
+          borderColor: '#6366f1',
+          backgroundColor: 'rgba(99,102,241,0.1)',
+          fill: true, tension: 0.3, pointRadius: 3
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        scales: { yAxes: [{ ticks: { beginAtZero: true, max: 100 } }] },
+        legend: { display: false }
+      }
+    });
+  } else {
+    canvas.style.display = 'none';
+  }
+}
+
+function renderNbLog() {
+  const d = _nbData; if (!d) return;
+  const el = document.getElementById('nb-parlay-log');
+  let parlays = d.parlays || [];
+  const bandF = document.getElementById('nb-log-band')?.value;
+  const statusF = document.getElementById('nb-log-status')?.value;
+  if (bandF) parlays = parlays.filter(p => p.band === bandF);
+  if (statusF) {
+    if (statusF === 'WON') parlays = parlays.filter(p => p.status === 'SETTLED_WIN' || p.status === 'WON');
+    else if (statusF === 'LOST') parlays = parlays.filter(p => p.status === 'SETTLED_LOSS' || p.status === 'LOST');
+    else parlays = parlays.filter(p => p.status === statusF);
+  }
+
+  if (!parlays.length) { el.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:8px">No parlays match filters</div>'; return; }
+
+  let html = `<table style="width:100%;border-collapse:collapse;font-size:12px">
+    <thead><tr style="border-bottom:2px solid var(--border)">
+      <th style="text-align:left;padding:4px 8px">Date</th>
+      <th style="text-align:left;padding:4px">Band</th>
+      <th style="text-align:right;padding:4px">Odds</th>
+      <th style="text-align:right;padding:4px">Legs</th>
+      <th style="text-align:right;padding:4px">WP</th>
+      <th style="text-align:center;padding:4px">Status</th>
+      <th style="text-align:right;padding:4px">P&L</th>
+    </tr></thead><tbody>`;
+
+  for (const p of parlays.slice(0, 100)) {
+    const statusColor = (p.status === 'SETTLED_WIN' || p.status === 'WON') ? 'var(--green)' : (p.status === 'SETTLED_LOSS' || p.status === 'LOST') ? 'var(--red)' : 'var(--muted)';
+    const statusLabel = (p.status === 'SETTLED_WIN' || p.status === 'WON') ? 'W' : (p.status === 'SETTLED_LOSS' || p.status === 'LOST') ? 'L' : 'P';
+    html += `<tr style="border-bottom:1px solid var(--border);cursor:pointer" onclick="showNbDrill('${p.id}')">
+      <td style="padding:4px 8px">${p.game_date}</td>
+      <td style="padding:4px">${p.band || '\u2014'}</td>
+      <td style="text-align:right;padding:4px">${p.odds ? p.odds.toFixed(2) : '\u2014'}x</td>
+      <td style="text-align:right;padding:4px">${p.leg_count}</td>
+      <td style="text-align:right;padding:4px">${p.win_prob ? (p.win_prob * 100).toFixed(1) + '%' : '\u2014'}</td>
+      <td style="text-align:center;padding:4px"><span style="color:${statusColor};font-weight:600">${statusLabel}</span></td>
+      <td style="text-align:right;padding:4px">${p.pnl != null ? _nbPnl(p.pnl) : '\u2014'}</td>
+    </tr>`;
+  }
+  if (parlays.length > 100) {
+    html += `<tr><td colspan="7" style="padding:8px;color:var(--muted);text-align:center;font-size:11px">Showing 100 of ${parlays.length}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function showNbDrill(id) {
+  const p = (_nbData?.parlays || []).find(x => x.id === id);
+  if (!p) return;
+  const modal = document.getElementById('nb-drill-modal');
+  const content = document.getElementById('nb-drill-content');
+
+  const statusColor = (p.status === 'SETTLED_WIN' || p.status === 'WON') ? 'var(--green)' : (p.status === 'SETTLED_LOSS' || p.status === 'LOST') ? 'var(--red)' : 'var(--muted)';
+  const statusLabel = (p.status === 'SETTLED_WIN' || p.status === 'WON') ? 'Won' : (p.status === 'SETTLED_LOSS' || p.status === 'LOST') ? 'Lost' : 'Pending';
+
+  let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+    <div>
+      <div style="font-size:16px;font-weight:700">Parlay Detail</div>
+      <div style="font-size:11px;color:var(--muted)">${p.game_date} &middot; ${p.band} &middot; ${p.leg_count} legs</div>
+    </div>
+    <div style="text-align:right">
+      <div style="font-size:18px;font-weight:700">${p.odds ? p.odds.toFixed(2) + 'x' : '\u2014'}</div>
+      <div style="color:${statusColor};font-weight:600">${statusLabel}</div>
+    </div>
+  </div>`;
+
+  // Parlay meta
+  html += `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px;font-size:11px">
+    <div style="background:var(--surface2);padding:8px;border-radius:6px"><span style="color:var(--muted)">Win Prob</span><br><strong>${p.win_prob ? (p.win_prob*100).toFixed(1)+'%' : '\u2014'}</strong></div>
+    <div style="background:var(--surface2);padding:8px;border-radius:6px"><span style="color:var(--muted)">Composite</span><br><strong>${_nbFmt(p.composite)}</strong></div>
+    <div style="background:var(--surface2);padding:8px;border-radius:6px"><span style="color:var(--muted)">Cell Adj</span><br><strong>${_nbFmt(p.cell_adj, 2)}</strong></div>
+    <div style="background:var(--surface2);padding:8px;border-radius:6px"><span style="color:var(--muted)">Cohort</span><br><strong>${p.cohort || 'NULL'}</strong></div>
+  </div>`;
+
+  // Legs table
+  html += `<table style="width:100%;border-collapse:collapse;font-size:12px">
+    <thead><tr style="border-bottom:2px solid var(--border)">
+      <th style="text-align:left;padding:4px 8px">Leg</th>
+      <th style="text-align:right;padding:4px">NB WP</th>
+      <th style="text-align:right;padding:4px">Mu H</th>
+      <th style="text-align:right;padding:4px">Mu A</th>
+      <th style="text-align:left;padding:4px">Cell</th>
+      <th style="text-align:right;padding:4px">Edge</th>
+      <th style="text-align:center;padding:4px">Result</th>
+    </tr></thead><tbody>`;
+
+  for (const leg of (p.legs || [])) {
+    const resultColor = leg.leg_result === 'WIN' ? 'var(--green)' : leg.leg_result === 'LOSS' ? 'var(--red)' : 'var(--muted)';
+    const resultLabel = leg.leg_result || 'pending';
+    html += `<tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:4px 8px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${leg.description||''}">${leg.description || '\u2014'}</td>
+      <td style="text-align:right;padding:4px">${leg.negbin_wp != null ? (leg.negbin_wp*100).toFixed(1)+'%' : '\u2014'}</td>
+      <td style="text-align:right;padding:4px">${_nbFmt(leg.negbin_mu_home)}</td>
+      <td style="text-align:right;padding:4px">${_nbFmt(leg.negbin_mu_away)}</td>
+      <td style="padding:4px">${leg.negbin_cell || '\u2014'}</td>
+      <td style="text-align:right;padding:4px">${leg.negbin_edge_pp != null ? _nbEdge(leg.negbin_edge_pp) : '\u2014'}</td>
+      <td style="text-align:center;padding:4px;color:${resultColor};font-weight:600">${resultLabel}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+
+  content.innerHTML = html;
+  modal.style.display = 'flex';
+}
 
 </script>
 

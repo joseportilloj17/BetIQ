@@ -555,6 +555,157 @@ def backfill_nba_nightly(date_str: Optional[str] = None, dry_run: bool = False) 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MLB — nightly updater (mirrors backfill_nba_nightly)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def backfill_mlb_nightly(date_str: Optional[str] = None, dry_run: bool = False) -> dict:
+    """
+    Nightly closing-line update for MLB games. Fetches ESPN odds for a single
+    date (default: yesterday) and updates rows with NULL close_spread.
+    Called from scheduler.py each morning after the previous day's games.
+    """
+    import datetime as _dt
+    if date_str is None:
+        date_str = (_dt.date.today() - _dt.timedelta(days=1)).isoformat()
+
+    log.info("MLB nightly odds: date=%s  dry_run=%s", date_str, dry_run)
+
+    conn = sqlite3.connect(os.path.abspath(DB_PATH))
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT g.game_id, g.game_date, g.home_team, g.away_team
+        FROM games g
+        JOIN betting_lines bl ON g.game_id = bl.game_id
+        WHERE g.sport      = 'MLB'
+          AND g.game_date  = ?
+          AND bl.close_spread IS NULL
+        ORDER BY g.game_date
+    """, (date_str,))
+    games = cur.fetchall()
+    log.info("MLB nightly: %d games on %s need odds", len(games), date_str)
+
+    if not games:
+        conn.close()
+        return {"sport": "MLB", "date": date_str, "attempted": 0, "filled": 0}
+
+    event_map = _build_mlb_date_event_map([date_str])
+
+    filled = missing = 0
+    for game_id, game_date, home_team, away_team in games:
+        event_id = event_map.get((game_date, home_team))
+        if not event_id:
+            missing += 1
+            continue
+
+        time.sleep(_DELAY_ODDS)
+        odds = _fetch_mlb_runline_odds(event_id)
+        if not odds:
+            if not dry_run:
+                cur.execute("UPDATE betting_lines SET close_spread = -1.5 WHERE game_id = ?",
+                            (game_id,))
+            missing += 1
+            continue
+
+        if not dry_run:
+            cur.execute("""
+                UPDATE betting_lines
+                SET close_spread = ?, close_total = ?,
+                    close_ml_home = ?, close_ml_away = ?,
+                    home_is_favorite = ?
+                WHERE game_id = ?
+            """, (odds["close_spread"], odds["over_under"],
+                  odds["ml_home"], odds["ml_away"],
+                  odds["home_is_favorite"], game_id))
+        filled += 1
+
+    if not dry_run:
+        conn.commit()
+    conn.close()
+
+    log.info("MLB nightly done: date=%s filled=%d missing=%d", date_str, filled, missing)
+    return {"sport": "MLB", "date": date_str, "attempted": len(games),
+            "filled": filled, "missing": missing}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NHL — nightly updater (mirrors backfill_nba_nightly)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def backfill_nhl_nightly(date_str: Optional[str] = None, dry_run: bool = False) -> dict:
+    """
+    Nightly closing-line update for NHL games. Fetches ESPN odds for a single
+    date (default: yesterday) and updates rows with NULL close_spread.
+    Called from scheduler.py each morning after the previous day's games.
+    """
+    import datetime as _dt
+    if date_str is None:
+        date_str = (_dt.date.today() - _dt.timedelta(days=1)).isoformat()
+
+    log.info("NHL nightly odds: date=%s  dry_run=%s", date_str, dry_run)
+
+    conn = sqlite3.connect(os.path.abspath(DB_PATH))
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT g.game_id, g.game_date, g.home_team, g.away_team
+        FROM games g
+        JOIN betting_lines bl ON g.game_id = bl.game_id
+        WHERE g.sport      = 'NHL'
+          AND g.game_date  = ?
+          AND bl.close_spread IS NULL
+        ORDER BY g.game_date
+    """, (date_str,))
+    games = cur.fetchall()
+    log.info("NHL nightly: %d games on %s need odds", len(games), date_str)
+
+    if not games:
+        conn.close()
+        return {"sport": "NHL", "date": date_str, "attempted": 0, "filled": 0}
+
+    event_map = _build_nhl_date_event_map([date_str])
+
+    filled = missing = 0
+    for game_id, game_date, home_team, away_team in games:
+        event_id = event_map.get((game_date, home_team))
+        if not event_id:
+            if not dry_run:
+                cur.execute("UPDATE betting_lines SET close_spread = -1.5 WHERE game_id = ?",
+                            (game_id,))
+            missing += 1
+            continue
+
+        time.sleep(_DELAY_ODDS)
+        odds = _fetch_nhl_puckline_odds(event_id)
+        if not odds:
+            if not dry_run:
+                cur.execute("UPDATE betting_lines SET close_spread = -1.5 WHERE game_id = ?",
+                            (game_id,))
+            missing += 1
+            continue
+
+        if not dry_run:
+            cur.execute("""
+                UPDATE betting_lines
+                SET close_spread = ?, close_total = ?,
+                    close_ml_home = ?, close_ml_away = ?,
+                    home_is_favorite = ?
+                WHERE game_id = ?
+            """, (odds["close_spread"], odds["over_under"],
+                  odds["ml_home"], odds["ml_away"],
+                  odds["home_is_favorite"], game_id))
+        filled += 1
+
+    if not dry_run:
+        conn.commit()
+    conn.close()
+
+    log.info("NHL nightly done: date=%s filled=%d missing=%d", date_str, filled, missing)
+    return {"sport": "NHL", "date": date_str, "attempted": len(games),
+            "filled": filled, "missing": missing}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Verification
 # ══════════════════════════════════════════════════════════════════════════════
 

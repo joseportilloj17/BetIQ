@@ -1023,6 +1023,8 @@ def fetch_mlb_pitcher_stats(seasons: Iterable[int] | None = None) -> pd.DataFram
                     "k9":           float(st.get("strikeOutsPer9Inn", 0.0) or 0.0),
                     "bb9":          float(st.get("walksPer9Inn", 0.0) or 0.0),
                     "fip":          float(st.get("fieldingIndependentPitching", 99.0) or 99.0),
+                    "hr9":          float(st.get("homeRunsPer9", 0.0) or 0.0),
+                    "home_runs_allowed": int(st.get("homeRuns", 0) or 0),
                     "gs":           gs,
                     "ip":           ip,
                 })
@@ -1120,6 +1122,7 @@ def fetch_mlb_pitcher_game_logs(seasons: Iterable[int] | None = None) -> pd.Data
                         "hits":         int(st.get("hits",        0) or 0),
                         "walks":        int(st.get("baseOnBalls", 0) or 0),
                         "strikeouts":   int(st.get("strikeOuts",  0) or 0),
+                        "home_runs":    int(st.get("homeRuns",    0) or 0),
                     })
             except Exception as exc:
                 log.warning("MLB game log %s %s %s: %s", name, season, pid, exc)
@@ -1130,9 +1133,132 @@ def fetch_mlb_pitcher_game_logs(seasons: Iterable[int] | None = None) -> pd.Data
             time.sleep(0.2)   # ~200ms between calls to stay well within rate limits
 
     if not rows:
-        return pd.DataFrame(columns=["pitcher_name","player_id","season","game_date","game_pk","ip","er","hits","walks","strikeouts"])
+        return pd.DataFrame(columns=["pitcher_name","player_id","season","game_date","game_pk","ip","er","hits","walks","strikeouts","home_runs"])
     df = pd.DataFrame(rows)
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    return df
+
+
+def fetch_mlb_team_game_batting(seasons: Iterable[int] | None = None) -> pd.DataFrame:
+    """
+    Fetch per-game, per-team batting box-score stats from the MLB Stats API.
+
+    Endpoint: GET /api/v1/teams/{id}/stats?stats=gameLog&group=hitting&season={year}
+
+    Returns one row per (team_name, season, game_date, game_pk) with raw counting
+    stats (hits, AB, HR, BB, K, etc.) plus pre-computed rates (OBP/SLG/OPS).
+
+    Used by features.py to compute rolling offensive quality (OBP/SLG/ISO at
+    10/20-game windows) for the totals model.
+
+    API cost: 30 teams × N seasons = ~150 calls at 0.2s spacing ≈ 30 seconds.
+    """
+    import time
+    import requests
+
+    if seasons is None:
+        seasons = HISTORICAL_SEASONS["MLB"]
+
+    # Build team ID → name map from the API
+    r_teams = requests.get("https://statsapi.mlb.com/api/v1/teams",
+                           params={"sportId": 1}, timeout=10)
+    r_teams.raise_for_status()
+    api_teams = [(t["id"], t["name"]) for t in r_teams.json()["teams"]]
+    id_to_name = {t[0]: t[1] for t in api_teams}
+
+    # Map API names to DB names (handle franchise relocations)
+    _API_TO_DB_NAME = {
+        "Athletics": {
+            # API always returns current name; DB uses "Oakland Athletics" pre-2025
+            2022: "Oakland Athletics",
+            2023: "Oakland Athletics",
+            2024: "Oakland Athletics",
+            2025: "Athletics",
+            2026: "Athletics",
+        },
+    }
+
+    def _resolve_team_name(api_name: str, season: int) -> str:
+        override = _API_TO_DB_NAME.get(api_name)
+        if override:
+            return override.get(season, api_name)
+        return api_name
+
+    rows = []
+    total_calls = len(api_teams) * len(seasons)
+    done = 0
+
+    for season in seasons:
+        for tid, tname in api_teams:
+            try:
+                url = f"https://statsapi.mlb.com/api/v1/teams/{tid}/stats"
+                resp = requests.get(url, params={
+                    "stats": "gameLog",
+                    "group": "hitting",
+                    "season": str(season),
+                }, timeout=20)
+                resp.raise_for_status()
+                splits = resp.json().get("stats", [{}])[0].get("splits", [])
+
+                db_name = _resolve_team_name(tname, int(season))
+
+                for s in splits:
+                    st = s.get("stat", {})
+                    game_date = s.get("date")
+                    game_pk = s.get("game", {}).get("gamePk")
+                    is_home = 1 if s.get("isHome") else 0
+                    opp_id = s.get("opponent", {}).get("id")
+                    opp_name = _resolve_team_name(
+                        id_to_name.get(opp_id, ""), int(season)
+                    ) if opp_id else ""
+
+                    rows.append({
+                        "team_name":         db_name,
+                        "season":            str(season),
+                        "game_date":         game_date,
+                        "game_pk":           int(game_pk) if game_pk else None,
+                        "is_home":           is_home,
+                        "opponent":          opp_name,
+                        "plate_appearances": int(st.get("plateAppearances", 0) or 0),
+                        "at_bats":           int(st.get("atBats", 0) or 0),
+                        "hits":              int(st.get("hits", 0) or 0),
+                        "doubles":           int(st.get("doubles", 0) or 0),
+                        "triples":           int(st.get("triples", 0) or 0),
+                        "home_runs":         int(st.get("homeRuns", 0) or 0),
+                        "runs":              int(st.get("runs", 0) or 0),
+                        "rbi":               int(st.get("rbi", 0) or 0),
+                        "walks":             int(st.get("baseOnBalls", 0) or 0),
+                        "hit_by_pitch":      int(st.get("hitByPitch", 0) or 0),
+                        "strikeouts":        int(st.get("strikeOuts", 0) or 0),
+                        "sac_flies":         int(st.get("sacFlies", 0) or 0),
+                        "total_bases":       int(st.get("totalBases", 0) or 0),
+                        "stolen_bases":      int(st.get("stolenBases", 0) or 0),
+                        "left_on_base":      int(st.get("leftOnBase", 0) or 0),
+                        "obp":               float(st.get("obp", 0) or 0),
+                        "slg":               float(st.get("slg", 0) or 0),
+                        "ops":               float(st.get("ops", 0) or 0),
+                        "babip":             float(st.get("babip", 0) or 0),
+                    })
+            except Exception as exc:
+                log.warning("MLB team game batting %s %s: %s", tname, season, exc)
+
+            done += 1
+            if done % 30 == 0:
+                log.info("  MLB team game batting: %d/%d team-seasons fetched",
+                         done, total_calls)
+            time.sleep(0.2)
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "team_name", "season", "game_date", "game_pk", "is_home", "opponent",
+            "plate_appearances", "at_bats", "hits", "doubles", "triples",
+            "home_runs", "runs", "rbi", "walks", "hit_by_pitch", "strikeouts",
+            "sac_flies", "total_bases", "stolen_bases", "left_on_base",
+            "obp", "slg", "ops", "babip",
+        ])
+    df = pd.DataFrame(rows)
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    log.info("MLB team game batting: %d rows across %d seasons", len(df), len(seasons))
     return df
 
 

@@ -394,6 +394,7 @@ def _personal_rows(conn: sqlite3.Connection) -> list[dict]:
         WHERE b.is_mock = 0
           AND bl.resolution_source != 'inferred_parlay_win'
           AND bl.leg_result IN ('WIN', 'LOSS')
+          AND COALESCE(bl.excluded_from_metrics, 0) = 0
         GROUP BY
             CASE
                 WHEN bl.sport = 'NHL Games' AND bl.market_type = 'Moneyline'
@@ -867,16 +868,17 @@ def get_contextual_wr_adjustment(
             )
             sk_placeholders = ",".join("?" * len(sport_keys))
             conn = sqlite3.connect(path)
+            import datetime as _dt
+            _today_iso = _dt.date.today().isoformat()
             row = conn.execute(f"""
-                SELECT MAX(date(commence_time)) AS last_game
+                SELECT MAX(game_date_ct) AS last_game
                 FROM   fixtures
                 WHERE  (home_team = ? OR away_team = ?)
-                  AND  date(commence_time) < date('now', '-5 hours')
+                  AND  game_date_ct < ?
                   AND  sport_key IN ({sk_placeholders})
-            """, [team, team] + sport_keys).fetchone()
+            """, [team, team, _today_iso] + sport_keys).fetchone()
             conn.close()
             if row and row[0]:
-                import datetime as _dt
                 last_game = _dt.date.fromisoformat(row[0])
                 today = _dt.date.today()
                 rest_days = (today - last_game).days - 1   # 0 = played yesterday

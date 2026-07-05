@@ -27,13 +27,39 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo as _ZoneInfo
 import calendar
 
 import requests
 
+# ─── UTC → CT date helper ────────────────────────────────────────────────────
+
+_CT = _ZoneInfo("America/Chicago")
+
+
+def _utc_to_ct_date(commence_time_str: str | None) -> str | None:
+    """Convert a UTC commence_time ISO string (e.g. '2026-06-16T01:10:00Z')
+    to a CT date string (YYYY-MM-DD).  Returns None on bad/missing input."""
+    if not commence_time_str:
+        return None
+    try:
+        ct_str = commence_time_str.replace("Z", "+00:00")
+        utc_dt = datetime.fromisoformat(ct_str)
+        if utc_dt.tzinfo is None:
+            utc_dt = utc_dt.replace(tzinfo=timezone.utc)
+        return utc_dt.astimezone(_CT).strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 _ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
+if not _ODDS_API_KEY:
+    try:
+        from config import ODDS_API_KEY as _cfg_key
+        _ODDS_API_KEY = _cfg_key
+    except Exception:
+        pass
 _BASE_URL = "https://api.the-odds-api.com/v4"
 _HIST_DB  = os.path.join(os.path.dirname(__file__), "..", "data", "historical.db")
 
@@ -46,6 +72,7 @@ _CLV_SPORTS: dict[str, str] = {
 # Player-prop markets to fetch per sport (TheOddsAPI market keys)
 _PROP_MARKETS: dict[str, list[str]] = {
     "baseball_mlb": [
+        # Standard lines
         "pitcher_strikeouts",
         "batter_hits",
         "batter_home_runs",
@@ -55,8 +82,13 @@ _PROP_MARKETS: dict[str, list[str]] = {
         "pitcher_earned_runs",
         "pitcher_hits_allowed",
         "pitcher_walks",
+        # Alternate lines (multiple thresholds per player — prop equivalent of alt spreads)
+        "pitcher_strikeouts_alternate",
+        "batter_hits_alternate",
+        "batter_total_bases_alternate",
     ],
     "basketball_nba": [
+        # Standard lines
         "player_points",
         "player_rebounds",
         "player_assists",
@@ -64,13 +96,22 @@ _PROP_MARKETS: dict[str, list[str]] = {
         "player_blocks",
         "player_steals",
         "player_points_rebounds_assists",
+        # Alternate lines
+        "player_points_alternate",
+        "player_rebounds_alternate",
+        "player_assists_alternate",
     ],
     "icehockey_nhl": [
+        # Standard lines
         "player_points",
         "player_goals",
         "player_assists",
         "player_shots_on_goal",
         "player_saves",
+        # Alternate lines
+        "player_points_alternate",
+        "player_shots_on_goal_alternate",
+        "player_assists_alternate",
     ],
     "americanfootball_nfl": [
         "player_pass_tds",
@@ -79,6 +120,10 @@ _PROP_MARKETS: dict[str, list[str]] = {
         "player_receptions",
         "player_reception_yds",
         "player_anytime_td",
+        # Alternate lines
+        "player_pass_yds_alternate",
+        "player_rush_yds_alternate",
+        "player_reception_yds_alternate",
     ],
 }
 
@@ -128,17 +173,18 @@ _ANCHOR_EDGE: float = 2.0    # edge_pp >= this → ANCHOR
 _VALUE_EDGE:  float = 3.0    # edge_pp >= this → VALUE
 
 # ─── Credit budget constants ───────────────────────────────────────────────────
-MONTHLY_BUDGET       = 20_000   # Creator tier allocation
-OPERATIONAL_TARGET   = 7_000    # target spend for recurring fetches
-RESERVE_CREDITS      = 3_000    # reserved for CLV backfill + playoffs + manual
+MONTHLY_BUDGET       = 100_000  # Creator tier allocation (upgraded from 20k free tier)
 
-# Thresholds trigger progressively restrictive modes
+# Derived from MONTHLY_BUDGET — change the one constant, everything follows.
+OPERATIONAL_TARGET   = int(MONTHLY_BUDGET * 0.35)   # 35% — target spend for recurring fetches
+RESERVE_CREDITS      = int(MONTHLY_BUDGET * 0.15)   # 15% — reserved for CLV backfill + playoffs + manual
+SUSTAINABLE_DAILY    = OPERATIONAL_TARGET // 30      # daily pace to stay within operational target
+MAX_DAILY_WARN       = MONTHLY_BUDGET // 30          # daily pace that would exhaust full budget
+
+# Thresholds trigger progressively restrictive modes (absolute — not budget-derived)
 THRESHOLD_SKIP       = 1_500    # remaining < this → skip non-essential fetches
 THRESHOLD_EMERGENCY  = 200      # remaining < this → skip alt lines, use cached only
 THRESHOLD_SUSPENDED  = 100      # remaining < this → all fetches suspended
-
-SUSTAINABLE_DAILY    = 233      # operational_target / 30 days
-MAX_DAILY_WARN       = 333      # monthly_budget / 30; warn if exceeded
 
 # ─── DB helpers ───────────────────────────────────────────────────────────────
 
@@ -185,6 +231,7 @@ def _ensure_tables():
             sport_key      TEXT NOT NULL,
             event_id       TEXT NOT NULL,
             game_date      TEXT,
+            game_date_ct   TEXT,
             home_team      TEXT,
             away_team      TEXT,
             bookmaker      TEXT NOT NULL,
@@ -205,6 +252,7 @@ def _ensure_tables():
             sport_key      TEXT NOT NULL,
             event_id       TEXT NOT NULL,
             game_date      TEXT,
+            game_date_ct   TEXT,
             home_team      TEXT,
             away_team      TEXT,
             bookmaker      TEXT NOT NULL,
@@ -214,12 +262,80 @@ def _ensure_tables():
             over_under     TEXT,
             odds           REAL NOT NULL,
             is_main_market INTEGER DEFAULT 0,
-            UNIQUE(event_id, bookmaker, market_key, team, over_under, fetched_at)
+            UNIQUE(event_id, bookmaker, market_key, team, line, over_under, fetched_at)
         );
         CREATE INDEX IF NOT EXISTS idx_alt_lines_event
             ON alt_lines(event_id, fetched_at);
     """)
     conn.commit()
+    conn.close()
+
+    # Migrate: add game_date_ct column to pre-existing tables and backfill
+    _migrate_game_date_ct()
+
+
+def _migrate_game_date_ct():
+    """Add game_date_ct column to alt_lines and line_snapshots if missing,
+    then backfill from event commence_time via the fixtures table in bets.db."""
+    conn = _hist_conn()
+
+    for table in ("alt_lines", "line_snapshots"):
+        # 1. Add column if missing
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN game_date_ct TEXT")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+
+        # 2. Backfill NULL rows using event_id → fixtures.commence_time
+        nulls = conn.execute(
+            f"SELECT DISTINCT event_id FROM {table} "
+            f"WHERE game_date_ct IS NULL AND game_date IS NOT NULL"
+        ).fetchall()
+        if not nulls:
+            continue
+
+        # Look up commence_time for each event from bets.db fixtures
+        _main_db = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
+        _main_db = os.path.abspath(_main_db)
+        try:
+            main_conn = sqlite3.connect(_main_db, timeout=10)
+            main_conn.row_factory = sqlite3.Row
+        except Exception:
+            continue
+
+        event_ids = [r[0] for r in nulls]
+        # Build a mapping event_id → commence_time from fixtures
+        ct_map: dict[str, str | None] = {}
+        # Query in batches of 500
+        for i in range(0, len(event_ids), 500):
+            batch = event_ids[i:i+500]
+            placeholders = ",".join("?" * len(batch))
+            rows = main_conn.execute(
+                f"SELECT id, commence_time FROM fixtures WHERE id IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for r in rows:
+                ct_map[r["id"]] = _utc_to_ct_date(str(r["commence_time"])) if r["commence_time"] else None
+
+        main_conn.close()
+
+        # Also derive from game_date + event times already in the table
+        # For events not in fixtures, try parsing game_date from alt_lines itself
+        # (these are UTC dates, so we can't perfectly fix them, but most are 1-day-off at worst)
+        # We only update rows where we have a real CT date from fixtures
+        updated = 0
+        for eid, ct_date in ct_map.items():
+            if ct_date:
+                conn.execute(
+                    f"UPDATE {table} SET game_date_ct = ? WHERE event_id = ? AND game_date_ct IS NULL",
+                    (ct_date, eid),
+                )
+                updated += 1
+
+        conn.commit()
+        print(f"[CreatorTier] Backfilled game_date_ct on {table}: {updated}/{len(event_ids)} events")
+
     conn.close()
 
 
@@ -393,15 +509,17 @@ def _get_active_sports_today() -> list[str]:
     Falls back to an empty list on any error (caller will use full key list).
     """
     try:
+        from zoneinfo import ZoneInfo as _ZI_ct
+        _ct = _ZI_ct("America/Chicago")
         _main_db = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
         conn = sqlite3.connect(os.path.abspath(_main_db), timeout=10)
         conn.row_factory = sqlite3.Row
-        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        today_str = datetime.now(_ct).strftime("%Y-%m-%d")
         now_str   = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
         rows = conn.execute(
             """
             SELECT DISTINCT sport_key FROM fixtures
-            WHERE DATE(commence_time) = ?
+            WHERE game_date_ct = ?
               AND commence_time > ?
             """,
             (today_str, now_str),
@@ -497,10 +615,11 @@ def fetch_imminent_games_odds(
 
         for event in imminent:
             total_events += 1
-            event_id  = event.get("id", "")
-            game_date = (event.get("commence_time") or "")[:10]
-            home      = event.get("home_team", "")
-            away      = event.get("away_team", "")
+            event_id     = event.get("id", "")
+            game_date    = (event.get("commence_time") or "")[:10]
+            game_date_ct = _utc_to_ct_date(event.get("commence_time"))
+            home         = event.get("home_team", "")
+            away         = event.get("away_team", "")
 
             for bk in event.get("bookmakers", []):
                 bk_key = bk.get("key", "")
@@ -509,7 +628,7 @@ def fetch_imminent_games_odds(
                 for mkt in bk.get("markets", []):
                     for oc in mkt.get("outcomes", []):
                         rows_to_insert.append((
-                            captured_at, sk, event_id, game_date,
+                            captured_at, sk, event_id, game_date, game_date_ct,
                             home, away, bk_key, mkt.get("key", ""),
                             oc.get("name", ""),
                             oc.get("price"),
@@ -518,9 +637,9 @@ def fetch_imminent_games_odds(
 
         conn.executemany("""
             INSERT INTO line_snapshots
-              (captured_at, sport_key, event_id, game_date, home_team, away_team,
+              (captured_at, sport_key, event_id, game_date, game_date_ct, home_team, away_team,
                bookmaker, market_key, outcome_name, price, point)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, rows_to_insert)
         conn.commit()
         total_rows += len(rows_to_insert)
@@ -745,38 +864,49 @@ def fetch_player_props(sport_key: str, bookmakers: list[str] | None = None,
                 "props_upserted": 0, "skipped_batches": 0,
                 "note": f"No games starting within {hours_ahead}h"}
 
-    # Fetch props in batches of 4 markets, filtered to imminent event IDs
-    batch_size = 4
-    for i in range(0, len(markets), batch_size):
-        market_batch = ",".join(markets[i : i + batch_size])
+    # Rebuild imminent event metadata for insert (id → {game_date, home, away})
+    imminent_meta: dict[str, dict] = {}
+    for ev in (event_list_data or []):
+        if ev.get("id") in imminent_ids:
+            imminent_meta[ev["id"]] = {
+                "game_date": (ev.get("commence_time") or "")[:10],
+                "home_team": ev.get("home_team", ""),
+                "away_team": ev.get("away_team", ""),
+            }
 
-        data = _get(
-            f"/sports/{sport_key}/odds",
-            {
-                "regions":    "us",
-                "markets":    market_batch,
-                "oddsFormat": "decimal",
-                "dateFormat":  "iso",
-                "bookmakers": books,
-            },
-        )
-        time.sleep(0.3)
+    # Player props require the per-event endpoint:
+    #   /sports/{sport_key}/events/{event_id}/odds
+    # (The bulk /sports/{sport_key}/odds endpoint rejects prop market keys with 422.)
+    # Fetch all markets in one call per event (API supports comma-joined markets).
+    all_markets = ",".join(markets)
+    batch_size  = 4    # market batches per event to stay within URL length limits
 
-        if not data or not isinstance(data, list):
-            skipped += 1
-            continue
+    for event_id, meta in imminent_meta.items():
+        events_scoped += 1
+        game_date = meta["game_date"]
+        home      = meta["home_team"]
+        away      = meta["away_team"]
 
-        for event in data:
-            event_id = event.get("id", "")
-            if event_id not in imminent_ids:
-                continue   # only process imminent games
+        for i in range(0, len(markets), batch_size):
+            market_batch = ",".join(markets[i : i + batch_size])
 
-            events_scoped += 1
-            game_date = (event.get("commence_time") or "")[:10]
-            home      = event.get("home_team", "")
-            away      = event.get("away_team", "")
+            data = _get(
+                f"/sports/{sport_key}/events/{event_id}/odds",
+                {
+                    "regions":    "us",
+                    "markets":    market_batch,
+                    "oddsFormat": "decimal",
+                    "dateFormat": "iso",
+                    "bookmakers": books,
+                },
+            )
+            time.sleep(0.3)
 
-            for bk in event.get("bookmakers", []):
+            if not data or not isinstance(data, dict):
+                skipped += 1
+                continue
+
+            for bk in data.get("bookmakers", []):
                 bk_key = bk.get("key", "")
                 for mkt in bk.get("markets", []):
                     mkt_key = mkt.get("key", "")
@@ -949,10 +1079,11 @@ def capture_line_snapshot(sport_key: str | None = None,
         rows_to_insert: list[tuple] = []
         for event in events:
             total_events += 1
-            event_id  = event.get("id", "")
-            game_date = (event.get("commence_time") or "")[:10]
-            home      = event.get("home_team", "")
-            away      = event.get("away_team", "")
+            event_id     = event.get("id", "")
+            game_date    = (event.get("commence_time") or "")[:10]
+            game_date_ct = _utc_to_ct_date(event.get("commence_time"))
+            home         = event.get("home_team", "")
+            away         = event.get("away_team", "")
 
             for bk in event.get("bookmakers", []):
                 bk_key = bk.get("key", "")
@@ -962,7 +1093,7 @@ def capture_line_snapshot(sport_key: str | None = None,
                     mkt_key = mkt.get("key", "")
                     for oc in mkt.get("outcomes", []):
                         rows_to_insert.append((
-                            captured_at, sk, event_id, game_date,
+                            captured_at, sk, event_id, game_date, game_date_ct,
                             home, away, bk_key, mkt_key,
                             oc.get("name", ""),
                             oc.get("price"),
@@ -971,9 +1102,9 @@ def capture_line_snapshot(sport_key: str | None = None,
 
         conn.executemany("""
             INSERT INTO line_snapshots
-              (captured_at, sport_key, event_id, game_date, home_team, away_team,
+              (captured_at, sport_key, event_id, game_date, game_date_ct, home_team, away_team,
                bookmaker, market_key, outcome_name, price, point)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, rows_to_insert)
         conn.commit()
         total_rows += len(rows_to_insert)
@@ -1265,9 +1396,10 @@ def fetch_alt_lines(sport_key: str, event_id: str,
         return {"error": "No data returned", "event_id": event_id,
                 "sport_key": sport_key, "rows_inserted": 0}
 
-    home_team  = data.get("home_team", "")
-    away_team  = data.get("away_team", "")
-    game_date  = (data.get("commence_time") or "")[:10]
+    home_team     = data.get("home_team", "")
+    away_team     = data.get("away_team", "")
+    game_date     = (data.get("commence_time") or "")[:10]
+    game_date_ct  = _utc_to_ct_date(data.get("commence_time"))
     rows_inserted = 0
 
     conn = _hist_conn()
@@ -1291,12 +1423,12 @@ def fetch_alt_lines(sport_key: str, event_id: str,
                 try:
                     conn.execute("""
                         INSERT OR REPLACE INTO alt_lines
-                          (fetched_at, sport_key, event_id, game_date,
+                          (fetched_at, sport_key, event_id, game_date, game_date_ct,
                            home_team, away_team, bookmaker, market_key,
                            market_type,
                            team, line, over_under, odds, is_main_market)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0)
-                    """, (fetched_at, sport_key, event_id, game_date,
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+                    """, (fetched_at, sport_key, event_id, game_date, game_date_ct,
                           home_team, away_team, bk_key, mkt_key,
                           mkt_key,
                           team, line, over_under, odds))
@@ -1421,10 +1553,11 @@ def fetch_alt_lines_batch(
         sport_events = 0
 
         for ev in upcoming:
-            event_id  = ev.get("id", "")
-            game_date = (ev.get("commence_time") or "")[:10]
-            home      = ev.get("home_team", "")
-            away      = ev.get("away_team", "")
+            event_id     = ev.get("id", "")
+            game_date    = (ev.get("commence_time") or "")[:10]
+            game_date_ct = _utc_to_ct_date(ev.get("commence_time"))
+            home         = ev.get("home_team", "")
+            away         = ev.get("away_team", "")
 
             data = _get(
                 f"/sports/{sk}/events/{event_id}/odds",
@@ -1463,7 +1596,7 @@ def fetch_alt_lines_batch(
                         if not _is_valid_spread_line(line, sk, mkt_key):
                             continue
                         rows_to_insert.append((
-                            fetched_at, sk, event_id, game_date,
+                            fetched_at, sk, event_id, game_date, game_date_ct,
                             home, away, bk_key, mkt_key,
                             mkt_key,   # market_type = market_key
                             team, line, over_under, odds, 0,
@@ -1472,11 +1605,11 @@ def fetch_alt_lines_batch(
             try:
                 conn.executemany("""
                     INSERT OR REPLACE INTO alt_lines
-                      (fetched_at, sport_key, event_id, game_date,
+                      (fetched_at, sport_key, event_id, game_date, game_date_ct,
                        home_team, away_team, bookmaker, market_key,
                        market_type,
                        team, line, over_under, odds, is_main_market)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, rows_to_insert)
                 conn.commit()
                 sport_rows += len(rows_to_insert)

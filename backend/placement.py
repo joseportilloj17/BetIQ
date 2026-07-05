@@ -34,13 +34,117 @@ _KELLY_FRACTION = {
 # Minimum hit probability to recommend OVER (not UNDER/skip)
 _PLAY_THRESHOLD = 0.55
 
-# Grade → composite score multiplier (mirrors scout/base.py GRADE_MULTIPLIERS)
+# Fix A+B: market type normalization — leg market_type → scouted_props market_type
+_MARKET_NORM: dict[str, str] = {
+    "h2h":               "h2h",
+    "spreads":           "spread",
+    "alternate_spreads": "spread",
+    "totals":            "totals",
+    "alternate_totals":  "totals",
+}
+
+# Fix A: OddsAPI sport_key → scouted_props sport name
+_SPORT_NORM: dict[str, str] = {
+    "baseball_mlb":          "MLB",
+    "icehockey_nhl":         "NHL",
+    "basketball_nba":        "NBA",
+    "americanfootball_nfl":  "NFL",
+}
+
+# Grade → Kelly sizing multiplier (for placement recommendations only — not composite scoring)
 _GRADE_MULTIPLIERS = {
     "A": 1.5,
     "B": 1.2,
     "C": 1.0,
     "D": 0.5,
 }
+
+# ── Dynamic scout multipliers ──────────────────────────────────────────────────
+# Multipliers relative to Grade B (= 1.00).  Used in composite scoring via
+# recommender.py.  Updated from empirical validation data after each batch.
+#
+# First validation run — May 2026 (325 settled legs):
+#   Grade A: 73.2% WR, 0.198 Brier  (n=112) → strong signal, moderate boost
+#   Grade B: 60.0% WR, 0.240 Brier  (n=170) → baseline
+#   Grade C: 72.2% WR, 0.234 Brier  (n=36)  → uncertain, hold at baseline
+#   Grade D: 57.1% WR, 0.250 Brier  (n=7)   → directional only, conservative penalty
+#
+# Review thresholds:
+#   A → raise to 1.35–1.50 once n≥200 and WR stays ≥70%
+#   C → investigate and possibly increase if WR holds ≥68% at n≥80
+#   D → lower to 0.50–0.60 once n≥30 and WR confirms <55%
+_SCOUT_GRADE_MULTIPLIERS: dict[str, float] = {
+    "A": 1.25,
+    "B": 1.00,
+    "C": 1.00,
+    "D": 0.75,
+}
+_SCOUT_GRADE_MULT_MIN_N = 50   # minimum legs before a grade's dynamic multiplier is trusted
+
+# Cache for dynamic multipliers (refreshed after each settlement batch)
+_dynamic_scout_mult_cache: dict[str, float] = {}
+_dynamic_scout_mult_ts: float = 0.0
+_DYNAMIC_SCOUT_MULT_TTL = 600.0   # 10-minute TTL
+
+
+def get_dynamic_scout_multipliers(db: Session, min_n: int = _SCOUT_GRADE_MULT_MIN_N) -> dict[str, float]:
+    """
+    Compute scout grade multipliers from empirical leg-level WR in the past 30 days.
+    Grade B = 1.00 (baseline); other grades scaled relative to B.
+    Returns cached result within TTL; falls back to _SCOUT_GRADE_MULTIPLIERS
+    when Grade B has < min_n settled legs.
+
+    Multipliers are clamped to [0.50, 1.75] to prevent extreme outliers.
+    """
+    import time
+
+    global _dynamic_scout_mult_cache, _dynamic_scout_mult_ts
+    if _dynamic_scout_mult_cache and (time.time() - _dynamic_scout_mult_ts) < _DYNAMIC_SCOUT_MULT_TTL:
+        return _dynamic_scout_mult_cache
+
+    try:
+        rows = db.execute(text("""
+            SELECT
+                mbl.scout_grade,
+                COUNT(*)                                                                  AS n,
+                AVG(CASE WHEN mbl.leg_result = 'WIN' THEN 1.0 ELSE 0.0 END)             AS wr
+            FROM mock_bet_legs mbl
+            JOIN mock_bets mb ON mb.id = mbl.mock_bet_id
+            WHERE mbl.scout_grade IS NOT NULL
+              AND mbl.leg_result IN ('WIN', 'LOSS')
+              AND COALESCE(mbl.excluded_from_metrics, 0) = 0
+              AND mb.game_date >= date('now', '-30 days')
+            GROUP BY mbl.scout_grade
+        """)).fetchall()
+
+        b_wr = None
+        grade_data: dict[str, tuple[int, float]] = {}
+        for r in rows:
+            grade = (r[0] or "").upper()
+            n, wr = int(r[1] or 0), float(r[2] or 0)
+            grade_data[grade] = (n, wr)
+            if grade == "B" and n >= min_n:
+                b_wr = wr
+
+        if b_wr is None or b_wr == 0:
+            # Not enough Grade B data — use hardcoded fallback
+            return _SCOUT_GRADE_MULTIPLIERS
+
+        result: dict[str, float] = {}
+        for grade, targets in _SCOUT_GRADE_MULTIPLIERS.items():
+            if grade in grade_data and grade_data[grade][0] >= min_n:
+                raw = grade_data[grade][1] / b_wr
+                result[grade] = round(max(0.50, min(1.75, raw)), 3)
+            else:
+                # Insufficient data: use hardcoded value for this grade
+                result[grade] = _SCOUT_GRADE_MULTIPLIERS[grade]
+
+        _dynamic_scout_mult_cache = result
+        _dynamic_scout_mult_ts    = time.time()
+        return result
+
+    except Exception:
+        return _SCOUT_GRADE_MULTIPLIERS
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -240,96 +344,294 @@ def _extract_player_name(description: str) -> str:
     return cleaned.strip()
 
 
+def _extract_team_from_description(description: str) -> str:
+    """
+    Extract team name from a game-level leg description.
+      "Pittsburgh Pirates +1.5 (Spread)"   → "Pittsburgh Pirates"
+      "Athletics +1.5 (alternate_spreads)"  → "Athletics"
+      "Washington Nationals (h2h)"          → "Washington Nationals"
+      "Over +8.5 (totals)"                  → "" (no team — caller handles)
+    """
+    import re
+    # Strip everything from the first +/- followed by a digit
+    cleaned = re.split(r'\s+[+-]\d', description, maxsplit=1)[0]
+    # Strip trailing parenthetical market label e.g. " (h2h)"
+    cleaned = re.sub(r'\s*\([^)]*\)\s*$', '', cleaned).strip()
+    # Reject known non-team tokens
+    if cleaned.lower() in ("over", "under", "o", "u", ""):
+        return ""
+    return cleaned
+
+
+def _scout_lookup_raw(fixture_id: str, market_type: str, description: str,
+                      db_path: str) -> tuple:
+    """
+    Thread-safe scout lookup using a dedicated sqlite3 connection.
+    Returns (quality_grade, hit_probability, id) or None.
+    Avoids SQLAlchemy session contention in background threads.
+    """
+    import sqlite3 as _sql3
+    scout_market = _MARKET_NORM.get(market_type)
+    if not fixture_id or not scout_market:
+        return None
+    scout_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    from datetime import timedelta
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    conn = _sql3.connect(db_path, timeout=10)
+    try:
+        fix_row = conn.execute(
+            "SELECT home_team, away_team, COALESCE(game_date_ct, date(commence_time)) AS game_date, sport_key "
+            "FROM fixtures WHERE id = ?", [fixture_id]).fetchone()
+        if not fix_row:
+            return None
+        home_team, away_team, game_date, sport_key = fix_row
+        sport = _SPORT_NORM.get(sport_key, sport_key)
+        # Scout may have been run yesterday for today's game — check all candidate dates
+        _dates = list(dict.fromkeys([game_date, scout_date, yesterday]))
+        # Try both home/away orderings — scouted_props may store
+        # the teams in a different order than the fixture.
+        _team_pairs = [
+            (home_team, away_team),
+            (away_team, home_team),
+        ]
+        row = None
+        if scout_market == "totals":
+            for d in _dates:
+                for _ht, _at in _team_pairs:
+                    row = conn.execute(
+                        "SELECT quality_grade, hit_probability, id FROM scouted_props "
+                        "WHERE scout_date=? AND home_team=? AND away_team=? "
+                        "AND sport=? AND market_type=? ORDER BY hit_probability DESC LIMIT 1",
+                        [d, _ht, _at, sport, scout_market]).fetchone()
+                    if row:
+                        break
+                if row:
+                    break
+        else:
+            bet_team = _extract_team_from_description(description)
+            for d in _dates:
+                for _ht, _at in _team_pairs:
+                    if bet_team:
+                        row = conn.execute(
+                            "SELECT quality_grade, hit_probability, id FROM scouted_props "
+                            "WHERE scout_date=? AND home_team=? AND away_team=? "
+                            "AND sport=? AND market_type=? AND team=? "
+                            "ORDER BY hit_probability DESC LIMIT 1",
+                            [d, _ht, _at, sport, scout_market, bet_team]).fetchone()
+                        if not row:
+                            last_word = bet_team.split()[-1]
+                            if len(last_word) >= 4:
+                                row = conn.execute(
+                                    "SELECT quality_grade, hit_probability, id FROM scouted_props "
+                                    "WHERE scout_date=? AND home_team=? AND away_team=? "
+                                    "AND sport=? AND market_type=? AND team LIKE ? "
+                                    "ORDER BY hit_probability DESC LIMIT 1",
+                                    [d, _ht, _at, sport, scout_market,
+                                     f"%{last_word}%"]).fetchone()
+                    if not row:
+                        row = conn.execute(
+                            "SELECT quality_grade, hit_probability, id FROM scouted_props "
+                            "WHERE scout_date=? AND home_team=? AND away_team=? "
+                            "AND sport=? AND market_type=? "
+                            "ORDER BY hit_probability DESC LIMIT 1",
+                            [d, _ht, _at, sport, scout_market]).fetchone()
+                    if row:
+                        break
+                if row:
+                    break
+        if not row:
+            player_name = _extract_player_name(description)
+            if player_name and len(player_name) >= 4:
+                row = conn.execute(
+                    "SELECT quality_grade, hit_probability, id FROM scouted_props "
+                    "WHERE scout_date=? AND player_name=? "
+                    "ORDER BY hit_probability DESC LIMIT 1",
+                    [scout_date, player_name]).fetchone()
+                if not row:
+                    last = player_name.split()[-1]
+                    if len(last) >= 4:
+                        row = conn.execute(
+                            "SELECT quality_grade, hit_probability, id FROM scouted_props "
+                            "WHERE scout_date=? AND player_name LIKE ? "
+                            "ORDER BY hit_probability DESC LIMIT 1",
+                            [scout_date, f"%{last}%"]).fetchone()
+        return row
+    finally:
+        conn.close()
+
+
 def attach_scout_grade_to_leg(leg: dict, db: Session) -> dict:
     """
     Look up scouted_props for today matching this leg's description/fixture,
     and attach scout_grade + scout_hit_prob to the leg dict.
     Called by recommender when building parlay candidates.
 
-    Matching strategy:
-      1. game_id + market_type match (exact)
-      2. Explicit player_name field + market_type
-      3. Extracted player name from description + market_type (last-name partial match)
-    If no match found, scout_grade=None.
+    Uses a dedicated sqlite3 connection (_scout_lookup_raw) for thread safety
+    in background generation threads, with ORM session as fallback.
+
+    Matching strategy (Fix A + B + C):
+      Primary — bridge via Fixtures table:
+        1. fixture_id  → fixtures.id  → home_team, away_team, game_date, sport_key
+        2. Normalize market_type  (alternate_spreads → spread, spreads → spread, etc.)
+        3. Normalize sport_key    (baseball_mlb → MLB, icehockey_nhl → NHL, …)
+        4. For spread/h2h: extract bet team from description, match scouted_props.team
+           Fallback to best grade for the game if team match fails.
+        5. For totals: just fetch best grade for the game.
+      Secondary — player-name match (for future player props):
+        6. player_name field or extracted from description
     """
-    scout_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    fixture_id   = leg.get("fixture_id", "") or leg.get("game_id", "")
-    market_type  = leg.get("market_type", "")
-    player_name  = leg.get("player_name", "") or ""
-    description  = leg.get("description", "") or ""
-    sport        = leg.get("sport", "")
-
-    # If player_name field is empty, try to extract from description
-    if not player_name and description:
-        player_name = _extract_player_name(description)
+    import os
+    fixture_id  = leg.get("fixture_id", "") or leg.get("game_id", "")
+    market_type = leg.get("market_type", "")
+    description = leg.get("description", "") or ""
 
     try:
-        # Try exact game_id + market_type match first
-        row = None
-        if fixture_id:
-            row = db.execute(text("""
-                SELECT quality_grade, hit_probability, id
-                FROM   scouted_props
-                WHERE  scout_date = :d AND game_id = :gid AND market_type = :mt
-                ORDER  BY hit_probability DESC
-                LIMIT  1
-            """), {"d": scout_date, "gid": fixture_id, "mt": market_type}).fetchone()
-
-        # Try player name exact match + market_type
-        if not row and player_name:
-            row = db.execute(text("""
-                SELECT quality_grade, hit_probability, id
-                FROM   scouted_props
-                WHERE  scout_date = :d AND player_name = :pn AND market_type = :mt
-                ORDER  BY hit_probability DESC
-                LIMIT  1
-            """), {"d": scout_date, "pn": player_name, "mt": market_type}).fetchone()
-
-        # Try partial match on extracted player name (last name fallback)
-        if not row and player_name and len(player_name) >= 4:
-            # Use last word as last name if multi-word name
-            words = player_name.split()
-            name_fragment = words[-1] if len(words) > 1 else player_name
-            row = db.execute(text("""
-                SELECT quality_grade, hit_probability, id
-                FROM   scouted_props
-                WHERE  scout_date = :d AND player_name LIKE :pn AND market_type = :mt
-                ORDER  BY hit_probability DESC
-                LIMIT  1
-            """), {"d": scout_date, "pn": f"%{name_fragment}%", "mt": market_type}).fetchone()
-
-        # Final fallback: match just on description fragment (any market)
-        if not row and description and len(description) >= 5:
-            frag = _extract_player_name(description)
-            if frag and len(frag) >= 4:
-                row = db.execute(text("""
-                    SELECT quality_grade, hit_probability, id
-                    FROM   scouted_props
-                    WHERE  scout_date = :d AND player_name LIKE :pn
-                    ORDER  BY hit_probability DESC
-                    LIMIT  1
-                """), {"d": scout_date, "pn": f"%{frag.split()[-1]}%"}).fetchone()
+        db_path = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
+        row = _scout_lookup_raw(fixture_id, market_type, description, db_path)
 
         if row:
-            leg["scout_grade"]    = row[0]
-            leg["scout_hit_prob"] = round(float(row[1]), 4)
+            leg["scout_grade"]     = row[0]
+            leg["scout_hit_prob"]  = round(float(row[1]), 4)
             leg["scouted_prop_id"] = row[2]
             leg["scout_multiplier"] = _grade_multiplier(row[0])
         else:
-            leg["scout_grade"]    = None
-            leg["scout_hit_prob"] = None
+            leg["scout_grade"]     = None
+            leg["scout_hit_prob"]  = None
             leg["scouted_prop_id"] = None
             leg["scout_multiplier"] = 1.0
 
     except Exception as exc:
         print(f"[placement] attach_scout_grade error: {exc}")
-        leg["scout_grade"]    = None
-        leg["scout_hit_prob"] = None
+        leg["scout_grade"]     = None
+        leg["scout_hit_prob"]  = None
         leg["scouted_prop_id"] = None
         leg["scout_multiplier"] = 1.0
 
     return leg
+
+
+def backfill_scout_grades_for_today() -> int:
+    """
+    Re-enrich mock_bet_legs that have NULL scout_grade for today's game_date.
+    Called after the scout cron completes to patch legs that were generated
+    before scout data was available.
+
+    Returns the number of legs updated.
+    """
+    import os
+    import sqlite3 as _sql3
+    db_path = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
+    conn = _sql3.connect(db_path, timeout=10)
+    updated = 0
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        from datetime import timedelta
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        # Find legs with NULL scout_grade for today's or yesterday's games
+        rows = conn.execute(
+            "SELECT mbl.id, mbl.fixture_id, mbl.market_type, mbl.description "
+            "FROM mock_bet_legs mbl "
+            "JOIN mock_bets mb ON mb.id = mbl.mock_bet_id "
+            "WHERE mb.game_date IN (?, ?) "
+            "AND mbl.scout_grade IS NULL "
+            "AND mbl.fixture_id IS NOT NULL",
+            [today, yesterday],
+        ).fetchall()
+
+        for leg_id, fixture_id, market_type, description in rows:
+            row = _scout_lookup_raw(fixture_id, market_type, description or "", db_path)
+            if row:
+                conn.execute(
+                    "UPDATE mock_bet_legs SET scout_grade=?, scout_hit_prob=?, "
+                    "scouted_prop_id=? WHERE id=?",
+                    [row[0], round(float(row[1]), 4), row[2], leg_id],
+                )
+                updated += 1
+
+        if updated:
+            conn.commit()
+            print(f"[placement] backfill_scout_grades: updated {updated}/{len(rows)} legs")
+    except Exception as exc:
+        print(f"[placement] backfill_scout_grades error: {exc}")
+    finally:
+        conn.close()
+    return updated
+
+
+def rescore_composites_for_today() -> dict:
+    """
+    Recalculate composite_score on today's PENDING mock bets to reflect
+    actual scout grades.  During generation, legs scored with NULL scout
+    get _DEFAULT_SCOUT_NORM=0.50 in the scout component (weight 0.20).
+    After backfill, the actual grade may be A(1.25), B(1.00), etc.
+
+    Instead of recomputing the full formula (which includes directional,
+    pattern, and projection adjustments already baked in), we add the
+    scout delta:  Δ = (avg_actual_scout_norm − 0.50) × 0.20
+
+    Returns {"updated": int, "details": [...]}.
+    """
+    import os
+    import sqlite3 as _sql3
+    _GRADE_NORM = {"A": 1.25, "B": 1.00, "C": 1.00, "D": 0.75}
+    _DEFAULT = 0.50
+
+    db_path = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
+    conn = _sql3.connect(db_path, timeout=10)
+    updated = 0
+    details = []
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Get PENDING bets with composite_score for today
+        bets = conn.execute(
+            "SELECT id, composite_score, bet_info "
+            "FROM mock_bets "
+            "WHERE game_date = ? AND status = 'PENDING' AND composite_score IS NOT NULL",
+            [today],
+        ).fetchall()
+
+        for bet_id, old_composite, bet_info in bets:
+            # Get scout grades for this bet's legs
+            legs = conn.execute(
+                "SELECT scout_grade FROM mock_bet_legs WHERE mock_bet_id = ?",
+                [bet_id],
+            ).fetchall()
+            if not legs:
+                continue
+
+            scout_norms = []
+            for (grade,) in legs:
+                scout_norms.append(_GRADE_NORM.get(grade, _DEFAULT) if grade else _DEFAULT)
+
+            avg_actual = sum(scout_norms) / len(scout_norms)
+            delta = (avg_actual - _DEFAULT) * 0.20
+
+            if abs(delta) < 0.0001:
+                continue  # no change
+
+            new_composite = round(old_composite + delta, 6)
+            conn.execute(
+                "UPDATE mock_bets SET composite_score = ? WHERE id = ?",
+                [new_composite, bet_id],
+            )
+            updated += 1
+            details.append({
+                "bet_id": bet_id,
+                "old": round(old_composite, 6),
+                "new": new_composite,
+                "delta": round(delta, 6),
+                "avg_scout_norm": round(avg_actual, 3),
+                "info": (bet_info or "")[:60],
+            })
+
+        if updated:
+            conn.commit()
+            print(f"[placement] rescore_composites: updated {updated}/{len(bets)} bets")
+    except Exception as exc:
+        print(f"[placement] rescore_composites error: {exc}")
+    finally:
+        conn.close()
+    return {"updated": updated, "details": details}
 
 
 def get_parlay_suggestions(db: Session, max_legs: int = 3) -> dict:

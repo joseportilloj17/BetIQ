@@ -41,6 +41,7 @@ from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Float, Text, DateTime,
     create_engine, text,
+    or_ as db_or, and_ as db_and,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -194,6 +195,8 @@ class PitcherStats(Base):
     fip          = Column(Float, nullable=True)    # fielding-independent pitching
     gs           = Column(Integer, nullable=True)  # games started
     ip           = Column(Float, nullable=True)    # innings pitched
+    hr9          = Column(Float, nullable=True)    # home runs per 9 innings
+    home_runs_allowed = Column(Integer, nullable=True)  # total HR allowed in season
 
 
 class PitcherGameLog(Base):
@@ -215,6 +218,43 @@ class PitcherGameLog(Base):
     hits         = Column(Integer, nullable=True)
     walks        = Column(Integer, nullable=True)
     strikeouts   = Column(Integer, nullable=True)
+    home_runs    = Column(Integer, nullable=True)   # HR allowed in this start
+
+
+class TeamGameBatting(Base):
+    """
+    Per-game team batting box-score stats for MLB teams.
+    One row per (team_name, game_date, game_pk).
+    Raw counting stats used to compute rolling OBP/SLG/ISO features.
+    """
+    __tablename__ = "team_game_batting"
+
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    team_name         = Column(String, nullable=False)
+    season            = Column(String, nullable=False)
+    game_date         = Column(String, nullable=True)     # ISO YYYY-MM-DD
+    game_pk           = Column(Integer, nullable=True)     # MLB gamePk
+    is_home           = Column(Integer, nullable=True)     # 1=home, 0=away
+    opponent          = Column(String, nullable=True)
+    plate_appearances = Column(Integer, nullable=True)
+    at_bats           = Column(Integer, nullable=True)
+    hits              = Column(Integer, nullable=True)
+    doubles           = Column(Integer, nullable=True)
+    triples           = Column(Integer, nullable=True)
+    home_runs         = Column(Integer, nullable=True)
+    runs              = Column(Integer, nullable=True)
+    rbi               = Column(Integer, nullable=True)
+    walks             = Column(Integer, nullable=True)
+    hit_by_pitch      = Column(Integer, nullable=True)
+    strikeouts        = Column(Integer, nullable=True)
+    sac_flies         = Column(Integer, nullable=True)
+    total_bases       = Column(Integer, nullable=True)
+    stolen_bases      = Column(Integer, nullable=True)
+    left_on_base      = Column(Integer, nullable=True)
+    obp               = Column(Float, nullable=True)      # pre-computed from API
+    slg               = Column(Float, nullable=True)
+    ops               = Column(Float, nullable=True)
+    babip             = Column(Float, nullable=True)
 
 
 class TeamBattingStats(Base):
@@ -236,6 +276,25 @@ class TeamBattingStats(Base):
     k_pct     = Column(Float, nullable=True)
     bb_pct    = Column(Float, nullable=True)
     babip     = Column(Float, nullable=True)
+
+
+class GameWeather(Base):
+    """
+    Per-game weather data for outdoor MLB stadiums.
+    One row per (home_team, game_date).  Dome stadiums get
+    temperature_f=72, wind_speed_mph=0, is_dome=1.
+    Used for totals features (wind/temp affect run scoring).
+    """
+    __tablename__ = "game_weather"
+
+    id                = Column(Integer, primary_key=True, autoincrement=True)
+    home_team         = Column(String, nullable=False)
+    game_date         = Column(String, nullable=False)   # ISO YYYY-MM-DD
+    temperature_f     = Column(Float, nullable=True)
+    wind_speed_mph    = Column(Float, nullable=True)
+    wind_direction_deg = Column(Float, nullable=True)
+    is_dome           = Column(Integer, nullable=True)   # 1=dome, 0=outdoor
+    stadium           = Column(String, nullable=True)
 
 
 def backfill_nba_injuries(seasons: list[str] | None = None) -> dict:
@@ -500,16 +559,24 @@ def update_mlb_scores_for_date(date_str: str) -> dict:
     db = SessionLocal()
     updated = 0
     try:
+        # Update games with NULL scores OR 0-0 placeholder scores.
+        # MLB games never end 0-0, so 0-0 = pre-loaded schedule placeholder.
         null_games = (
             db.query(Game)
-            .filter(Game.sport == "MLB", Game.game_date == date_str,
-                    Game.home_score.is_(None))
+            .filter(Game.sport == "MLB", Game.game_date == date_str)
+            .filter(
+                db_or(
+                    Game.home_score.is_(None),
+                    db_and(Game.home_score == 0, Game.away_score == 0),
+                )
+            )
             .all()
         )
         for g in null_games:
             key = (date_str, g.home_team or "", g.away_team or "")
             if key in lookup:
                 g.home_score, g.away_score = lookup[key]
+                g.status = "Final"
                 updated += 1
         if updated:
             db.commit()
@@ -911,10 +978,27 @@ def _migrate_puck_line_columns() -> None:
                 pass  # column already exists
 
 
+def _migrate_hr9_columns() -> None:
+    """Add HR/9 columns to pitcher tables if they don't exist yet."""
+    migrations = [
+        "ALTER TABLE pitcher_game_logs ADD COLUMN home_runs INTEGER DEFAULT NULL",
+        "ALTER TABLE pitcher_stats ADD COLUMN hr9 REAL DEFAULT NULL",
+        "ALTER TABLE pitcher_stats ADD COLUMN home_runs_allowed INTEGER DEFAULT NULL",
+    ]
+    with engine.connect() as conn:
+        for sql in migrations:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception:
+                pass  # column already exists
+
+
 def init_db() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
     Base.metadata.create_all(bind=engine)
     _migrate_puck_line_columns()
+    _migrate_hr9_columns()
     log.info("historical.db initialised at %s", os.path.abspath(DB_PATH))
 
 
@@ -944,7 +1028,14 @@ def _upsert_games(session, rows: list[dict]) -> int:
             continue
         existing = session.get(Game, gid)
         if existing:
-            continue   # skip duplicates; use --reset to re-ingest
+            # Update status + scores for games that have concluded
+            new_status = r.get("status")
+            if new_status == "Final" and existing.status != "Final":
+                existing.status     = new_status
+                existing.home_score = r.get("home_score", existing.home_score)
+                existing.away_score = r.get("away_score", existing.away_score)
+                written += 1
+            continue
         g = Game(
             game_id    = gid,
             sport      = r.get("sport"),
@@ -1142,6 +1233,7 @@ def _upsert_pitcher_game_logs(session, rows: list[dict]) -> int:
             existing.hits       = r.get("hits")
             existing.walks      = r.get("walks")
             existing.strikeouts = r.get("strikeouts")
+            existing.home_runs  = r.get("home_runs")
         else:
             session.add(PitcherGameLog(
                 pitcher_name = r.get("pitcher_name", ""),
@@ -1154,6 +1246,7 @@ def _upsert_pitcher_game_logs(session, rows: list[dict]) -> int:
                 hits         = r.get("hits"),
                 walks        = r.get("walks"),
                 strikeouts   = r.get("strikeouts"),
+                home_runs    = r.get("home_runs"),
             ))
         written += 1
     return written
@@ -1184,6 +1277,8 @@ def _upsert_pitcher_stats(session, rows: list[dict]) -> int:
             existing.fip  = r.get("fip")
             existing.gs   = r.get("gs")
             existing.ip   = r.get("ip")
+            existing.hr9  = r.get("hr9")
+            existing.home_runs_allowed = r.get("home_runs_allowed")
         else:
             session.add(PitcherStats(
                 pitcher_name = name,
@@ -1196,6 +1291,8 @@ def _upsert_pitcher_stats(session, rows: list[dict]) -> int:
                 fip          = r.get("fip"),
                 gs           = r.get("gs"),
                 ip           = r.get("ip"),
+                hr9          = r.get("hr9"),
+                home_runs_allowed = r.get("home_runs_allowed"),
             ))
         written += 1
     return written
@@ -1238,6 +1335,65 @@ def _upsert_team_batting_stats(session, rows: list[dict]) -> int:
                 k_pct     = r.get("k_pct"),
                 bb_pct    = r.get("bb_pct"),
                 babip     = r.get("babip"),
+            ))
+        written += 1
+    return written
+
+
+def _upsert_team_game_batting(session, rows: list[dict]) -> int:
+    """
+    INSERT OR IGNORE team_game_batting rows keyed on (team_name, game_date, game_pk).
+    Returns count of rows written.
+    """
+    written = 0
+    for r in rows:
+        name      = r.get("team_name", "")
+        season    = r.get("season", "")
+        game_date = r.get("game_date")
+        game_pk   = r.get("game_pk")
+        if not name or not game_date:
+            continue
+        if hasattr(game_date, "isoformat"):
+            game_date = game_date.strftime("%Y-%m-%d")
+        existing = (
+            session.query(TeamGameBatting)
+            .filter_by(team_name=name, game_date=game_date, game_pk=game_pk)
+            .first()
+        )
+        if existing:
+            for col in ("plate_appearances", "at_bats", "hits", "doubles",
+                        "triples", "home_runs", "runs", "rbi", "walks",
+                        "hit_by_pitch", "strikeouts", "sac_flies",
+                        "total_bases", "stolen_bases", "left_on_base",
+                        "obp", "slg", "ops", "babip"):
+                setattr(existing, col, r.get(col))
+        else:
+            session.add(TeamGameBatting(
+                team_name         = name,
+                season            = season,
+                game_date         = game_date,
+                game_pk           = game_pk,
+                is_home           = r.get("is_home"),
+                opponent          = r.get("opponent"),
+                plate_appearances = r.get("plate_appearances"),
+                at_bats           = r.get("at_bats"),
+                hits              = r.get("hits"),
+                doubles           = r.get("doubles"),
+                triples           = r.get("triples"),
+                home_runs         = r.get("home_runs"),
+                runs              = r.get("runs"),
+                rbi               = r.get("rbi"),
+                walks             = r.get("walks"),
+                hit_by_pitch      = r.get("hit_by_pitch"),
+                strikeouts        = r.get("strikeouts"),
+                sac_flies         = r.get("sac_flies"),
+                total_bases       = r.get("total_bases"),
+                stolen_bases      = r.get("stolen_bases"),
+                left_on_base      = r.get("left_on_base"),
+                obp               = r.get("obp"),
+                slg               = r.get("slg"),
+                ops               = r.get("ops"),
+                babip             = r.get("babip"),
             ))
         written += 1
     return written

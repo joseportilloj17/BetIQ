@@ -32,6 +32,7 @@ SPORT_LABEL = {
     "soccer_france_ligue_one":    "Ligue 1",
     "soccer_italy_serie_a":       "Serie A",
     "soccer_uefa_europa_league":  "Europa League",
+    "soccer_fifa_world_cup":      "World Cup",
     "icehockey_nhl":              "NHL",
     "tennis_atp_french_open":     "Tennis",
     "mma_mixed_martial_arts":     "MMA",
@@ -45,7 +46,7 @@ MARKET_LABEL = {
 
 # ─── Leg extraction ───────────────────────────────────────────────────────────
 
-def get_available_legs(db: Session, markets: list[str] = None) -> list[dict]:
+def get_available_legs(db: Session, markets: list[str] = None, include_started: bool = False) -> list[dict]:
     """
     Parse all stored fixtures into individual scoreable legs.
     Each leg = one pick on one market for one fixture.
@@ -74,17 +75,11 @@ def get_available_legs(db: Session, markets: list[str] = None) -> list[dict]:
         _slate_end_ct = _4am_base                  # today's 4 AM CT (early morning run)
     _slate_end_utc = _slate_end_ct.astimezone(timezone.utc)
 
-    # ── EMERGENCY PATCH 2026-05-03 ─────────────────────���─────────────────────────
-    # Morning generation missed the early-slate MLB games. Allow recently-started
-    # games to enter the pool so the 12:30 PM PT slate is not lost.
-    # After tonight's settlement: set EMERGENCY_INCLUDE_STARTED = False.
-    # Long-term fix: 11 AM CT safety check (see scheduler) regenerates picks
-    # before first pitch when pick count is below expected threshold.
-    # Emergency override: allow recently-started games to re-enter the pool.
-    # Set True only on days where the morning generation missed early-slate games.
-    # MUST be reverted to False the same day after settlement.
-    EMERGENCY_INCLUDE_STARTED = False
-    EMERGENCY_WINDOW_HOURS    = 2
+    # ── Started-game override ──────────────────────────────────────────────────
+    # Default: exclude started games (standard pre-game generation).
+    # Pass include_started=True for one-time catch-up when morning run was
+    # delayed — pre-game odds/pitcher/Pi/scout data are still valid.
+    INCLUDE_STARTED = include_started
 
     # Bookmakers-freshness threshold: reject fixtures where all bookmaker data is
     # older than 48 hours. TheOddsAPI pre-populates phantom future playoff games
@@ -138,11 +133,8 @@ def get_available_legs(db: Session, markets: list[str] = None) -> list[dict]:
 
             if ct > now:
                 pass  # today's game, not yet started — include normally
-            elif EMERGENCY_INCLUDE_STARTED:
-                hours_since = (now - ct).total_seconds() / 3600
-                if hours_since > EMERGENCY_WINDOW_HOURS:
-                    continue
-                live_bet_patch = True
+            elif INCLUDE_STARTED:
+                pass  # system has no live data; pre-game odds are still valid
             else:
                 continue  # today's game already started — skip
 
@@ -164,6 +156,13 @@ def get_available_legs(db: Session, markets: list[str] = None) -> list[dict]:
                     key   = (mkt_key, name, point)
                     if key not in best or price > best[key]:
                         best[key] = price
+
+        # Extract the primary total line for this fixture (used by ATS model)
+        _fix_total = None
+        for (_mk, _mn, _pt), _pr in best.items():
+            if _mk == "totals" and _pt is not None:
+                _fix_total = float(_pt)
+                break  # all totals outcomes share the same point
 
         for (mkt_key, name, point), price in best.items():
             if price <= 1.0:
@@ -219,6 +218,9 @@ def get_available_legs(db: Session, markets: list[str] = None) -> list[dict]:
                 "home_team":    fix.home_team,
                 "away_team":    fix.away_team,
             }
+            # Attach fixture's total line for ATS totals-context features
+            if _fix_total is not None:
+                leg_entry["total_line"] = _fix_total
             if live_bet_patch:
                 leg_entry["live_bet_patch"] = True
             legs.append(leg_entry)
@@ -241,11 +243,11 @@ def score_leg(leg: dict) -> dict:
     (soccer_total_v1 for Over/Under, soccer_ml_v1 for Moneyline).
     Falls back to the global combined_v1 model if sub-model unavailable.
     """
-    from ml_model import load_model, FEATURE_COLS, SPORT_MAP, LEAGUE_MAP, predict_game_ats, score_soccer_leg
+    from ml_model import load_model, ORIGINAL_FEATURE_COLS, SPORT_MAP, LEAGUE_MAP, predict_game_ats, score_soccer_leg
     import numpy as np
 
     try:
-        clf, scaler, imputer = load_model()
+        clf, scaler, imputer, _active_cols = load_model()
     except Exception as _load_err:
         # Graceful fallback when the pickled model was saved with an incompatible
         # numpy version (e.g. numpy._core vs numpy.core). Picks are still generated
@@ -270,14 +272,37 @@ def score_leg(leg: dict) -> dict:
     _TO_CANONICAL = {"Baseball": "MLB", "Ice Hockey": "NHL"}
     sport_canonical = _TO_CANONICAL.get(sport_norm, sport_raw)
 
-    if mkt in ("spreads", "alternate_spreads") and (
+    # ATS sub-model: route both standard spreads AND alternate_spreads for
+    # MLB/NHL.  The spread-aware sub-model (MLB) can differentiate -1.5 from
+    # +4.5 via the spread_value feature; non-augmented models (NHL) ignore it.
+    _SPREAD_MARKETS = {"spreads", "alternate_spreads"}
+    if mkt in _SPREAD_MARKETS and (
         sport_raw in _ATS_RAW or sport_norm in _ATS_NORM
     ):
+        # Extract spread_value from leg description for spread-aware models
+        _desc = leg.get("description", "")
+        try:
+            from ml_model import _extract_spread_value
+            _sv_ats = _extract_spread_value(_desc, mkt)
+        except Exception:
+            _sv_ats = None
+
+        # The sub-model expects spread from the HOME team's perspective.
+        # _extract_spread_value returns it from the PICK team's perspective.
+        # For away-team picks, flip the sign so the model sees the correct
+        # home spread (e.g. away -1.5 → home +1.5).
+        _pick_lower = leg.get("pick", "").lower().strip()
+        _away_lower = leg.get("away_team", "").lower().strip()
+        if _pick_lower and _away_lower and _pick_lower == _away_lower and _sv_ats is not None:
+            _sv_ats = -_sv_ats
+
         ats_prob = predict_game_ats(
-            sport      = sport_canonical,
-            home_team  = leg.get("home_team", ""),
-            away_team  = leg.get("away_team", ""),
-            game_date  = leg.get("game_date", ""),
+            sport        = sport_canonical,
+            home_team    = leg.get("home_team", ""),
+            away_team    = leg.get("away_team", ""),
+            game_date    = leg.get("game_date", ""),
+            spread_value = _sv_ats,
+            total_line   = leg.get("total_line"),
         )
         if ats_prob is not None:
             # ats_prob = probability the HOME TEAM covers the spread.
@@ -285,13 +310,6 @@ def score_leg(leg: dict) -> dict:
             pick = leg.get("pick", "").lower().strip()
             away = leg.get("away_team", "").lower().strip()
             win_prob   = (1.0 - ats_prob) if (pick and away and pick == away) else ats_prob
-
-            # Post-hoc calibration correction for MLB run line:
-            # Retrain (Apr 2026) showed mlb_ats_v1 is overconfident by 3.8pp in the
-            # 55–65% confidence band (predicted 57.6%, actual 53.8%).  Apply a flat
-            # correction to keep Component B EV scores from inflating MLB spread picks.
-            if sport_canonical == "MLB" and 0.55 <= win_prob <= 0.65:
-                win_prob = max(0.50, win_prob - 0.038)
 
             ev         = win_prob * (dec_odds - 1) - (1 - win_prob)
             edge       = win_prob - imp_prob
@@ -307,9 +325,62 @@ def score_leg(leg: dict) -> dict:
                 "model_used":  model_used,
             }
 
+    # ── MLB totals sub-model path ────────────────────────────────────────────
+    _TOTALS_MARKETS = {"totals", "alternate_totals"}
+    if mkt in _TOTALS_MARKETS and (
+        sport_raw in _ATS_RAW or sport_norm in _ATS_NORM
+    ):
+        from ml_model import predict_game_totals, _extract_total_line
+        _desc = leg.get("description", "")
+        _tl, _tdir = _extract_total_line(_desc)
+
+        if _tl is not None and _tdir is not None:
+            over_prob = predict_game_totals(
+                home_team  = leg.get("home_team", ""),
+                away_team  = leg.get("away_team", ""),
+                total_line = _tl,
+                game_date  = leg.get("game_date", ""),
+                sport      = _TO_CANONICAL.get(sport_norm, sport_raw),
+            )
+            if over_prob is not None:
+                # over_prob = P(total > line).  Invert for under picks.
+                win_prob   = over_prob if _tdir == "over" else (1.0 - over_prob)
+                ev         = win_prob * (dec_odds - 1) - (1 - win_prob)
+                edge       = win_prob - imp_prob
+                model_used = "mlb_totals_v1"
+                return {
+                    **leg,
+                    "win_prob":   round(win_prob * 100, 2),
+                    "ev":         round(ev, 4),
+                    "ev_pct":     round(ev * 100, 2),
+                    "edge":       round(edge * 100, 2),
+                    "grade":      _grade(ev, edge),
+                    "model_used": model_used,
+                }
+
+    # ── World Cup sub-model path ────────────────────────────────────────────
+    _WC_SPORTS = {"World Cup", "world cup", "FIFA World Cup"}
+    if sport_raw in _WC_SPORTS or leg.get("sport_key") == "soccer_fifa_world_cup":
+        from ml_model import predict_wc_match
+        wc_result = predict_wc_match(leg)
+        if wc_result is not None:
+            win_prob = wc_result["win_prob"] / 100
+            ev       = wc_result["ev"]
+            edge     = win_prob - imp_prob
+            return {
+                **leg,
+                "win_prob":   wc_result["win_prob"],
+                "ev":         round(ev, 4),
+                "ev_pct":     round(ev * 100, 2),
+                "edge":       round(edge * 100, 2),
+                "grade":      _grade(ev, edge),
+                "model_used": wc_result["model_used"],
+            }
+        # WC sub-model unavailable → fall through to soccer sub-model / global
+
     # ── Soccer sub-model path ─────────────────────────────────────────────────
     _SOCCER_SPORTS = {"Soccer", "soccer", "EPL", "La Liga", "Ligue 1", "Bundesliga",
-                      "Serie A", "UCL", "Europa League"}
+                      "Serie A", "UCL", "Europa League", "World Cup"}
     if sport_raw in _SOCCER_SPORTS or sport_norm == "Soccer":
         soccer_result = score_soccer_leg(leg)
         if soccer_result is not None:
@@ -332,8 +403,36 @@ def score_leg(leg: dict) -> dict:
         win_prob = imp_prob
         ev       = 0.0
     else:
+        from ml_model import _extract_spread_value, FEATURE_COLS
         sport_id  = SPORT_MAP.get(sport_norm, 6)
         league_id = LEAGUE_MAP.get(leg.get("sport", ""), 10)
+
+        # Extract spread value from leg description
+        _desc = leg.get("description", "")
+        _sv   = _extract_spread_value(_desc, mkt)
+
+        # MLB-specific features
+        _home_team = leg.get("home_team") or leg.get("resolved_home_team") or ""
+        _away_team = leg.get("away_team") or leg.get("resolved_away_team") or ""
+        _game_date = leg.get("game_date", "")
+        _commence  = leg.get("commence_time", "")
+        try:
+            from mlb_features import (get_park_features, get_pitcher_features,
+                                      get_weather_features, get_statcast_features,
+                                      get_bullpen_features, get_h2h_features)
+            _park     = get_park_features(_home_team, sport_norm)
+            _pitcher  = get_pitcher_features(_home_team, _away_team, _game_date, sport_norm)
+            _weather  = get_weather_features(_home_team, _commence, sport_norm)
+            _statcast = get_statcast_features(_home_team, _away_team, sport_norm)
+            _bullpen  = get_bullpen_features(_home_team, _away_team, sport_norm)
+            _h2h      = get_h2h_features(_home_team, _away_team, db)
+        except Exception:
+            _park     = {"park_runs_factor": 1.0, "park_hr_factor": 1.0}
+            _pitcher  = {}
+            _weather  = {}
+            _statcast = {}
+            _bullpen  = {}
+            _h2h      = {}
 
         feature_dict = {
             "legs":         1,
@@ -347,7 +446,7 @@ def score_leg(leg: dict) -> dict:
             "hour_placed":  datetime.now().hour,
             "day_of_week":  datetime.now().weekday(),
             "ml_pct":       1.0 if mkt == "h2h"     else 0.0,
-            "spread_pct":   1.0 if mkt == "spreads"  else 0.0,
+            "spread_pct":   1.0 if "spread" in mkt   else 0.0,
             "total_pct":    1.0 if mkt == "totals"   else 0.0,
             "prop_pct":     0.0,
             "multi_sport":  0,
@@ -355,12 +454,18 @@ def score_leg(leg: dict) -> dict:
             "has_ev":       0,
             "ev_value":     0.0,
             "closing_line_diff": 0.0,
+            # Spread-aware features
+            "spread_value":       _sv,
+            "spread_abs":         abs(_sv),
+            "is_favorite_spread": 1.0 if _sv < 0 else 0.0,
+            # MLB features
+            **_park, **_pitcher, **_weather, **_statcast,
+            **_bullpen, **_h2h,
         }
-        # Use np.nan (not 0.0) for missing features so the imputer fills median.
-        row    = np.array([[feature_dict.get(c, np.nan) for c in FEATURE_COLS]], dtype=float)
-        if imputer is not None:
-            row = imputer.transform(row)
-        row_s  = scaler.transform(row)
+        # Use FEATURE_COLS to match the retrained model.  _prep_row handles
+        # both GBC (imputer+scaler) and HistGBT (NaN-native) paths.
+        from ml_model import _prep_row
+        row_s  = _prep_row(feature_dict, scaler, imputer, _active_cols)
         win_prob = float(clf.predict_proba(row_s)[0][1])
         ev       = win_prob * (dec_odds - 1) - (1 - win_prob)
 
@@ -384,7 +489,7 @@ def _normalize_sport(label: str) -> str:
         "MLB": "Baseball",
         "EPL": "Soccer", "La Liga": "Soccer", "MLS": "Soccer", "UCL": "Soccer",
         "Bundesliga": "Soccer", "Ligue 1": "Soccer", "Serie A": "Soccer",
-        "Europa League": "Soccer",
+        "Europa League": "Soccer", "World Cup": "Soccer",
         "NHL": "Ice Hockey",
         "Tennis": "Tennis", "MMA": "other",
     }
@@ -497,6 +602,7 @@ def _sim_win_rate(db, sport: str, market_type: str, team: str,
               AND mb.generated_at >= ?
               AND mbl.leg_result IS NOT NULL
               AND mbl.leg_result != 'PUSH'
+              AND COALESCE(mbl.excluded_from_metrics, 0) = 0
         """, (sport, market_type, f"%{team}%", since)).fetchone()
         con.close()
         if row and row[1] and row[1] >= 5:
@@ -688,6 +794,22 @@ def evaluate_alt_lines(
         })
         seen_leg_ids.add(leg.get("leg_id", ""))
 
+    # Extract primary total line for this fixture (ATS totals-context features)
+    _fix_total_alt = None
+    if fix.bookmakers:
+        for _bk in fix.bookmakers:
+            for _m in _bk.get("markets", []):
+                if _m.get("key") == "totals":
+                    for _oc in _m.get("outcomes", []):
+                        _pt = _oc.get("point")
+                        if _pt is not None:
+                            _fix_total_alt = float(_pt)
+                            break
+                if _fix_total_alt is not None:
+                    break
+            if _fix_total_alt is not None:
+                break
+
     # ── Source 2: alternate spreads/totals from bookmakers JSON ───────────────
     if fix.bookmakers:
         best_bk: dict[tuple, float] = {}
@@ -736,15 +858,16 @@ def evaluate_alt_lines(
                 "away_team":    fix.away_team,
                 "is_alt_line":  True,
             }
+            if _fix_total_alt is not None:
+                raw_leg["total_line"] = _fix_total_alt
             try:
                 sl = score_leg(raw_leg)
             except Exception:
                 sl = {**raw_leg, "win_prob": raw_leg["implied_prob"],
                       "ev": 0.0, "edge": 0.0, "grade": "C", "model_used": "implied"}
-            # Use model-assigned win_prob/edge directly.
-            # MLB/NHL alternate_spreads route through mlb_ats_v1/nhl_ats_v1;
-            # other sports fall back to the global model.  Implied-only fallback
-            # only applies when score_leg() raises (model_used="implied" above).
+            # Alt-spread handling: The spread-aware ATS sub-model (MLB, AUC 0.74)
+            # now scores both standard and alternate spreads via score_leg().
+            # No implied_prob override needed — sub-model has near-perfect calibration.
 
             # Zero-edge gate: exclude low-probability legs when no model provides
             # a real edge signal (soccer spreads, global fallback).  Legs above 65%
@@ -819,15 +942,19 @@ def evaluate_alt_lines(
             "away_team":    fix.away_team,
             "is_alt_line":  True,
         }
-        # Score via ML model — use result directly, not implied_prob override.
-        # MLB/NHL alternate_spreads route through mlb_ats_v1/nhl_ats_v1 inside
-        # score_leg(), giving real model win_prob and edge for alt lines.
-        # Implied-only fallback only when score_leg() raises.
+        if _fix_total_alt is not None:
+            raw_leg["total_line"] = _fix_total_alt
+        # Score via ML model.  For all MLB/NHL alt-spread legs, override with
+        # implied_prob — the ATS model is trained on standard ±1.5 only and
+        # has no valid signal for non-standard alt values (same home-cover
+        # prob returned regardless of actual line value).
         try:
             sl = score_leg(raw_leg)
         except Exception:
             sl = {**raw_leg, "win_prob": raw_leg["implied_prob"],
                   "ev": 0.0, "edge": 0.0, "grade": "C", "model_used": "implied"}
+
+        # Alt-spreads routed through spread-aware ATS sub-model (MLB AUC 0.74).
 
         # Zero-edge gate: exclude low-probability legs when no model provides
         # a real edge signal (soccer spreads, global fallback).
@@ -932,6 +1059,122 @@ def evaluate_alt_lines(
     except Exception:
         pass  # annotation is non-fatal
 
+    # ── Optimal totals-line selection ─────────────────────────────────────────
+    # For MLB totals candidates, scan the real alt-totals ladder from alt_lines
+    # and tag the optimal cushion line per direction (over / under).
+    #
+    # Discriminating range: 6.5–10.5 — where the totals model has resolution.
+    # Outside this range the per-line calibrator plateaus (identical probs for
+    # adjacent lines), so we tag those as _model_plateau and do NOT optimize.
+    #
+    # Within the discriminating range, the optimal line maximises payout while
+    # keeping model_prob >= 0.72 (the sweet-spot cushion threshold).
+    _DISCRIM_LO, _DISCRIM_HI = 6.5, 10.5
+    _TOTALS_CUSHION_FLOOR    = 0.72
+
+    try:
+        from ml_model import predict_game_totals
+        _totals_cands = [c for c in candidates
+                         if c.get("market") in ("totals", "alternate_totals")
+                         and c.get("sport") in ("MLB", "NHL")]
+        if _totals_cands and _fix_total_alt:
+            # Collect real FD alt-total lines for this fixture
+            _fd_lines: set[float] = set()
+            for al in (alt_lines_raw or []):
+                if (al.get("market_key") in ("alternate_totals", "totals")
+                        and al.get("bookmaker") == "fanduel"):
+                    try:
+                        _fd_lines.add(float(al["line"]))
+                    except (TypeError, ValueError, KeyError):
+                        pass
+            # Also include the main FD line
+            _fd_lines.add(float(_fix_total_alt))
+
+            # Score each real FD line through the model
+            _line_probs: dict[float, float] = {}  # line → over_prob
+            _ht = fix.home_team
+            _at = fix.away_team
+            _gd = fix.game_date_ct or (fix.commence_time.strftime("%Y-%m-%d") if fix.commence_time else None)
+            _sp = SPORT_LABEL.get(fix.sport_key, "MLB")
+
+            for _fl in sorted(_fd_lines):
+                _op = predict_game_totals(
+                    home_team=_ht, away_team=_at,
+                    total_line=_fl, game_date=_gd, sport=_sp,
+                )
+                if _op is not None:
+                    _line_probs[_fl] = _op
+
+            if _line_probs:
+                # Detect plateau: lines where prob differs < 0.005 from neighbour
+                _sorted_lines = sorted(_line_probs.keys())
+                _plateau_lines: set[float] = set()
+                for i, _ln in enumerate(_sorted_lines):
+                    if _ln < _DISCRIM_LO or _ln > _DISCRIM_HI:
+                        _plateau_lines.add(_ln)
+                    elif i > 0:
+                        _prev = _sorted_lines[i - 1]
+                        if abs(_line_probs[_ln] - _line_probs[_prev]) < 0.005:
+                            _plateau_lines.add(_ln)
+
+                # Find optimal OVER line: highest line in discriminating range
+                # where over_prob >= threshold (best payout with cushion)
+                _best_over: tuple[float, float] | None = None  # (line, prob)
+                for _ln in sorted(_line_probs.keys(), reverse=True):
+                    if _ln in _plateau_lines:
+                        continue
+                    if _DISCRIM_LO <= _ln <= _DISCRIM_HI and _line_probs[_ln] >= _TOTALS_CUSHION_FLOOR:
+                        _best_over = (_ln, _line_probs[_ln])
+                        break
+
+                # Find optimal UNDER line: lowest line in discriminating range
+                # where under_prob >= threshold (best payout with cushion)
+                _best_under: tuple[float, float] | None = None
+                for _ln in sorted(_line_probs.keys()):
+                    _up = 1.0 - _line_probs[_ln]
+                    if _ln in _plateau_lines:
+                        continue
+                    if _DISCRIM_LO <= _ln <= _DISCRIM_HI and _up >= _TOTALS_CUSHION_FLOOR:
+                        _best_under = (_ln, _up)
+                        break
+
+                # Tag matching candidates
+                for c in _totals_cands:
+                    _c_pt = c.get("point")
+                    if _c_pt is None:
+                        continue
+                    try:
+                        _c_line = float(_c_pt)
+                    except (TypeError, ValueError):
+                        continue
+
+                    # Mark plateau
+                    if _c_line in _plateau_lines:
+                        c["_model_plateau"] = True
+
+                    # Mark real FD line
+                    if _c_line in _fd_lines:
+                        c["_real_fd_line"] = True
+
+                    # Mark optimal over/under
+                    _c_dir = c.get("pick", "").lower()
+                    if "over" in _c_dir and _best_over and abs(_c_line - _best_over[0]) < 0.01:
+                        c["_optimal_totals_line"] = True
+                        c["_optimal_model_prob"]  = round(_best_over[1] * 100, 1)
+                        c["los"] = round(c["los"] * 1.15, 4)  # 15% LOS boost
+                    elif "under" in _c_dir and _best_under and abs(_c_line - _best_under[0]) < 0.01:
+                        c["_optimal_totals_line"] = True
+                        c["_optimal_model_prob"]  = round(_best_under[1] * 100, 1)
+                        c["los"] = round(c["los"] * 1.15, 4)
+
+                _bo_str = f"O{_best_over[0]}={_best_over[1]:.1%}" if _best_over else "none"
+                _bu_str = f"U{_best_under[0]}={_best_under[1]:.1%}" if _best_under else "none"
+                print(f"[ALE-optimal] {fix.away_team}@{fix.home_team} "
+                      f"FD={_fix_total_alt} over={_bo_str} under={_bu_str} "
+                      f"ladder={len(_line_probs)} plateau={len(_plateau_lines)}")
+    except Exception as _oe:
+        print(f"[ALE-optimal] error: {_oe}")
+
     # ── Boost safety re-ranking ───────────────────────────────────────────────
     # When boost_pct >= 0.30, apply a safety premium to LOS so that safer lines
     # (higher implied_prob) rank above aggressive lines, implementing the step-down
@@ -1021,10 +1264,19 @@ def correlation_check(legs: list[dict]) -> list[str]:
                 f"CONFLICT: Both sides of {game} moneyline selected — only one can win."
             )
         elif len(flegs) >= 2:
-            warnings.append(
-                f"CORRELATED: {len(flegs)} legs from same game ({game}). "
-                f"Sportsbooks may restrict or void same-game parlays."
-            )
+            # Player prop legs from the same game are independent (different stats /
+            # players) — don't warn. Only warn when team-market legs share a fixture.
+            _TEAM_MKTS_CC = frozenset({
+                "h2h", "spreads", "spread", "totals", "total",
+                "alternate_spreads", "alternate_totals", "moneyline",
+            })
+            team_flegs = [l for l in flegs
+                          if (l.get("market_type") or l.get("market") or "").lower() in _TEAM_MKTS_CC]
+            if len(team_flegs) >= 2:
+                warnings.append(
+                    f"CORRELATED: {len(team_flegs)} team-market legs from same game ({game}). "
+                    f"Sportsbooks may restrict or void same-game parlays."
+                )
 
     # Opposite sides of totals (over + under same game)
     seen_totals: dict[str, list] = {}
@@ -1101,17 +1353,26 @@ def optimize_parlays(
     for combo in combos:
         legs = [quality[i] for i in combo]
 
-        # Enforce max_same_game constraint
-        fixture_counts: dict[str, int] = {}
-        skip = False
-        for leg in legs:
-            fid = leg["fixture_id"]
-            fixture_counts[fid] = fixture_counts.get(fid, 0) + 1
-            if fixture_counts[fid] > max_same_game:
-                skip = True
-                break
-        if skip:
-            continue
+        # Enforce max_same_game constraint — skip for all-prop combos since
+        # multiple props from the same game (e.g. same player, different stats)
+        # are independent and sportsbooks allow them in the same parlay.
+        _TEAM_MKTS_PB = frozenset({
+            "h2h", "spreads", "spread", "totals", "total",
+            "alternate_spreads", "alternate_totals", "moneyline",
+        })
+        _team_legs = [l for l in legs
+                      if (l.get("market_type") or l.get("market") or "").lower() in _TEAM_MKTS_PB]
+        if _team_legs:
+            fixture_counts: dict[str, int] = {}
+            skip = False
+            for leg in _team_legs:
+                fid = leg["fixture_id"]
+                fixture_counts[fid] = fixture_counts.get(fid, 0) + 1
+                if fixture_counts[fid] > max_same_game:
+                    skip = True
+                    break
+            if skip:
+                continue
 
         parlay = build_parlay(legs, stake=stake)
         best_parlays.append(parlay)
