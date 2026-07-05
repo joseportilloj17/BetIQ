@@ -125,8 +125,89 @@ def _ensure_game_infos(games) -> List[GameInfo]:
     return infos
 
 
-def _persist_props(props: List[ScoutedProp], db) -> int:
-    """Insert ScoutedProp rows into scouted_props table. Returns count inserted."""
+def _persist_props(props: List[ScoutedProp], db=None) -> int:
+    """Insert ScoutedProp rows into scouted_props table. Returns count inserted.
+
+    Always opens a fresh session from SessionLocal so that a failed transaction
+    on the caller's shared `db` session never corrupts future persist calls.
+    """
+    if not props:
+        return 0
+
+    from sqlalchemy import text
+    from database import SessionLocal, DB_WRITE_LOCK
+    session = SessionLocal()
+    count = 0
+    try:
+        for p in props:
+            try:
+                session.execute(text("""
+                    INSERT INTO scouted_props
+                        (scout_date, sport, game_id, home_team, away_team,
+                         commence_time, market_type, player_name, player_id,
+                         team, side, threshold, projected_value,
+                         projected_low_95, projected_high_95, projected_std_dev,
+                         hit_probability, quality_grade,
+                         confidence_factors, risk_factors,
+                         data_source, projection_version)
+                    VALUES
+                        (:scout_date, :sport, :game_id, :home_team, :away_team,
+                         :commence_time, :market_type, :player_name, :player_id,
+                         :team, :side, :threshold, :projected_value,
+                         :projected_low_95, :projected_high_95, :projected_std_dev,
+                         :hit_probability, :quality_grade,
+                         :confidence_factors, :risk_factors,
+                         :data_source, :projection_version)
+                """), {
+                    "scout_date":        p.scout_date,
+                    "sport":             p.sport,
+                    "game_id":           p.game_id,
+                    "home_team":         p.home_team,
+                    "away_team":         p.away_team,
+                    "commence_time":     p.commence_time,
+                    "market_type":       p.market_type,
+                    "player_name":       p.player_name,
+                    "player_id":         p.player_id,
+                    "team":              p.team,
+                    "side":              p.side,
+                    "threshold":         p.threshold,
+                    "projected_value":   p.projected_value,
+                    "projected_low_95":  p.projected_low_95,
+                    "projected_high_95": p.projected_high_95,
+                    "projected_std_dev": p.projected_std_dev,
+                    "hit_probability":   p.hit_probability,
+                    "quality_grade":     p.quality_grade,
+                    "confidence_factors": json.dumps(p.confidence_factors),
+                    "risk_factors":       json.dumps(p.risk_factors),
+                    "data_source":       p.data_source,
+                    "projection_version":p.projection_version,
+                })
+                count += 1
+            except Exception as exc:
+                print(f"[scout.runner] persist error for {p.player_name} / {p.market_type}: {exc}")
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+        try:
+            with DB_WRITE_LOCK:
+                session.commit()
+        except Exception as exc:
+            print(f"[scout.runner] commit error: {exc}")
+            try:
+                session.rollback()
+            except Exception:
+                pass
+    finally:
+        session.close()
+    return count
+
+# ── Legacy single-row insert (kept for callers that pass individual props) ────
+def _persist_props_UNUSED(props: List[ScoutedProp], db) -> int:
+    """Replaced by _persist_props above."""
+    return _persist_props(props)
+
+def __persist_props_old(props: List[ScoutedProp], db) -> int:
     if not props:
         return 0
 
@@ -178,8 +259,19 @@ def _persist_props(props: List[ScoutedProp], db) -> int:
             count += 1
         except Exception as exc:
             print(f"[scout.runner] persist error for {p.player_name} / {p.market_type}: {exc}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
-    db.commit()
+    try:
+        db.commit()
+    except Exception as exc:
+        print(f"[scout.runner] commit error: {exc}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
     return count
 
 
@@ -210,15 +302,33 @@ def run_daily_scout(engine, db) -> dict:
     # ── Delete stale props from today (re-run idempotently) ───────────────────
     try:
         from sqlalchemy import text
+        from database import DB_WRITE_LOCK as _WL
         deleted = db.execute(
             text("DELETE FROM scouted_props WHERE scout_date = :d"),
             {"d": scout_date}
         ).rowcount
-        db.commit()
+        with _WL:
+            db.commit()
         if deleted:
             print(f"[scout.runner] Cleared {deleted} stale props from {scout_date}")
     except Exception as exc:
         print(f"[scout.runner] Failed to clear stale props: {exc}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    def _safe_persist(props, db):
+        """Persist with rollback on failure so session stays usable."""
+        try:
+            return _persist_props(props, db)
+        except Exception as exc:
+            print(f"[scout.runner] persist batch error: {exc}")
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            return 0
 
     # ── NBA ────────────────────────────────────────────────────────────────────
     try:
@@ -230,11 +340,15 @@ def run_daily_scout(engine, db) -> dict:
                 props: list[ScoutedProp] = []
                 props += nba_props.scout_game(game)
                 props += nba_teams.scout_game(game)
-                nba_count += _persist_props(props, db)
+                nba_count += _safe_persist(props, db)
             except Exception as exc:
                 err = f"NBA game {game.game_id}: {exc}"
                 errors.append(err)
                 print(f"[scout.runner] {err}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
         total_props    += nba_count
         by_sport["NBA"] = nba_count
         print(f"[scout.runner] NBA: {len(nba_games)} games → {nba_count} props")
@@ -252,11 +366,15 @@ def run_daily_scout(engine, db) -> dict:
                 props = []
                 props += mlb_props.scout_game(game)
                 props += mlb_teams.scout_game(game)
-                mlb_count += _persist_props(props, db)
+                mlb_count += _safe_persist(props, db)
             except Exception as exc:
                 err = f"MLB game {game.game_id}: {exc}"
                 errors.append(err)
                 print(f"[scout.runner] {err}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
         total_props    += mlb_count
         by_sport["MLB"] = mlb_count
         print(f"[scout.runner] MLB: {len(mlb_games)} games → {mlb_count} props")
@@ -274,11 +392,15 @@ def run_daily_scout(engine, db) -> dict:
                 props = []
                 props += nhl_props.scout_game(game)
                 props += nhl_teams.scout_game(game)
-                nhl_count += _persist_props(props, db)
+                nhl_count += _safe_persist(props, db)
             except Exception as exc:
                 err = f"NHL game {game.game_id}: {exc}"
                 errors.append(err)
                 print(f"[scout.runner] {err}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
         total_props    += nhl_count
         by_sport["NHL"] = nhl_count
         print(f"[scout.runner] NHL: {len(nhl_games)} games → {nhl_count} props")

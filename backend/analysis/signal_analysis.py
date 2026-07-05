@@ -266,6 +266,7 @@ def _load_component_proxies(db_path: str) -> list[dict]:
               AND mb.generated_at >= ?
               AND mb.status IN ('SETTLED_WIN', 'SETTLED_LOSS')
               AND ml.leg_result IN ('WIN', 'LOSS')
+              AND COALESCE(ml.excluded_from_metrics, 0) = 0
         """, list(SIM_SOURCES) + [SIM_START_DATE])
         rows = [dict(r) for r in cur.fetchall()]
     except Exception as e:
@@ -1600,6 +1601,7 @@ def analysis_11_line_quality(db_path: str) -> dict:
               AND mb.generated_at >= ?
               AND mb.status IN ('SETTLED_WIN', 'SETTLED_LOSS')
               AND ml.leg_result IN ('WIN', 'LOSS')
+              AND COALESCE(ml.excluded_from_metrics, 0) = 0
               AND ml.direction_correct IS NOT NULL
             ORDER BY mb.generated_at
         """, list(SIM_SOURCES) + [SIM_START_DATE]).fetchall()

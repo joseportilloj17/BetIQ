@@ -114,8 +114,18 @@ def get_nba_team_roster(team_id: str) -> list[dict]:
         return []
     players = []
     for group in data.get("athletes", []):
-        items = group if isinstance(group, list) else group.get("items", [])
+        if isinstance(group, list):
+            items = group
+        elif isinstance(group, dict):
+            items = group.get("items", [])
+            # Some ESPN roster responses put athletes directly in the group dict
+            if not items and "id" in group:
+                items = [group]
+        else:
+            continue  # skip strings or other unexpected types
         for a in items:
+            if not isinstance(a, dict):
+                continue
             # Normalise so nba_player_props.py gets consistent keys
             a.setdefault("fullName", a.get("displayName", ""))
             players.append(a)
@@ -234,7 +244,11 @@ def get_nba_team_season_stats(team_id: str) -> dict:
     stats_data = _espn(f"{ESPN_SITE_NBA}/teams/{team_id}/statistics")
     if stats_data:
         for cat in (stats_data.get("results") or [{}]):
-            for stat in (cat.get("stats", {}).get("stats") or []):
+            if not isinstance(cat, dict):
+                continue
+            inner = cat.get("stats", {})
+            stat_list = inner.get("stats") if isinstance(inner, dict) else None
+            for stat in (stat_list or []):
                 name = stat.get("name", "")
                 try:
                     val = float(stat["value"])

@@ -5,11 +5,23 @@ Fetches live fixtures + odds, stores to DB, and computes EV against model predic
 from __future__ import annotations
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, timezone as _utc_tz
 from typing import Optional
+from zoneinfo import ZoneInfo as _ZoneInfo
 
 from sqlalchemy.orm import Session
 from database import Fixture
+
+_CT = _ZoneInfo("America/Chicago")
+
+
+def _utc_to_ct_date(utc_dt: datetime | None) -> str | None:
+    """Convert a UTC-naive or UTC-aware datetime to a CT date string (YYYY-MM-DD)."""
+    if utc_dt is None:
+        return None
+    if utc_dt.tzinfo is None:
+        utc_dt = utc_dt.replace(tzinfo=_utc_tz.utc)
+    return utc_dt.astimezone(_CT).strftime("%Y-%m-%d")
 
 
 def american_to_decimal(american: float) -> float:
@@ -23,6 +35,12 @@ def american_to_decimal(american: float) -> float:
     return 1.0
 
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
+if not ODDS_API_KEY:
+    try:
+        from config import ODDS_API_KEY as _cfg_key
+        ODDS_API_KEY = _cfg_key
+    except Exception:
+        pass
 BASE_URL     = "https://api.the-odds-api.com/v4"
 
 # ── Dev-mode credit guard ─────────────────────────────────────────────────────
@@ -67,6 +85,7 @@ ALL_SPORT_KEYS = [
     "soccer_italy_serie_a",
     "soccer_uefa_champs_league",
     "soccer_uefa_europa_league",
+    "soccer_fifa_world_cup",
     "icehockey_nhl",
     "basketball_ncaab",
     "americanfootball_ncaaf",
@@ -146,6 +165,8 @@ def fetch_all_fixtures(db: Session, sport_keys: list[str] | None = None) -> dict
     Only fetches sports that are currently active (checked via /sports endpoint).
     Returns summary of what was fetched.
     """
+    from line_movement import record_odds_snapshot as _record_snap
+
     requested = sport_keys or ALL_SPORT_KEYS
     keys = get_active_sport_keys(requested)
 
@@ -154,6 +175,8 @@ def fetch_all_fixtures(db: Session, sport_keys: list[str] | None = None) -> dict
                 "message": "No active sports found right now."}
 
     total_new = total_updated = 0
+    _SNAPSHOT_MARKETS = {"h2h", "spreads", "totals"}
+    _SNAPSHOT_BOOK    = "fanduel"
 
     for sport_key in keys:
         events = fetch_odds(sport_key)
@@ -165,9 +188,13 @@ def fetch_all_fixtures(db: Session, sport_keys: list[str] | None = None) -> dict
             except Exception:
                 commence = None
 
+            _gd_ct = _utc_to_ct_date(commence)
+
             if existing:
-                existing.bookmakers  = event.get("bookmakers", [])
-                existing.fetched_at  = datetime.utcnow()
+                existing.bookmakers   = event.get("bookmakers", [])
+                existing.fetched_at   = datetime.utcnow()
+                if _gd_ct and not existing.game_date_ct:
+                    existing.game_date_ct = _gd_ct
                 total_updated += 1
             else:
                 fix = Fixture(
@@ -177,10 +204,54 @@ def fetch_all_fixtures(db: Session, sport_keys: list[str] | None = None) -> dict
                     home_team     = event.get("home_team", ""),
                     away_team     = event.get("away_team", ""),
                     commence_time = commence,
+                    game_date_ct  = _gd_ct,
                     bookmakers    = event.get("bookmakers", []),
                 )
                 db.add(fix)
                 total_new += 1
+
+            # ── Record odds snapshot for line-movement tracking (FanDuel only) ──
+            _fid        = event["id"]
+            _sport      = event.get("sport_title", sport_key)
+            _home       = event.get("home_team", "")
+            _away       = event.get("away_team", "")
+            for bk in (event.get("bookmakers") or []):
+                if bk.get("key") != _SNAPSHOT_BOOK:
+                    continue
+                for mkt in (bk.get("markets") or []):
+                    mkt_key = mkt.get("key", "")
+                    if mkt_key not in _SNAPSHOT_MARKETS:
+                        continue
+                    for outcome in (mkt.get("outcomes") or []):
+                        _price = outcome.get("price")
+                        _point = outcome.get("point")
+                        _name  = outcome.get("name", "")
+                        # Normalise side: team name → "home"/"away", Over/Under → "over"/"under"
+                        if mkt_key == "totals":
+                            _side = _name.lower()  # "over" or "under"
+                        elif _name == _home:
+                            _side = "home"
+                        elif _name == _away:
+                            _side = "away"
+                        else:
+                            _side = _name.lower()
+                        try:
+                            _record_snap(
+                                db,
+                                fixture_id    = _fid,
+                                sport         = _sport,
+                                home_team     = _home,
+                                away_team     = _away,
+                                market_type   = mkt_key,
+                                point         = float(_point) if _point is not None else None,
+                                side          = _side,
+                                american_odds = None,
+                                decimal_odds  = float(_price) if _price is not None else None,
+                                book          = _SNAPSHOT_BOOK,
+                            )
+                        except Exception:
+                            pass
+                break  # Only one FanDuel block per event
 
     db.commit()
     return {
@@ -219,7 +290,7 @@ def fixtures_with_ev(db: Session, min_win_prob: float = 0.0) -> list[dict]:
     from ml_model import load_model, FEATURE_COLS, predict_bet
     import math
 
-    clf, scaler = load_model()
+    clf, scaler, _imputer, _active_cols = load_model()
     fixtures = db.query(Fixture).order_by(Fixture.commence_time).all()
     results  = []
 

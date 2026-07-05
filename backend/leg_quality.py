@@ -169,9 +169,9 @@ def _canonical_market(market_type: str) -> str:
     mt = (market_type or "").strip().lower()
     if not mt:
         return "Other"
-    if "alt spread" in mt or "alternate spread" in mt or "alt run line" in mt or "alt puck line" in mt:
+    if "alt spread" in mt or "alternate spread" in mt or "alternate_spread" in mt or "alt run line" in mt or "alt puck line" in mt:
         return "Alt Spread"
-    if "alt total" in mt or "alternate total" in mt:
+    if "alt total" in mt or "alternate total" in mt or "alternate_total" in mt:
         return "Alt Total"
     if "player prop" in mt or mt == "prop":
         return "Player Prop"
@@ -386,6 +386,7 @@ def compute_component_a(
                 FROM   mock_bet_legs bl
                 JOIN   mock_bets mb ON mb.id = bl.mock_bet_id
                 WHERE  bl.leg_result IN ('WIN', 'LOSS')
+                  AND  COALESCE(bl.excluded_from_metrics, 0) = 0
                   AND  bl.sport        = :sport
                   AND  bl.market_type  = :market_type
                   AND  bl.description  LIKE :team_frag
@@ -553,6 +554,7 @@ def _lookup_accuracy_profile(
         JOIN   bets b ON b.id = bl.bet_id
         WHERE  b.is_mock = 0
           AND  bl.leg_result IN ('WIN','LOSS')
+          AND  COALESCE(bl.excluded_from_metrics, 0) = 0
           AND  bl.accuracy_delta IS NOT NULL
     """
     params: dict = {}
@@ -1054,6 +1056,7 @@ def check_close_call_history(
         JOIN   bets b ON b.id = bl.bet_id
         WHERE  b.is_mock = 0
           AND  bl.leg_result IN ('WIN','LOSS')
+          AND  COALESCE(bl.excluded_from_metrics, 0) = 0
           AND  bl.accuracy_delta IS NOT NULL
           AND  bl.market_type = :market_type
           AND  (UPPER(bl.sport) = :sport OR :sport = '')
@@ -1143,6 +1146,7 @@ def compute_leg_deviation_profile(
         JOIN   bets b ON b.id = bl.bet_id
         WHERE  b.is_mock = 0
           AND  bl.leg_result IN ('WIN','LOSS')
+          AND  COALESCE(bl.excluded_from_metrics, 0) = 0
           AND  bl.market_type = :market_type
         {sport_clause}{team_clause}
     """), base_params).fetchall()
@@ -1163,6 +1167,7 @@ def compute_leg_deviation_profile(
         JOIN   bets b ON b.id = bl.bet_id
         WHERE  b.is_mock = 0
           AND  bl.leg_result IN ('WIN','LOSS')
+          AND  COALESCE(bl.excluded_from_metrics, 0) = 0
           AND  COALESCE(bl.resolution_source, '') != 'inferred_parlay_win'
           AND  bl.market_type = :market_type
         {sport_clause}{team_clause}
@@ -1182,6 +1187,7 @@ def compute_leg_deviation_profile(
         JOIN   bets b ON b.id = bl.bet_id
         WHERE  b.is_mock = 0
           AND  bl.leg_result IN ('WIN','LOSS')
+          AND  COALESCE(bl.excluded_from_metrics, 0) = 0
           AND  bl.accuracy_delta IS NOT NULL
           AND  bl.market_type = :market_type
         {sport_clause}{team_clause}
@@ -1244,6 +1250,7 @@ def update_quality_profiles(db: Session) -> dict:
         JOIN   bets b ON b.id = bl.bet_id
         WHERE  b.is_mock = 0
           AND  bl.leg_result IN ('WIN','LOSS')
+          AND  COALESCE(bl.excluded_from_metrics, 0) = 0
           AND  bl.market_type IS NOT NULL
     """)).fetchall()
 
@@ -1428,6 +1435,7 @@ def tune_lqs_weights(db: Session) -> dict:
         JOIN   bets b ON b.id = bl.bet_id
         WHERE  b.is_mock = 0
           AND  bl.leg_result IN ('WIN','LOSS')
+          AND  COALESCE(bl.excluded_from_metrics, 0) = 0
           AND  bl.lqs IS NOT NULL
           AND  COALESCE(bl.resolution_source, '') != 'inferred_parlay_win'
     """)).fetchall()
@@ -1635,6 +1643,7 @@ def get_lqs_attribution(db: Session) -> dict:
         WHERE  b.is_mock = 0
           AND  bl.lqs_grade IS NOT NULL
           AND  bl.leg_result IN ('WIN','LOSS')
+          AND  COALESCE(bl.excluded_from_metrics, 0) = 0
         GROUP BY bl.lqs_grade
         ORDER BY bl.lqs_grade
     """)).fetchall()
