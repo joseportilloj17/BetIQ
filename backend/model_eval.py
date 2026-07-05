@@ -321,7 +321,7 @@ def main(threshold: float = 0.55, plot_dir: str | None = None, no_plots: bool = 
 
     # ── 1. Load model ──────────────────────────────────────────────────────
     print("Loading trained model…")
-    clf, scaler, imputer = load_model()
+    clf, scaler, imputer, _active_cols = load_model()
 
     # ── 2. Rebuild dataset ─────────────────────────────────────────────────
     print("Rebuilding dataset…")

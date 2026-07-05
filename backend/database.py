@@ -11,15 +11,84 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 import os
+import threading
+
+# ── Canonical mock-bet status values ────────────────────────────────────────
+# Every write path MUST use these constants (or normalize_mock_status()).
+# Adding a value here is the ONLY way to introduce a new status.
+MOCK_STATUS_PENDING      = "PENDING"
+MOCK_STATUS_SETTLED_WIN  = "SETTLED_WIN"
+MOCK_STATUS_SETTLED_LOSS = "SETTLED_LOSS"
+MOCK_STATUS_EXPIRED      = "EXPIRED"
+MOCK_STATUS_DNP          = "DNP"
+MOCK_STATUS_PUSH         = "PUSH"
+MOCK_STATUS_SETTLED_PUSH = "SETTLED_PUSH"
+MOCK_STATUS_VOIDED       = "VOIDED"
+
+_MOCK_STATUS_CANONICAL = {
+    MOCK_STATUS_PENDING, MOCK_STATUS_SETTLED_WIN, MOCK_STATUS_SETTLED_LOSS,
+    MOCK_STATUS_EXPIRED, MOCK_STATUS_DNP, MOCK_STATUS_PUSH,
+    MOCK_STATUS_SETTLED_PUSH, MOCK_STATUS_VOIDED,
+}
+
+# Map common non-canonical variants → canonical value
+_MOCK_STATUS_ALIASES: dict[str, str] = {
+    "pending":      MOCK_STATUS_PENDING,
+    "won":          MOCK_STATUS_SETTLED_WIN,
+    "WON":          MOCK_STATUS_SETTLED_WIN,
+    "lost":         MOCK_STATUS_SETTLED_LOSS,
+    "LOST":         MOCK_STATUS_SETTLED_LOSS,
+    "win":          MOCK_STATUS_SETTLED_WIN,
+    "loss":         MOCK_STATUS_SETTLED_LOSS,
+    "settled_win":  MOCK_STATUS_SETTLED_WIN,
+    "settled_loss": MOCK_STATUS_SETTLED_LOSS,
+    "expired":      MOCK_STATUS_EXPIRED,
+    "push":         MOCK_STATUS_PUSH,
+    "voided":       MOCK_STATUS_VOIDED,
+    "dnp":          MOCK_STATUS_DNP,
+}
+
+
+def normalize_mock_status(raw: str | None) -> str:
+    """Normalize any status string to its canonical uppercase form.
+
+    Returns PENDING for None/empty.  Raises ValueError for truly unknown values
+    so bad data surfaces immediately instead of silently filtering out bets.
+    """
+    if not raw:
+        return MOCK_STATUS_PENDING
+    s = raw.strip()
+    if s in _MOCK_STATUS_CANONICAL:
+        return s
+    mapped = _MOCK_STATUS_ALIASES.get(s)
+    if mapped:
+        return mapped
+    # Last resort: try uppercase
+    upper = s.upper()
+    if upper in _MOCK_STATUS_CANONICAL:
+        return upper
+    raise ValueError(
+        f"Unknown mock-bet status {raw!r}. "
+        f"Canonical values: {sorted(_MOCK_STATUS_CANONICAL)}"
+    )
+
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
-DATABASE_URL = f"sqlite:///{os.path.abspath(DB_PATH)}"
+_DB_ABS = os.path.abspath(DB_PATH)
+DATABASE_URL = f"sqlite:///{_DB_ABS}"
+
+# ── Use NullPool to avoid connection caching issues ──────────────────────
+# SQLite WAL + multi-thread + connection pooling can cause "disk I/O error"
+# on macOS when pooled connections hold stale SHM mappings.  NullPool creates
+# a fresh connection for every checkout and closes it on return, eliminating
+# the cross-thread connection state problem entirely.
+# Performance impact is minimal: sqlite3.connect() is ~0.1 ms for a local file.
+from sqlalchemy.pool import NullPool
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},
-    # Keep connections open for the process lifetime — avoids repeated file open/close
-    pool_pre_ping=True,
+    connect_args={"check_same_thread": False, "timeout": 30},
+    poolclass=NullPool,
 )
 
 # WAL mode: safer for concurrent readers/writers, checkpointed on close.
@@ -28,13 +97,34 @@ from sqlalchemy import event as _sa_event
 
 @_sa_event.listens_for(engine, "connect")
 def _set_sqlite_pragmas(dbapi_conn, _):
+    import time as _time
     cursor = dbapi_conn.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
+    # PRAGMA journal_mode=WAL can fail with "disk I/O error" on macOS when
+    # another thread is concurrently initializing the same DB's SHM region.
+    # Retry with a brief backoff to handle this startup race.
+    for _attempt in range(3):
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            break
+        except Exception:
+            if _attempt == 2:
+                raise
+            _time.sleep(0.5 * (_attempt + 1))
     cursor.execute("PRAGMA synchronous=FULL")
+    cursor.execute("PRAGMA busy_timeout=30000")   # 30s wait instead of immediate error
     cursor.close()
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+# ── Global write lock ────────────────────────────────────────────────────
+# SQLite WAL allows concurrent readers but only one writer at a time.
+# Python's busy_timeout handles this at the SQLite level, but when multiple
+# threads commit simultaneously from the same process the internal locking
+# can fail with "disk I/O error" instead of a clean busy/locked error.
+# This lock serializes ALL background DB writes so only one thread writes
+# at a time.  Reads are NOT gated — WAL handles concurrent reads fine.
+DB_WRITE_LOCK = threading.Lock()
 
 
 def get_db():
@@ -126,8 +216,9 @@ class Fixture(Base):
     sport_title   = Column(String)
     home_team     = Column(String)
     away_team     = Column(String)
-    commence_time = Column(DateTime)
-    bookmakers    = Column(JSON, nullable=True)         # raw odds payload
+    commence_time = Column(DateTime)                    # stored as UTC
+    game_date_ct  = Column(String, nullable=True)       # YYYY-MM-DD in America/Chicago
+    bookmakers    = Column(JSON, nullable=True)          # raw odds payload
     fetched_at    = Column(DateTime, default=datetime.utcnow)
 
 
@@ -144,6 +235,29 @@ class ModelRun(Base):
     roc_auc       = Column(Float)
     feature_names = Column(JSON)
     notes         = Column(Text, nullable=True)
+
+
+class ModelVersion(Base):
+    """
+    Tracks each weekly retraining attempt.
+    One row per candidate; status = 'active' | 'rejected' | 'rollback'.
+    """
+    __tablename__ = "model_versions"
+
+    id                  = Column(Integer,  primary_key=True, autoincrement=True)
+    version             = Column(String,   nullable=False, unique=True)  # "v1", "v2", …
+    version_n           = Column(Integer,  nullable=False)
+    trained_at          = Column(DateTime, default=datetime.utcnow)
+    training_legs       = Column(Integer,  nullable=True)
+    holdout_auc         = Column(Float,    nullable=True)
+    holdout_brier       = Column(Float,    nullable=True)
+    holdout_reliability = Column(Float,    nullable=True)
+    status              = Column(String,   nullable=False, default="active")
+    rejection_reasons   = Column(JSON,     nullable=True)
+    model_path          = Column(String,   nullable=True)
+    scaler_path         = Column(String,   nullable=True)
+    imputer_path        = Column(String,   nullable=True)
+    notes               = Column(Text,     nullable=True)
 
 
 class Prediction(Base):
@@ -302,12 +416,15 @@ class MockBet(Base):
     avg_lqs             = Column(Float, nullable=True)
     # Predicted odds at generation time (American format, e.g. +350)
     predicted_odds      = Column(Integer, nullable=True)
-    # Boost simulation tracking (Phase 7A)
+    # Boost simulation tracking (Phase 7A / 7B two-strategy framework)
     promo_type          = Column(String,  nullable=True)  # PROFIT_BOOST / BONUS_BET / NO_SWEAT / None
     promo_boost_pct     = Column(Float,   nullable=True)  # 0.25 / 0.30 / 0.50 / None
-    boost_strategy      = Column(String,  nullable=True)  # eligibility route/reason string
+    boost_strategy      = Column(String,  nullable=True)  # 'amplify_positive_ev' | 'rescue_high_wr_chalk' | 'no_boost'
     promo_ev_lift       = Column(Float,   nullable=True)  # EV gain in $ from the boost
     promo_boosted_odds  = Column(Float,   nullable=True)  # post-boost decimal odds (PROFIT_BOOST only)
+    base_ev_per_10      = Column(Float,   nullable=True)  # EV at $10 stake before any boost
+    boost_lift_ev       = Column(Float,   nullable=True)  # incremental EV added by the boost (per $10)
+    boosted_ev_per_10   = Column(Float,   nullable=True)  # EV at $10 stake after boost applied
     # User curation
     user_excluded           = Column(Boolean,  nullable=True, default=False)
     user_excluded_reason    = Column(String,   nullable=True)
@@ -320,6 +437,23 @@ class MockBet(Base):
     recalculated_combined_odds_american = Column(Integer,  nullable=True)
     recalculated_actual_profit          = Column(Float,    nullable=True)
     counterfactual_message              = Column(Text,     nullable=True)
+    # Exploration tier tracking — NULL for prospective, set for exploration bets
+    exploration_tier    = Column(String,  nullable=True)  # 'validation' | 'expansion' | 'boundary_testing'
+    # Tier classification — T1 (highest conviction) / T2 / T3 (monitor only)
+    bet_tier            = Column(String,  nullable=True)
+    # Composite ranking score from recommender (30%WP + 15%EV + 10%LQS + 20%scout + ...)
+    composite_score     = Column(Float,   nullable=True)
+    # Live bet recommendation flag — True = passes all live criteria for real-money betting
+    live_recommendation = Column(Boolean, nullable=True, default=False)
+    # Cohort boundary — labels code-era for forward evaluation
+    #   prospective_legacy = pre-clean-code era (in P&L, not in forward graduation read)
+    #   clean              = post-6/29 clean-code era (forward eval set)
+    #   NULL               = retroactive/backfill (not prospective)
+    cohort              = Column(String,  nullable=True)
+    # Shadow Kelly tracking — what quarter-Kelly WOULD recommend (not used for actual sizing)
+    kelly_fraction      = Column(Float,   nullable=True)  # raw Kelly fraction (0-1)
+    kelly_bet_size      = Column(Float,   nullable=True)  # quarter-Kelly bet size at reference bankroll
+    kelly_edge          = Column(Float,   nullable=True)  # model_wp - implied_prob (pp)
 
 
 class MockBetLeg(Base):
@@ -383,12 +517,24 @@ class MockBetLeg(Base):
     # Tier 4: MIXED   + wp>=70% (very high model confidence only)
     qualification_tier       = Column(String,   nullable=True)
 
+    # Bet category — 'team' or 'player_prop'; set at generation, used for split-view validation
+    bet_category             = Column(String,   nullable=True)  # 'team' | 'player_prop'
+
     # User curation — leg-level exclusion
     user_excluded            = Column(Boolean,  nullable=True, default=False)
     user_excluded_reason     = Column(String,   nullable=True)
     user_excluded_at         = Column(DateTime, nullable=True)
     user_excluded_thesis_id  = Column(Integer,  nullable=True)
     exclusion_mode           = Column(String,   nullable=True)  # null_bet | recalculate | counterfactual
+
+    # Metrics quarantine — bug-era legs flagged so aggregate queries exclude by default
+    excluded_from_metrics    = Column(Integer,  nullable=True, default=0)  # 1 = quarantined
+
+    # ── Devig (Group F) — true no-vig probabilities, measure-only ──
+    devig_entry_prob         = Column(Float,   nullable=True)   # devigged implied prob at entry (0-1)
+    devig_close_prob         = Column(Float,   nullable=True)   # devigged implied prob at close (0-1)
+    overround                = Column(Float,   nullable=True)   # vig amount removed (e.g. 1.05 = 5% vig)
+    devig_available          = Column(Integer, nullable=True)   # 1 = devig computed, 0 = paired side missing
 
 
 class UserThesis(Base):
@@ -537,6 +683,82 @@ class LegHistoricalResolution(Base):
     margin            = Column(Float,   nullable=True)   # covered/missed by (accuracy_delta)
     resolution_source = Column(String,  nullable=False, default="historical_db")
     resolved_at       = Column(String,  nullable=True)   # ISO timestamp
+
+
+class BetPatternSignal(Base):
+    """
+    Tracks per-pattern calibration error across settled legs.
+
+    A pattern_key encodes a combination of bet characteristics
+    (sport × market × wp_bucket × day_of_week × n_legs × cushion, etc.).
+    When a pattern's signal_strength crosses a threshold, its actual_wr
+    feeds back as a composite score adjustment.
+    """
+    __tablename__ = "bet_pattern_signals"
+
+    pattern_key     = Column(String,  primary_key=True)  # e.g. "NBA|alt_spread|55-65|tue"
+    description     = Column(String,  nullable=True)      # human-readable label
+    n_legs          = Column(Integer, default=0)
+    actual_wr       = Column(Float,   nullable=True)      # observed win rate 0-100
+    predicted_wr    = Column(Float,   nullable=True)      # mean model WP 0-100
+    signal_strength = Column(Float,   nullable=True)      # |actual-predicted| * sqrt(n)
+    last_updated    = Column(DateTime, default=datetime.utcnow)
+
+
+class PendingMarketAction(Base):
+    """
+    Auto-flagged promotion/demotion candidates surfaced after calibration refresh.
+
+    Requires manual confirmation via POST /api/exploration/promote-market or
+    /api/exploration/demote-market — never auto-executes.
+    """
+    __tablename__ = "pending_market_actions"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    action      = Column(String,  nullable=False)   # "promote" | "demote"
+    sport       = Column(String,  nullable=False)
+    market_type = Column(String,  nullable=False)
+    tier        = Column(String,  nullable=True)    # current exploration tier
+    actual_wr   = Column(Float,   nullable=True)
+    expected_wr = Column(Float,   nullable=True)
+    n_legs      = Column(Integer, nullable=True)
+    reason      = Column(String,  nullable=True)
+    flagged_at  = Column(DateTime, default=datetime.utcnow)
+    reviewed    = Column(Boolean, default=False)    # True after user acts on it
+
+
+class PlayerProjection(Base):
+    """
+    Daily player-level stat projections built from free public APIs.
+
+    Built before game time from: season averages, recent game logs,
+    opposing pitcher/team quality, park factors, and injury discounts.
+
+    When OddsAPI player props are enabled, compare projection against
+    sportsbook line to compute edge for prop bet recommendations.
+    """
+    __tablename__ = "player_projections"
+
+    # Composite PK: one projection per player × stat type × game date
+    player_id           = Column(String,  primary_key=True)
+    stat_type           = Column(String,  primary_key=True)   # hits / total_bases / points / etc.
+    game_date           = Column(String,  primary_key=True)   # YYYY-MM-DD
+
+    player_name         = Column(String,  nullable=False)
+    sport               = Column(String,  nullable=False)     # MLB / NBA / NHL
+    team                = Column(String,  nullable=True)
+    opponent            = Column(String,  nullable=True)
+
+    # Core projection
+    projection          = Column(Float,   nullable=False)     # projected value (e.g. 1.42 hits)
+    confidence          = Column(Float,   nullable=True)      # 0-1 based on sample size + variance
+
+    # Adjustment components (all additive in log space, stored as multiplier - 1)
+    matchup_adjustment  = Column(Float,   nullable=True)      # vs opposing pitcher/defense
+    venue_adjustment    = Column(Float,   nullable=True)      # park factor or home/away split
+    injury_adjustment   = Column(Float,   nullable=True)      # discount for injury risk
+
+    projected_at        = Column(String,  nullable=True)      # ISO timestamp of last update
 
 
 class UserPick(Base):
@@ -927,6 +1149,262 @@ def _migrate_user_pick_leg_outcome_columns():
                 pass   # column already exists
 
 
+class InjuryReport(Base):
+    """
+    Game-day injury status for players affecting pick generation.
+
+    Populated by injury_fetcher.py via ESPN and MLB Stats API.
+    Refreshed at 7 AM, 1 PM, 4 PM CT + 60 min before each game.
+    """
+    __tablename__ = "injury_reports"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    sport        = Column(String,  nullable=False)                  # NBA | MLB | NHL | NFL
+    team         = Column(String,  nullable=True)
+    player_name  = Column(String,  nullable=True)
+    player_id    = Column(String,  nullable=True)                   # ESPN/MLB player ID
+    position     = Column(String,  nullable=True)                   # SP | PG | C | etc.
+    status       = Column(String,  nullable=True)                   # OUT|DOUBTFUL|QUESTIONABLE|PROBABLE|DAY_TO_DAY
+    injury_type  = Column(String,  nullable=True)                   # hamstring, back, etc.
+    reported_at  = Column(DateTime, nullable=True)
+    game_date    = Column(String,  nullable=True)                   # YYYY-MM-DD
+    fixture_id   = Column(String,  nullable=True)                   # links to fixtures table
+    impact_score = Column(Float,   nullable=True)                   # 0-1.0 team strength reduction
+    source       = Column(String,  nullable=True)                   # espn | mlb_stats_api
+
+
+class LineMovementLog(Base):
+    """
+    Historical odds snapshots for line movement tracking.
+
+    Every alt_lines fetch appends here. Deltas computed at fetch time
+    let the model detect sharp money (line moves vs public direction).
+    """
+    __tablename__ = "line_movement_log"
+
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    event_id         = Column(String,  nullable=True)               # fixture_id / odds-API event id
+    fixture_id       = Column(String,  nullable=True)               # links to fixtures table
+    sport            = Column(String,  nullable=True)
+    home_team        = Column(String,  nullable=True)
+    away_team        = Column(String,  nullable=True)
+    market_type      = Column(String,  nullable=True)               # h2h | spreads | totals | alternate_spreads
+    point            = Column(Float,   nullable=True)               # spread/total value
+    side             = Column(String,  nullable=True)               # home | away | over | under
+    american_odds    = Column(Integer, nullable=True)
+    decimal_odds     = Column(Float,   nullable=True)
+    fetched_at       = Column(DateTime, nullable=True)
+    book             = Column(String,  default="fanduel")
+    # Computed movement signals
+    line_opened      = Column(Float,   nullable=True)               # first fetch odds today
+    line_delta       = Column(Float,   nullable=True)               # current vs open
+    line_delta_hours = Column(Float,   nullable=True)               # hours since open fetch
+    movement_direction = Column(String, nullable=True)              # sharp_home|sharp_away|public_chasing|stable
+
+
+class MarketEligibilityOverride(Base):
+    """
+    Human-approved market eligibility overrides (promote / demote).
+
+    Layers on top of the hardcoded MARKET_ELIGIBILITY dict in recommender.py.
+    The calibration system identifies candidates; human review writes here.
+    Latest override per (sport, market_type) wins at runtime.
+    """
+    __tablename__ = "market_eligibility_overrides"
+
+    id          = Column(Integer,  primary_key=True, autoincrement=True)
+    sport       = Column(String,   nullable=False)      # "MLB" | "NBA" | "NHL" …
+    market_type = Column(String,   nullable=False)      # "alternate_spreads" | "player_points" …
+    action      = Column(String,   nullable=False)      # "promote" | "demote"
+    min_wp      = Column(Float,    nullable=True)        # None = computed at promote time
+    priority    = Column(Float,    nullable=True)        # None = 1.0 default
+    banned      = Column(Boolean,  default=False)
+    reason      = Column(Text,     nullable=True)        # qualitative justification
+    applied_at  = Column(DateTime, nullable=True)
+    applied_by  = Column(String,   nullable=True)        # free-form ("analyst", email, etc.)
+
+
+class PiConcentrationFlag(Base):
+    """
+    Tracking table for Pi-gated concentration analysis.
+
+    Populated after each settlement batch — NOT wired to live generation.
+    Records whether Pi filtering would have removed each high-exposure leg,
+    and what the actual outcome was.  Accumulate 2-3 weeks of data before
+    deciding whether to wire Pi filtering live.
+    """
+    __tablename__ = "pi_concentration_flags"
+
+    id                   = Column(Integer,  primary_key=True, autoincrement=True)
+    game_date            = Column(Text,     nullable=True)
+    fixture_id           = Column(Text,     nullable=True)
+    bet_info             = Column(Text,     nullable=True)
+    pi_diff              = Column(Float,    nullable=True)
+    n_bets_containing    = Column(Integer,  nullable=True)
+    leg_result           = Column(Text,     nullable=True)
+    would_have_filtered  = Column(Text,     nullable=True)   # 'pi_cap_2' | 'pi_disqualify' | 'none'
+    settled_at           = Column(DateTime, nullable=True)
+
+
+def _migrate_exploration_tier():
+    """Add exploration_tier column to mock_bets for tiered diagnostic tracking."""
+    with engine.connect() as conn:
+        try:
+            conn.execute(__import__("sqlalchemy").text(
+                "ALTER TABLE mock_bets ADD COLUMN exploration_tier TEXT DEFAULT NULL"
+            ))
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+
+
+def _migrate_injury_line_movement():
+    """Create injury_reports and line_movement_log tables if they don't exist."""
+    Base.metadata.create_all(bind=engine)  # creates new tables, no-op for existing
+
+
+def _migrate_injury_impact_on_legs():
+    """Add injury impact columns to mock_bet_legs for feature engineering."""
+    migrations = [
+        "ALTER TABLE mock_bet_legs ADD COLUMN home_team_injury_impact REAL DEFAULT NULL",
+        "ALTER TABLE mock_bet_legs ADD COLUMN away_team_injury_impact REAL DEFAULT NULL",
+        "ALTER TABLE mock_bet_legs ADD COLUMN injury_net_advantage   REAL DEFAULT NULL",
+        "ALTER TABLE mock_bet_legs ADD COLUMN confidence_tier        TEXT DEFAULT NULL",
+        "ALTER TABLE mock_bet_legs ADD COLUMN line_movement_signal   REAL DEFAULT NULL",
+        # Directional filter columns — populated during generation, validated after settlement
+        "ALTER TABLE mock_bet_legs ADD COLUMN line_direction          TEXT DEFAULT NULL",
+        "ALTER TABLE mock_bet_legs ADD COLUMN injury_direction        TEXT DEFAULT NULL",
+        # Pi (Elo-like) team power ratings — populated during generation
+        "ALTER TABLE mock_bet_legs ADD COLUMN home_team_home_pi       REAL DEFAULT NULL",
+        "ALTER TABLE mock_bet_legs ADD COLUMN away_team_away_pi       REAL DEFAULT NULL",
+        "ALTER TABLE mock_bet_legs ADD COLUMN pi_diff                 REAL DEFAULT NULL",
+        # Pick-relative Pi diff: positive = our picked side is stronger, negative = weaker
+        "ALTER TABLE mock_bet_legs ADD COLUMN pi_diff_pick            REAL DEFAULT NULL",
+    ]
+    with engine.connect() as conn:
+        for sql in migrations:
+            try:
+                conn.execute(__import__("sqlalchemy").text(sql))
+                conn.commit()
+            except Exception:
+                pass   # column already exists
+
+
+def _migrate_composite_score():
+    """Add composite_score column to mock_bets for ranking preservation."""
+    with engine.connect() as conn:
+        try:
+            conn.execute(__import__("sqlalchemy").text(
+                "ALTER TABLE mock_bets ADD COLUMN composite_score REAL DEFAULT NULL"
+            ))
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+
+
+def _migrate_live_recommendation():
+    """Add live_recommendation and shadow Kelly columns to mock_bets."""
+    _sa_text = __import__("sqlalchemy").text
+    with engine.connect() as conn:
+        for stmt in [
+            "ALTER TABLE mock_bets ADD COLUMN live_recommendation BOOLEAN DEFAULT 0",
+            "ALTER TABLE mock_bets ADD COLUMN kelly_fraction REAL DEFAULT NULL",
+            "ALTER TABLE mock_bets ADD COLUMN kelly_bet_size REAL DEFAULT NULL",
+            "ALTER TABLE mock_bets ADD COLUMN kelly_edge REAL DEFAULT NULL",
+        ]:
+            try:
+                conn.execute(_sa_text(stmt))
+                conn.commit()
+            except Exception:
+                pass  # column already exists
+
+
+def _migrate_metrics_quarantine():
+    """Add excluded_from_metrics column — bug-era legs flagged so aggregate queries skip them."""
+    _sa_text = __import__("sqlalchemy").text
+    with engine.connect() as conn:
+        try:
+            conn.execute(_sa_text(
+                "ALTER TABLE mock_bet_legs ADD COLUMN excluded_from_metrics INTEGER DEFAULT 0"
+            ))
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+
+
+def _migrate_fixture_game_date_ct():
+    """Add game_date_ct column to fixtures and backfill from commence_time."""
+    _sa_text = __import__("sqlalchemy").text
+    with engine.connect() as conn:
+        try:
+            conn.execute(_sa_text(
+                "ALTER TABLE fixtures ADD COLUMN game_date_ct TEXT DEFAULT NULL"
+            ))
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+        # Backfill any rows where game_date_ct is NULL but commence_time exists.
+        # Use Python for DST-correct conversion rather than SQLite offset.
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            _ct = _ZI("America/Chicago")
+            rows = conn.execute(_sa_text(
+                "SELECT id, commence_time FROM fixtures "
+                "WHERE game_date_ct IS NULL AND commence_time IS NOT NULL"
+            )).fetchall()
+            for row in rows:
+                try:
+                    from datetime import datetime as _dt2, timezone as _tz
+                    ct_raw = str(row[1])
+                    # Parse UTC-naive ISO string, attach UTC, convert to CT
+                    utc_dt = _dt2.fromisoformat(ct_raw).replace(tzinfo=_tz.utc)
+                    ct_date = utc_dt.astimezone(_ct).strftime("%Y-%m-%d")
+                    conn.execute(_sa_text(
+                        "UPDATE fixtures SET game_date_ct=:gd WHERE id=:fid"
+                    ), {"gd": ct_date, "fid": row[0]})
+                except Exception:
+                    pass
+            conn.commit()
+        except Exception:
+            pass
+
+
+def _migrate_devig_columns():
+    """Add Group F devig columns to mock_bet_legs — measure-only, additive."""
+    _sa_text = __import__("sqlalchemy").text
+    with engine.connect() as conn:
+        for stmt in [
+            "ALTER TABLE mock_bet_legs ADD COLUMN devig_entry_prob REAL DEFAULT NULL",
+            "ALTER TABLE mock_bet_legs ADD COLUMN devig_close_prob REAL DEFAULT NULL",
+            "ALTER TABLE mock_bet_legs ADD COLUMN overround REAL DEFAULT NULL",
+            "ALTER TABLE mock_bet_legs ADD COLUMN devig_available INTEGER DEFAULT NULL",
+        ]:
+            try:
+                conn.execute(_sa_text(stmt))
+                conn.commit()
+            except Exception:
+                pass  # column already exists
+
+
+def _migrate_cohort_column():
+    """Add cohort column to mock_bets for code-era labeling.
+
+    Cohort is assigned at CREATION time by new code (cohort='clean').
+    Historical bets keep cohort=NULL (unchanged).
+    prospective_legacy is a one-time targeted tag applied manually,
+    NOT an auto-rule in this migration.
+    """
+    _sa_text = __import__("sqlalchemy").text
+    with engine.connect() as conn:
+        try:
+            conn.execute(_sa_text(
+                "ALTER TABLE mock_bets ADD COLUMN cohort TEXT DEFAULT NULL"
+            ))
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
     # Initialize migration safety infrastructure first
@@ -952,6 +1430,18 @@ def init_db():
     _migrate_user_picks_editable_columns()
     _migrate_user_picks_ingest_columns()
     _migrate_user_pick_leg_outcome_columns()
+    _migrate_exploration_tier()
+    _migrate_injury_line_movement()
+    _migrate_injury_impact_on_legs()
+    _migrate_composite_score()
+    _migrate_live_recommendation()
+    _migrate_metrics_quarantine()
+    _migrate_fixture_game_date_ct()
+    _migrate_devig_columns()
+    _migrate_cohort_column()
+    # market_eligibility_overrides, BetPatternSignal, PendingMarketAction, PlayerProjection
+    # are new tables — created by create_all above, no ALTER needed.
     print(f"[DB] Initialized at {DB_PATH}")
     # New tables are created by Base.metadata.create_all above (LegHistoricalResolution,
-    # RegimeAbLog).  No explicit migration needed — they're new, not additions to old tables.
+    # RegimeAbLog, InjuryReport, LineMovementLog).
+    # No explicit migration needed — they're new, not additions to old tables.

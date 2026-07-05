@@ -190,7 +190,7 @@ def check_retrain_status() -> None:
         RETRAIN_STATE["completed_ct"] = _now_ct_str()
         print(f"[AutoSettle] Retrain ended — no pkl update (AUC gate or no new data)", flush=True)
     RETRAIN_STATE["pid"] = None
-from database import Bet, SettleLog, SchedulerRun, SessionLocal
+from database import Bet, SettleLog, SchedulerRun, SessionLocal, DB_WRITE_LOCK
 
 from odds_api import get_scores, ALL_SPORT_KEYS, ODDS_API_KEY
 from parlay_builder import SPORT_LABEL   # sport_key → label
@@ -210,7 +210,8 @@ SPORT_TO_KEYS = {
     "Soccer":            ["soccer_epl", "soccer_spain_la_liga", "soccer_usa_mls",
                           "soccer_uefa_champs_league", "soccer_germany_bundesliga",
                           "soccer_france_ligue_one", "soccer_italy_serie_a",
-                          "soccer_uefa_europa_league"],
+                          "soccer_uefa_europa_league", "soccer_fifa_world_cup"],
+    "World Cup":         ["soccer_fifa_world_cup"],
     "EPL":               ["soccer_epl"],
     "La Liga":           ["soccer_spain_la_liga"],
     "UCL":               ["soccer_uefa_champs_league"],
@@ -241,6 +242,8 @@ def _team_match(pick: str, home: str, away: str, threshold: float = 0.55) -> Opt
     Returns 'home', 'away', or None.
     Uses difflib ratio for fuzzy matching to handle
     'NY Knicks' vs 'New York Knicks', city-only names, etc.
+    Also does word-level matching to handle cases like
+    'Rennes' vs 'Stade Rennais' or 'Athletic Bilbao' vs 'Athletic Club'.
     """
     p = _normalise(pick)
     h = _normalise(home)
@@ -252,9 +255,18 @@ def _team_match(pick: str, home: str, away: str, threshold: float = 0.55) -> Opt
     if p == a or p in a or a in p:
         return "away"
 
-    # Fuzzy ratio
-    h_ratio = difflib.SequenceMatcher(None, p, h).ratio()
-    a_ratio = difflib.SequenceMatcher(None, p, a).ratio()
+    def _best_ratio(pick_str: str, full_str: str) -> float:
+        """Max of full-string ratio and best single-word ratio."""
+        full = difflib.SequenceMatcher(None, pick_str, full_str).ratio()
+        words = full_str.split()
+        word_best = max(
+            (difflib.SequenceMatcher(None, pick_str, w).ratio() for w in words),
+            default=0.0,
+        )
+        return max(full, word_best)
+
+    h_ratio = _best_ratio(p, h)
+    a_ratio = _best_ratio(p, a)
 
     if h_ratio >= threshold and h_ratio > a_ratio:
         return "home"
@@ -270,13 +282,51 @@ _score_cache: dict[str, tuple[list, datetime]] = {}
 CACHE_TTL_MINUTES = 15
 
 
-def _fetch_scores_cached(sport_key: str, days_from: int = 3) -> list[dict]:
-    """Cache score fetches per sport_key to avoid hammering the API."""
+def _fetch_scores_cached(sport_key: str, days_from: int = 7) -> list[dict]:
+    """
+    Fetch completed game scores for `sport_key` over the last `days_from` days.
+
+    Three-tier strategy:
+      1. ESPN Scoreboard API — free, no auth, covers all regular-season games.
+         Returns OddsAPI-compatible format from espn_scores.fetch_scores_free().
+      2. OddsAPI /scores — paid fallback only if ESPN returns nothing.
+         Preserves original fixture IDs for exact pinning in _settle_mock_leg.
+      3. TheSportsDB eventspastleague — free last resort for end-of-season
+         playoff/barrage games that ESPN and OddsAPI stop serving once the
+         regular season calendar closes (e.g. Ligue 1 relegation barrage).
+
+    Cache TTL: 15 minutes (shared across all sources).
+    """
     now = datetime.utcnow()
     cached = _score_cache.get(sport_key)
     if cached and (now - cached[1]).total_seconds() < CACHE_TTL_MINUTES * 60:
         return cached[0]
-    scores = get_scores(sport_key, days_from=days_from)
+
+    # 1. ESPN Scoreboard API (free, covers regular-season games)
+    try:
+        from espn_scores import fetch_scores_free as _espn_fetch
+        scores = _espn_fetch(sport_key, days_from=days_from)
+    except Exception:
+        scores = []
+
+    # 2. OddsAPI /scores — paid fallback, preserves original fixture IDs
+    if not scores:
+        try:
+            scores = get_scores(sport_key, days_from=days_from)
+        except Exception:
+            scores = []
+
+    # 3. TheSportsDB — last resort for end-of-season playoff/barrage games
+    #    that ESPN and OddsAPI stop serving after the regular season closes.
+    #    Returns only the most recent ~5 events per league, so only useful
+    #    when both primary sources are empty.
+    if not scores:
+        try:
+            from espn_scores import fetch_thesportsdb_scores as _tsdb_fetch
+            scores = _tsdb_fetch(sport_key, days_from=days_from)
+        except Exception:
+            scores = []
+
     _score_cache[sport_key] = (scores, now)
     return scores
 
@@ -500,7 +550,8 @@ def _backfill_cash_out_decisions(db: Session) -> None:
         except Exception:
             pass
 
-    db.commit()
+    with DB_WRITE_LOCK:
+        db.commit()
 
 
 # ─── Main settle runner ───────────────────────────────────────────────────────
@@ -624,7 +675,8 @@ def _settle_scout_props(db: Session, days_back: int = 3) -> int:
             """), {"hit": actual_hit, "val": actual_value, "pid": prop_id})
             settled += 1
 
-        db.commit()
+        with DB_WRITE_LOCK:
+            db.commit()
         if settled:
             print(f"[AutoSettle] Settled {settled} scouted props")
         return settled
@@ -724,7 +776,8 @@ def run_auto_settle(
 
     for log in settle_logs:
         db.add(log)
-    db.commit()
+    with DB_WRITE_LOCK:
+        db.commit()
 
     # ── Retrospective cash-out analysis ───────────────────────────────────────
     # For every bet that was cashed out AND has now settled via the score lookup
@@ -806,7 +859,8 @@ def run_auto_settle(
         duration_secs = duration,
     )
     db.add(run)
-    db.commit()
+    with DB_WRITE_LOCK:
+        db.commit()
 
     return {
         "bets_checked":         len(placed_bets),
