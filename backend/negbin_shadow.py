@@ -381,11 +381,72 @@ def _assemble_fav_home_carveout(candidates, odds_bands, cell_boost):
     return parlays
 
 
-def generate_negbin_shadow_picks(db=None, today_str=None):
+def _fit_wp_calibration():
+    """Fit isotonic WP recalibration from settled Shadow A legs.
+
+    Uses settled shadow_negbin legs (negbin_wp → leg_result) to learn the
+    WP→cover mapping.  Returns a callable wp_transform(raw_wp) → calibrated_wp,
+    or None if insufficient data (< 500 settled legs).
+    """
+    try:
+        from sklearn.isotonic import IsotonicRegression
+    except ImportError:
+        print("[negbin-recal] sklearn not available, skipping calibration")
+        return None
+
+    try:
+        con = sqlite3.connect(_BETS_DB, timeout=15)
+        rows = con.execute("""
+            SELECT mbl.negbin_wp, mbl.leg_result
+            FROM mock_bet_legs mbl
+            JOIN mock_bets mb ON mb.id = mbl.mock_bet_id
+            WHERE mb.source = 'shadow_negbin'
+              AND mbl.leg_result IN ('WIN', 'LOSS')
+              AND mbl.negbin_wp IS NOT NULL
+              AND mb.cohort = 'clean'
+        """).fetchall()
+        con.close()
+    except Exception as e:
+        print(f"[negbin-recal] DB error: {e}")
+        return None
+
+    if len(rows) < 500:
+        print(f"[negbin-recal] Only {len(rows)} settled legs — need 500+, skipping")
+        return None
+
+    wps = np.array([r[0] for r in rows], dtype=float)
+    covers = np.array([1.0 if r[1] == "WIN" else 0.0 for r in rows], dtype=float)
+
+    iso = IsotonicRegression(y_min=0.01, y_max=0.99, out_of_bounds="clip")
+    iso.fit(wps, covers)
+
+    # Log the mapping for transparency
+    print(f"[negbin-recal] Isotonic fit on {len(rows)} settled legs")
+    for probe in [0.55, 0.65, 0.75, 0.85, 0.95]:
+        cal = float(iso.predict([probe])[0])
+        print(f"[negbin-recal]   WP {probe:.2f} → {cal:.3f} ({cal-probe:+.3f})")
+
+    def wp_transform(raw_wp):
+        return float(iso.predict([raw_wp])[0])
+
+    return wp_transform
+
+
+def generate_negbin_shadow_picks(db=None, today_str=None,
+                                 wp_transform=None, source_tag="shadow_negbin",
+                                 fixtures=None):
     """Generate NegBin shadow picks for today.
 
     Returns list of shadow parlay dicts, each with legs, odds, band, cell info.
-    Also stores them as MockBet/MockBetLeg with source='shadow_negbin'.
+    Also stores them as MockBet/MockBetLeg with source=source_tag.
+
+    Args:
+        wp_transform: Optional callable(raw_wp) → calibrated_wp. When provided,
+            all WP-based decisions (gate, edge, LOS, combo scoring) use the
+            calibrated value. Used by Shadow B (recalibrated) variant.
+        source_tag: DB source tag for stored parlays. Default 'shadow_negbin' (A).
+        fixtures: Optional pre-fetched fixture list. When provided, skips
+            _get_todays_fixtures() — guarantees A/B see the exact same slate.
     """
     from negbin_model import load_negbin_model, _simulate_margins
     from ml_model import _get_feature_matrix
@@ -395,11 +456,12 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
     if today_str is None:
         today_str = datetime.now(_CT).strftime("%Y-%m-%d")
 
-    print(f"\n[negbin-shadow] Generating shadow picks for {today_str}")
+    tag_label = "recal" if source_tag == "shadow_negbin_recal" else "shadow"
+    print(f"\n[negbin-{tag_label}] Generating {tag_label} picks for {today_str}")
 
     model = load_negbin_model()
     if model is None:
-        print("[negbin-shadow] ERROR: NegBin model not found")
+        print(f"[negbin-{tag_label}] ERROR: NegBin model not found")
         return []
 
     gbm_home = model["gbm_home"]
@@ -409,17 +471,18 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
     # Get feature matrix (cached, same as live pipeline)
     matrix = _get_feature_matrix("MLB")
     if matrix.empty:
-        print("[negbin-shadow] ERROR: empty feature matrix")
+        print(f"[negbin-{tag_label}] ERROR: empty feature matrix")
         return []
 
     matrix["_gd"] = matrix["game_date"].astype(str).str[:10]
 
-    fixtures = _get_todays_fixtures(today_str)
+    if fixtures is None:
+        fixtures = _get_todays_fixtures(today_str)
     if not fixtures:
-        print(f"[negbin-shadow] No MLB fixtures for {today_str}")
+        print(f"[negbin-{tag_label}] No MLB fixtures for {today_str}")
         return []
 
-    print(f"[negbin-shadow] {len(fixtures)} MLB fixtures")
+    print(f"[negbin-{tag_label}] {len(fixtures)} MLB fixtures")
 
     # ── Generate candidates ──
     candidates = []
@@ -461,14 +524,15 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
         p_blow = float(np.mean(np.abs(margins) >= 5))
         blow_suppress = p_blow >= 0.50  # extreme zone only
         if blow_suppress:
-            print(f"[negbin-shadow] {home} v {away}: P(blow)={p_blow:.1%} ≥50% — suppressing +1.5/+2.5")
+            print(f"[negbin-{tag_label}] {home} v {away}: P(blow)={p_blow:.1%} ≥50% — suppressing +1.5/+2.5")
 
         for sv in LIVE_RUNGS:
             # Extreme-zone filter: skip tight rungs for high-blowout fixtures
             if blow_suppress and sv <= 2.5:
                 continue
             # Home side
-            home_wp = float(np.mean(margins > -sv))
+            home_wp_raw = float(np.mean(margins > -sv))
+            home_wp = wp_transform(home_wp_raw) if wp_transform else home_wp_raw
             mkt_home, dec_odds_home = _get_market_implied(home, away, today_str, sv, "home")
             if mkt_home is not None and home_wp >= NEGBIN_GATE and mkt_home >= MKT_IMPLIED_FLOOR:
                 edge = (home_wp - mkt_home) * 100.0
@@ -502,7 +566,8 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
                     })
 
             # Away side
-            away_wp = float(np.mean(margins < sv))
+            away_wp_raw = float(np.mean(margins < sv))
+            away_wp = wp_transform(away_wp_raw) if wp_transform else away_wp_raw
             mkt_away, dec_odds_away = _get_market_implied(home, away, today_str, sv, "away")
             if mkt_away is not None and away_wp >= NEGBIN_GATE and mkt_away >= MKT_IMPLIED_FLOOR:
                 edge = (away_wp - mkt_away) * 100.0
@@ -534,7 +599,7 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
                         "commence_time": fix["commence_time"],
                     })
 
-    print(f"[negbin-shadow] {len(candidates)} candidates "
+    print(f"[negbin-{tag_label}] {len(candidates)} candidates "
           f"(Home: {sum(1 for c in candidates if c['pick_side']=='home')}, "
           f"Away: {sum(1 for c in candidates if c['pick_side']=='away')})")
 
@@ -545,7 +610,7 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
     cell_counts = defaultdict(int)
     for c in candidates:
         cell_counts[c["cell"]] += 1
-    print(f"[negbin-shadow] Cells: {dict(cell_counts)}")
+    print(f"[negbin-{tag_label}] Cells: {dict(cell_counts)}")
 
     # ── Assemble parlays ──
     # Design: LEG-LEVEL capped reuse, matching live's construction rules.
@@ -654,7 +719,7 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
                 any_progress = True
                 break  # one per band per round
 
-    print(f"[negbin-shadow] {len(parlays)} shadow parlays assembled "
+    print(f"[negbin-{tag_label}] {len(parlays)} {tag_label} parlays assembled "
           f"(from {len(all_scored)} scored combos, pool={pool_cap})")
 
     # ── Band distribution + underfill diagnostic ──
@@ -662,8 +727,8 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
     for p in parlays:
         band_counts[p["odds_band"]] += 1
     avail_counts = {b: len(v) for b, v in band_buckets.items() if v}
-    print(f"[negbin-shadow] Bands selected: {dict(band_counts)}")
-    print(f"[negbin-shadow] Bands available: {avail_counts}")
+    print(f"[negbin-{tag_label}] Bands selected: {dict(band_counts)}")
+    print(f"[negbin-{tag_label}] Bands available: {avail_counts}")
 
     # Underfill diagnostic: distinguish leg-consumption vs no-constructable-parlays
     for band_label, _, _ in ODDS_BANDS:
@@ -678,7 +743,7 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
         else:
             # Partially filled: some combos worked, rest hit cap
             reason = f"LEG_CONSUMPTION — {avail} combos exist, {filled}/{PER_BAND_TARGET} filled before legs capped"
-        print(f"[negbin-shadow]   {band_label} underfill: {reason}")
+        print(f"[negbin-{tag_label}]   {band_label} underfill: {reason}")
 
     # Leg reuse stats
     leg_dist = defaultdict(int)
@@ -688,7 +753,7 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
     for cnt in leg_use.values():
         reuse_hist[cnt] += 1
     at_cap = sum(1 for cnt in leg_use.values() if cnt >= _MAX_LEG_APP)
-    print(f"[negbin-shadow] Leg counts: {dict(leg_dist)} | "
+    print(f"[negbin-{tag_label}] Leg counts: {dict(leg_dist)} | "
           f"reuse histogram: {dict(sorted(reuse_hist.items()))} | "
           f"at cap ({_MAX_LEG_APP}x): {at_cap}")
 
@@ -698,7 +763,7 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
         away_cands = [c for c in candidates if c["pick_side"] == "away"]
         h_edge = np.mean([c["edge_pp"] for c in home_cands]) if home_cands else 0
         a_edge = np.mean([c["edge_pp"] for c in away_cands]) if away_cands else 0
-        print(f"[negbin-shadow] Home edge: {h_edge:+.1f}pp, Away edge: {a_edge:+.1f}pp")
+        print(f"[negbin-{tag_label}] Home edge: {h_edge:+.1f}pp, Away edge: {a_edge:+.1f}pp")
 
     # ── Live-realistic subset ──
     # Re-select from scored combos using live's structural constraints:
@@ -712,7 +777,7 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
         p["live_realistic"] = 1 if bet_key in live_real_keys else 0
 
     lr_count = sum(1 for p in parlays if p["live_realistic"])
-    print(f"[negbin-shadow] live-realistic subset: {lr_count} of {len(parlays)} parlays")
+    print(f"[negbin-{tag_label}] live-realistic subset: {lr_count} of {len(parlays)} parlays")
 
     # ── Fav@Home carved-out allocation ──
     # Separate assembly from fav_home candidates ONLY.
@@ -721,12 +786,41 @@ def generate_negbin_shadow_picks(db=None, today_str=None):
 
     # ── Store as MockBet/MockBetLeg ──
     if db is not None and parlays:
-        _store_shadow_parlays(db, parlays, today_str)
+        _store_shadow_parlays(db, parlays, today_str, source_tag=source_tag)
     if db is not None and fh_parlays:
-        _store_shadow_parlays(db, fh_parlays, today_str,
-                              source_tag="shadow_negbin_fh")
+        fh_tag = f"{source_tag}_fh"
+        _store_shadow_parlays(db, fh_parlays, today_str, source_tag=fh_tag)
 
     return parlays
+
+
+def generate_negbin_recal_shadow_picks(db=None, today_str=None, fixtures=None):
+    """Shadow B: same NegBin model with isotonic WP recalibration.
+
+    Parallel to Shadow A (uncalibrated). Identical model, features, gate logic,
+    construction — ONLY the WP calibration differs. Tagged as
+    source='shadow_negbin_recal' for clean A/B comparison on the same slates.
+
+    Args:
+        fixtures: Pre-fetched fixture list from Shadow A's run. Guarantees
+            both shadows see the exact same slate (no timing divergence).
+    """
+    if today_str is None:
+        today_str = datetime.now(_CT).strftime("%Y-%m-%d")
+
+    # Snapshot fixtures once so A and B see identical slates
+    if fixtures is None:
+        fixtures = _get_todays_fixtures(today_str)
+
+    cal = _fit_wp_calibration()
+    if cal is None:
+        print("[negbin-recal] No calibration available — Shadow B skipped")
+        return []
+    return generate_negbin_shadow_picks(
+        db=db, today_str=today_str,
+        wp_transform=cal, source_tag="shadow_negbin_recal",
+        fixtures=fixtures,
+    )
 
 
 def _store_shadow_parlays(db, parlays, today_str, source_tag="shadow_negbin"):
@@ -1073,8 +1167,22 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "report":
         days = int(sys.argv[2]) if len(sys.argv) > 2 else 30
         report_forward_tracking(days)
+    elif len(sys.argv) > 1 and sys.argv[1] == "recal":
+        # Generate Shadow B (recalibrated) picks
+        from database import SessionLocal
+        db = SessionLocal()
+        try:
+            picks = generate_negbin_recal_shadow_picks(db)
+            if picks:
+                print(f"\n[negbin-recal] Summary:")
+                for i, p in enumerate(picks):
+                    legs_desc = " + ".join(f"{l['pick_team']} +{l['spread_value']}" for l in p["legs"])
+                    print(f"  #{i+1}: {legs_desc} | odds={p['combined_odds']:.3f} "
+                          f"| band={p['odds_band']} | cell_adj={p['cell_adj']}")
+        finally:
+            db.close()
     else:
-        # Generate shadow picks for today
+        # Generate Shadow A (uncalibrated) picks
         from database import SessionLocal
         db = SessionLocal()
         try:

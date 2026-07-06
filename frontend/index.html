@@ -2284,6 +2284,12 @@ Rockets +4.5  Alt Spread  -950"
         <button onclick="setNbCohort('prospective_legacy')" id="nb-coh-legacy" style="padding:4px 10px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Legacy</button>
         <button onclick="setNbCohort('all')" id="nb-coh-all" style="padding:4px 10px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">All</button>
       </div>
+      <!-- Shadow source: A (control) vs B (recalibrated) -->
+      <div id="nb-source-filter" style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;font-size:11px">
+        <button onclick="setNbSource('shadow_a')" id="nb-src-a" style="padding:4px 10px;background:var(--blue);color:#fff;border:none;cursor:pointer">A (control)</button>
+        <button onclick="setNbSource('shadow_b')" id="nb-src-b" style="padding:4px 10px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">B (recal)</button>
+        <button onclick="setNbSource('all')" id="nb-src-all" style="padding:4px 10px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Both</button>
+      </div>
       <!-- View toggle: Measurement vs Live-realistic -->
       <div id="nb-view-filter" style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;font-size:11px">
         <button onclick="setNbView('measurement')" id="nb-view-meas" style="padding:4px 10px;background:var(--blue);color:#fff;border:none;cursor:pointer">Measurement</button>
@@ -13659,6 +13665,7 @@ async function adminSubmitParsed(btn) {
 // ── NegBin Shadow Tracker ──────────────────────────────────────────────────
 var _nbCohort = 'clean';
 var _nbView = 'measurement';  // 'measurement' or 'live_realistic'
+var _nbSource = 'shadow_a';   // 'shadow_a', 'shadow_b', 'all'
 var _nbData = null;  // cached API response
 
 function setNbCohort(c) {
@@ -13667,6 +13674,17 @@ function setNbCohort(c) {
     b.style.background = 'var(--surface2)'; b.style.color = 'var(--text)';
   });
   const active = document.getElementById('nb-coh-' + (c === 'prospective_legacy' ? 'legacy' : c));
+  if (active) { active.style.background = 'var(--blue)'; active.style.color = '#fff'; }
+  loadNegbin();
+}
+
+function setNbSource(s) {
+  _nbSource = s;
+  document.querySelectorAll('#nb-source-filter button').forEach(b => {
+    b.style.background = 'var(--surface2)'; b.style.color = 'var(--text)';
+  });
+  const btnId = s === 'shadow_a' ? 'nb-src-a' : s === 'shadow_b' ? 'nb-src-b' : 'nb-src-all';
+  const active = document.getElementById(btnId);
   if (active) { active.style.background = 'var(--blue)'; active.style.color = '#fff'; }
   loadNegbin();
 }
@@ -13688,7 +13706,7 @@ async function loadNegbin() {
     if (el) el.innerHTML = '<div class="loading">Loading...</div>';
   });
   try {
-    _nbData = await apiFetch(`/api/negbin/tracker?days=${days}&cohort=${_nbCohort}&view=${_nbView}`);
+    _nbData = await apiFetch(`/api/negbin/tracker?days=${days}&cohort=${_nbCohort}&view=${_nbView}&source=${_nbSource}`);
     renderNbStatus();
     renderNbBands();
     renderNbCells();
@@ -13708,8 +13726,11 @@ function renderNbStatus() {
   const cohortLabel = _nbCohort === 'clean' ? 'Clean (forward eval)' :
                       _nbCohort === 'prospective_legacy' ? 'Legacy (pre-clean)' : 'All';
   const viewLabel = _nbView === 'live_realistic' ? 'Live-Realistic' : 'Measurement';
+  const sourceLabel = _nbSource === 'shadow_a' ? 'Shadow A (control)' :
+                      _nbSource === 'shadow_b' ? 'Shadow B (recal)' : 'Both A+B';
   strip.innerHTML = `
-    <span>Cohort: <strong>${cohortLabel}</strong> |
+    <span>Source: <strong>${sourceLabel}</strong> |
+    Cohort: <strong>${cohortLabel}</strong> |
     View: <strong>${viewLabel}</strong> |
     ${d.settled_count} settled, ${d.pending_count} pending |
     Status: <span style="color:${statusColor};font-weight:600">${d.status}</span>

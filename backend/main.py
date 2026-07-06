@@ -6671,7 +6671,8 @@ def list_mock_bets(
         "exploration": ["exploration"],
         "simulation":  ["simulation"],
         "retro":       ["retroactive_mock"],
-        "shadow":      ["shadow_negbin", "shadow_negbin_fh", "shadow_negbin_excluded"],
+        "shadow":      ["shadow_negbin", "shadow_negbin_fh", "shadow_negbin_excluded",
+                        "shadow_negbin_recal", "shadow_negbin_recal_fh"],
     }
     if source:
         src_list = _SOURCE_GROUPS.get(source)
@@ -9607,22 +9608,37 @@ def _negbin_view_filter(view: str) -> str:
     return ""  # "measurement" — no filter, show all
 
 
+def _negbin_source_filter(source: str) -> str:
+    """Filter by shadow source for A/B comparison."""
+    if source == "shadow_a":
+        return "AND mb.source = 'shadow_negbin'"
+    if source == "shadow_b":
+        return "AND mb.source = 'shadow_negbin_recal'"
+    # "all" — both A and B
+    return "AND mb.source IN ('shadow_negbin', 'shadow_negbin_recal')"
+
+
 @app.get("/api/negbin/tracker")
 def negbin_tracker(
     days: int = Query(30, ge=1, le=365),
     cohort: str = Query("clean"),
     view: str = Query("measurement"),
+    source: str = Query("shadow_a"),
 ):
     """
     Comprehensive NegBin shadow pipeline tracker.
     Returns band-for-band stats, 2x2 cell performance, parlay structure,
     daily stats, per-parlay drill-down, and overall status.
+
+    source: 'shadow_a' (uncalibrated control), 'shadow_b' (recalibrated),
+            'all' (both combined).
     """
     import sqlite3 as _sq3
     from collections import defaultdict as _dd
 
     cohort_filter = _negbin_cohort_filter(cohort)
     view_filter = _negbin_view_filter(view)
+    source_filter = _negbin_source_filter(source)
 
     con = _negbin_db_connect()
     cur = con.cursor()
@@ -9646,8 +9662,8 @@ def negbin_tracker(
                GROUP_CONCAT(mbl.sport, ',')          AS leg_sports
         FROM mock_bets mb
         JOIN mock_bet_legs mbl ON mbl.mock_bet_id = mb.id
-        WHERE mb.source = 'shadow_negbin'
-          AND mb.game_date >= date('now', '-' || ? || ' days')
+        WHERE mb.game_date >= date('now', '-' || ? || ' days')
+          {source_filter}
           {cohort_filter}
           {view_filter}
         GROUP BY mb.id
@@ -9679,8 +9695,8 @@ def negbin_tracker(
                mbl.fixture_id
         FROM mock_bet_legs mbl
         JOIN mock_bets mb ON mb.id = mbl.mock_bet_id
-        WHERE mb.source = 'shadow_negbin'
-          AND mb.game_date >= date('now', '-' || ? || ' days')
+        WHERE mb.game_date >= date('now', '-' || ? || ' days')
+          {source_filter}
           {cohort_filter}
           {view_filter}
         ORDER BY mbl.id
@@ -10053,7 +10069,7 @@ def negbin_tracker(
                    GROUP_CONCAT(mbl.description, '||') AS leg_descs
             FROM mock_bets mb
             JOIN mock_bet_legs mbl ON mbl.mock_bet_id = mb.id
-            WHERE mb.source = 'shadow_negbin_fh'
+            WHERE mb.source IN ('shadow_negbin_fh'{", 'shadow_negbin_recal_fh'" if source != "shadow_a" else ""})
               AND mb.game_date >= date('now', '-' || ? || ' days')
             GROUP BY mb.id
         """
@@ -10078,7 +10094,7 @@ def negbin_tracker(
         pass
 
     return {
-        "filters": {"days": days, "cohort": cohort, "view": view},
+        "filters": {"days": days, "cohort": cohort, "view": view, "source": source},
         "bands": bands_out,
         "nb_total": {
             "n": nb_total_n, "wins": nb_total_wins,
@@ -10125,7 +10141,7 @@ def negbin_parlay_detail(parlay_id: str):
         FROM mock_bets mb
         JOIN mock_bet_legs mbl ON mbl.mock_bet_id = mb.id
         WHERE mb.id = ?
-          AND mb.source = 'shadow_negbin'
+          AND mb.source IN ('shadow_negbin', 'shadow_negbin_recal')
         GROUP BY mb.id
     """, (parlay_id,))
     row = cur.fetchone()

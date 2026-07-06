@@ -93,6 +93,9 @@ _scheduler_state = {
     # NegBin shadow AM — standalone, runs AFTER alt_lines_morning completes
     "last_negbin_shadow_am":                  None,
     "last_negbin_shadow_am_result":           None,
+    # NegBin Shadow B (recalibrated) — parallel A/B, runs AFTER Shadow A
+    "last_negbin_recal_shadow_am":            None,
+    "last_negbin_recal_shadow_am_result":     None,
     # Weekly personal edge profile refresh (Sunday 9 AM CT)
     "last_personal_edge_refresh":        None,
     "last_personal_edge_refresh_result": None,
@@ -1493,12 +1496,20 @@ def _run_afternoon_mock_generate() -> dict:
             except Exception as _sims_exc:
                 result["daily_sims"] = {"error": str(_sims_exc)}
                 print(f"[Scheduler] PM daily sims error: {_sims_exc}")
-            # NegBin shadow PM refresh (updated odds → updated candidates)
+            # NegBin shadow PM refresh — A + B on same fixture snapshot
             try:
-                from negbin_shadow import generate_negbin_shadow_picks as _nb_shadow
-                _nb_result = _nb_shadow(db)
+                from negbin_shadow import (
+                    generate_negbin_shadow_picks as _nb_shadow,
+                    generate_negbin_recal_shadow_picks as _nb_recal,
+                    _get_todays_fixtures as _nb_fixtures,
+                )
+                _pm_fixtures = _nb_fixtures(today_str)
+                _nb_result = _nb_shadow(db, fixtures=_pm_fixtures)
                 result["negbin_shadow_pm"] = {"generated": len(_nb_result)}
-                print(f"[Scheduler] PM NegBin shadow: {len(_nb_result)} parlays")
+                print(f"[Scheduler] PM NegBin shadow A: {len(_nb_result)} parlays")
+                _nb_recal_result = _nb_recal(db, fixtures=_pm_fixtures)
+                result["negbin_recal_shadow_pm"] = {"generated": len(_nb_recal_result)}
+                print(f"[Scheduler] PM NegBin shadow B: {len(_nb_recal_result)} parlays")
             except Exception as _nb_exc:
                 result["negbin_shadow_pm"] = {"error": str(_nb_exc)}
                 print(f"[Scheduler] PM NegBin shadow error: {_nb_exc}")
@@ -1963,17 +1974,43 @@ def _should_run_negbin_shadow_am() -> bool:
 
 
 def _run_negbin_shadow_am() -> dict:
-    """Generate NegBin shadow picks for today (AM pass, post-alt-lines)."""
+    """Generate NegBin shadow picks for today (AM pass, post-alt-lines).
+
+    Runs BOTH Shadow A (uncalibrated) and Shadow B (recalibrated) on the
+    exact same fixture snapshot — guarantees identical slates for A/B comparison.
+    """
     try:
         from database import SessionLocal, init_db
-        from negbin_shadow import generate_negbin_shadow_picks
+        from negbin_shadow import (
+            generate_negbin_shadow_picks,
+            generate_negbin_recal_shadow_picks,
+            _get_todays_fixtures,
+        )
+        from datetime import datetime as _dt
         init_db()
         db = SessionLocal()
         try:
-            result = generate_negbin_shadow_picks(db)
-            count = len(result) if result else 0
-            print(f"[Scheduler] NegBin shadow AM (post-alt-lines): {count} parlays")
-            return {"generated": count}
+            today_str = _dt.now(_CT).strftime("%Y-%m-%d")
+
+            # Snapshot fixtures ONCE — both shadows see the exact same slate
+            fixtures = _get_todays_fixtures(today_str)
+
+            # Shadow A (uncalibrated control)
+            result_a = generate_negbin_shadow_picks(db, today_str=today_str,
+                                                     fixtures=fixtures)
+            count_a = len(result_a) if result_a else 0
+            print(f"[Scheduler] NegBin shadow A AM: {count_a} parlays")
+
+            # Shadow B (recalibrated) — same fixtures, same slate
+            result_b = generate_negbin_recal_shadow_picks(db, today_str=today_str,
+                                                           fixtures=fixtures)
+            count_b = len(result_b) if result_b else 0
+            print(f"[Scheduler] NegBin shadow B AM: {count_b} parlays")
+
+            # Stamp Shadow B as done too
+            _scheduler_state["last_negbin_recal_shadow_am"] = today_str
+
+            return {"shadow_a": count_a, "shadow_b": count_b}
         finally:
             db.close()
     except Exception as exc:
@@ -3111,6 +3148,7 @@ def _loop(interval_mins: int, auto_retrain: bool):
         # _dispatch is synchronous: alt_lines_morning blocks until done, so this line
         # only executes after the fetch has returned and state is stamped.
         _dispatch("negbin_shadow_am",    _should_run_negbin_shadow_am,      _run_negbin_shadow_am,          "last_negbin_shadow_am", use_now_utc=False)
+        # Shadow B (recalibrated) stamped inside _run_negbin_shadow_am — same fixture snapshot
         # 10:45 AM CT near-close for day/getaway games (standalone — no downstream chain)
         _dispatch("alt_lines_getaway",   _should_run_alt_lines_getaway,     _run_alt_lines_fetch,           "last_alt_lines_fetch_getaway")
         # alt_lines_afternoon moved into AFTERNOON_CHAIN (runs before pm_mock_generate)
