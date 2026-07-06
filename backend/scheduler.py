@@ -96,6 +96,9 @@ _scheduler_state = {
     # NegBin Shadow B (recalibrated) — parallel A/B, runs AFTER Shadow A
     "last_negbin_recal_shadow_am":            None,
     "last_negbin_recal_shadow_am_result":     None,
+    # ATS ungated shadow — scores ALL MLB spread legs (no gates) for discrimination analysis
+    "last_ats_ungated_shadow":                None,
+    "last_ats_ungated_shadow_result":         None,
     # Weekly personal edge profile refresh (Sunday 9 AM CT)
     "last_personal_edge_refresh":        None,
     "last_personal_edge_refresh_result": None,
@@ -1513,6 +1516,15 @@ def _run_afternoon_mock_generate() -> dict:
             except Exception as _nb_exc:
                 result["negbin_shadow_pm"] = {"error": str(_nb_exc)}
                 print(f"[Scheduler] PM NegBin shadow error: {_nb_exc}")
+            # ATS ungated shadow PM refresh
+            try:
+                from ats_ungated_shadow import generate_ungated_shadow as _ats_ug
+                _ats_result = _ats_ug(db)
+                result["ats_ungated_pm"] = {"legs_scored": len(_ats_result) if _ats_result else 0}
+                print(f"[Scheduler] PM ATS ungated: {len(_ats_result) if _ats_result else 0} legs")
+            except Exception as _ats_exc:
+                result["ats_ungated_pm"] = {"error": str(_ats_exc)}
+                print(f"[Scheduler] PM ATS ungated error: {_ats_exc}")
         finally:
             db.close()
         generated = result.get("generated", 0)
@@ -2015,6 +2027,38 @@ def _run_negbin_shadow_am() -> dict:
             db.close()
     except Exception as exc:
         print(f"[Scheduler] NegBin shadow AM error: {exc}")
+        return {"error": str(exc)}
+
+
+# ── ATS ungated shadow — scores ALL MLB spread legs (no gates) ──
+
+def _should_run_ats_ungated_shadow() -> bool:
+    """True if alt_lines_morning completed today and ungated shadow hasn't run."""
+    ct = _now_ct()
+    today_str = ct.strftime("%Y-%m-%d")
+    if _scheduler_state.get("last_ats_ungated_shadow") == today_str:
+        return False
+    if _scheduler_state.get("last_alt_lines_fetch_morning") != today_str:
+        return False
+    return True
+
+
+def _run_ats_ungated_shadow() -> dict:
+    """Score all MLB spread legs through ATS model with no gates."""
+    try:
+        from database import SessionLocal, init_db
+        from ats_ungated_shadow import generate_ungated_shadow
+        init_db()
+        db = SessionLocal()
+        try:
+            legs = generate_ungated_shadow(db)
+            count = len(legs) if legs else 0
+            print(f"[Scheduler] ATS ungated shadow: {count} legs scored")
+            return {"legs_scored": count}
+        finally:
+            db.close()
+    except Exception as exc:
+        print(f"[Scheduler] ATS ungated shadow error: {exc}")
         return {"error": str(exc)}
 
 
@@ -3149,6 +3193,8 @@ def _loop(interval_mins: int, auto_retrain: bool):
         # only executes after the fetch has returned and state is stamped.
         _dispatch("negbin_shadow_am",    _should_run_negbin_shadow_am,      _run_negbin_shadow_am,          "last_negbin_shadow_am", use_now_utc=False)
         # Shadow B (recalibrated) stamped inside _run_negbin_shadow_am — same fixture snapshot
+        # ATS ungated shadow — scores ALL MLB spread legs (no gates) for discrimination analysis
+        _dispatch("ats_ungated_shadow", _should_run_ats_ungated_shadow, _run_ats_ungated_shadow, "last_ats_ungated_shadow", use_now_utc=False)
         # 10:45 AM CT near-close for day/getaway games (standalone — no downstream chain)
         _dispatch("alt_lines_getaway",   _should_run_alt_lines_getaway,     _run_alt_lines_fetch,           "last_alt_lines_fetch_getaway")
         # alt_lines_afternoon moved into AFTERNOON_CHAIN (runs before pm_mock_generate)

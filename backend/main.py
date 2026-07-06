@@ -6673,6 +6673,7 @@ def list_mock_bets(
         "retro":       ["retroactive_mock"],
         "shadow":      ["shadow_negbin", "shadow_negbin_fh", "shadow_negbin_excluded",
                         "shadow_negbin_recal", "shadow_negbin_recal_fh"],
+        "ats_ungated": ["ats_ungated"],
     }
     if source:
         src_list = _SOURCE_GROUPS.get(source)
