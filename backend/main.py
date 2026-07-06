@@ -10199,3 +10199,291 @@ def negbin_parlay_detail(parlay_id: str):
         "pnl": pnl,
         "legs": legs_out,
     }
+
+
+@app.get("/api/ats-ungated/tracker")
+def ats_ungated_tracker(
+    days: int = Query(30, ge=1, le=365),
+    cohort: str = Query("clean"),
+):
+    """
+    ATS ungated shadow tracker.
+    Returns per-rung stats, score-bucket breakdown, rung×bucket cross-tab,
+    calibration bins, and full leg list for the ats_ungated shadow source.
+    """
+    from collections import defaultdict as _dd
+    from datetime import date as _date
+
+    _STAKE = 10.0
+
+    con = _negbin_db_connect()
+    cur = con.cursor()
+
+    sql = """
+        SELECT mb.id, mb.odds, mb.status, mb.game_date, mb.predicted_win_prob,
+               mb.notes, mb.bet_info,
+               mbl.description, mbl.win_prob, mbl.leg_result, mbl.market_type,
+               mbl.fixture_id, mbl.is_alt_line
+        FROM mock_bets mb
+        JOIN mock_bet_legs mbl ON mbl.mock_bet_id = mb.id
+        WHERE mb.source = 'ats_ungated'
+          AND mb.cohort = ?
+          AND mb.game_date >= date('now', '-' || ? || ' days')
+        ORDER BY mb.game_date DESC, mb.id
+    """
+    cur.execute(sql, (cohort, days))
+    raw_rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+
+    # ── Parse each row ───────────────────────────────────────────────────────
+    legs = []
+    for row in raw_rows:
+        # Parse spread/gate from notes
+        notes = row.get("notes") or ""
+        spread_val = None
+        gate_val = None
+        for part in notes.split():
+            if part.startswith("spread="):
+                try:
+                    spread_val = float(part.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif part.startswith("gate="):
+                gate_val = part.split("=", 1)[1]
+
+        side = "fav" if (spread_val is not None and spread_val < 0) else "dog"
+        rung = str(spread_val) if spread_val is not None else "unknown"
+
+        # Win probability (prefer leg-level, fall back to bet-level)
+        wp_raw = row.get("win_prob") or row.get("predicted_win_prob")
+        try:
+            wp = float(wp_raw) if wp_raw is not None else None
+        except (ValueError, TypeError):
+            wp = None
+
+        # Decimal odds and breakeven
+        odds_raw = row.get("odds")
+        try:
+            odds = float(odds_raw) if odds_raw is not None else None
+        except (ValueError, TypeError):
+            odds = None
+        valid_odds = odds is not None and odds > 1.0
+        breakeven = round(1.0 / odds, 6) if valid_odds else None
+
+        # Status / result
+        leg_result = row.get("leg_result")
+        if leg_result == "W":
+            status = "WON"
+        elif leg_result == "L":
+            status = "LOST"
+        else:
+            status = "PENDING"
+
+        legs.append({
+            "id": str(row["id"]),
+            "date": row.get("game_date") or "",
+            "description": row.get("description") or "",
+            "rung": rung,
+            "side": side,
+            "gate": gate_val or "",
+            "wp": wp,
+            "odds": odds,
+            "breakeven": breakeven,
+            "no_odds": not valid_odds,
+            "status": status,
+            "result": leg_result,
+            "spread_val": spread_val,
+        })
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    total = len(legs)
+    settled_legs = [lg for lg in legs if lg["status"] != "PENDING"]
+    pending_legs = [lg for lg in legs if lg["status"] == "PENDING"]
+    won_legs = [lg for lg in legs if lg["status"] == "WON"]
+    lost_legs = [lg for lg in legs if lg["status"] == "LOST"]
+    settled = len(settled_legs)
+    won = len(won_legs)
+    lost = len(lost_legs)
+
+    def _leg_pnl(lg: dict) -> float:
+        if lg["status"] == "WON":
+            odds_v = lg["odds"] if lg["odds"] and lg["odds"] > 1.0 else 2.0
+            return (odds_v - 1.0) * _STAKE
+        if lg["status"] == "LOST":
+            return -_STAKE
+        return 0.0
+
+    total_pnl = sum(_leg_pnl(lg) for lg in settled_legs)
+    roi = round(total_pnl / (settled * _STAKE), 6) if settled else None
+
+    dates = [lg["date"] for lg in legs if lg["date"]]
+    first_date = min(dates) if dates else None
+    days_active = None
+    if first_date:
+        try:
+            fd = _date.fromisoformat(first_date)
+            days_active = (_date.today() - fd).days
+        except Exception:
+            pass
+
+    summary = {
+        "total": total,
+        "settled": settled,
+        "pending": len(pending_legs),
+        "won": won,
+        "lost": lost,
+        "first_date": first_date,
+        "days_active": days_active,
+        "pnl": round(total_pnl, 4),
+        "roi": round(roi, 6) if roi is not None else None,
+    }
+
+    # ── Helper: compute stats for a group of legs ────────────────────────────
+    def _group_stats(group: list) -> dict:
+        n = len(group)
+        grp_settled = [lg for lg in group if lg["status"] != "PENDING"]
+        grp_won = [lg for lg in group if lg["status"] == "WON"]
+        grp_lost = [lg for lg in group if lg["status"] == "LOST"]
+        s = len(grp_settled)
+        w = len(grp_won)
+        pnl = sum(_leg_pnl(lg) for lg in grp_settled)
+        wps = [lg["wp"] for lg in group if lg["wp"] is not None]
+        odds_list = [lg["odds"] for lg in group if lg["odds"] and lg["odds"] > 1.0]
+        be_list = [lg["breakeven"] for lg in group if lg["breakeven"] is not None]
+        no_odds_count = sum(1 for lg in group if lg["no_odds"])
+        avg_wp = round(sum(wps) / len(wps), 6) if wps else None
+        avg_odds = round(sum(odds_list) / len(odds_list), 6) if odds_list else None
+        avg_be = round(sum(be_list) / len(be_list), 6) if be_list else None
+        cover_rate = round(w / s, 6) if s > 0 else None
+        roi_v = round(pnl / (s * _STAKE), 6) if s > 0 else None
+        return {
+            "n": n, "settled": s, "won": w, "lost": len(grp_lost),
+            "avg_wp": avg_wp, "avg_odds": avg_odds, "avg_breakeven": avg_be,
+            "cover_rate": cover_rate, "pnl": round(pnl, 4), "roi": roi_v,
+            "no_odds_count": no_odds_count,
+        }
+
+    # ── By rung ──────────────────────────────────────────────────────────────
+    rung_map: dict = _dd(list)
+    for lg in legs:
+        rung_map[(lg["rung"], lg["side"])].append(lg)
+
+    by_rung = []
+    for (rung_key, side_key) in sorted(rung_map.keys(), key=lambda x: (float(x[0]) if x[0] != "unknown" else 9999)):
+        group = rung_map[(rung_key, side_key)]
+        stats = _group_stats(group)
+        by_rung.append({
+            "rung": rung_key,
+            "side": side_key,
+            **{k: v for k, v in stats.items() if k != "no_odds_count"},
+        })
+
+    # ── Score buckets (quintiles by win_prob) ────────────────────────────────
+    _BUCKET_LABELS = ["Q1 (top)", "Q2", "Q3", "Q4", "Q5 (bottom)"]
+    scored_legs = sorted([lg for lg in legs if lg["wp"] is not None], key=lambda x: -x["wp"])
+    n_scored = len(scored_legs)
+    bucket_assignments: dict = {}
+    if n_scored > 0:
+        bucket_size = n_scored / 5
+        for i, lg in enumerate(scored_legs):
+            bucket_idx = min(int(i / bucket_size), 4)
+            bucket_assignments[lg["id"]] = bucket_idx
+
+    bucket_map: dict = _dd(list)
+    for lg in legs:
+        idx = bucket_assignments.get(lg["id"], 4)
+        bucket_map[idx].append(lg)
+
+    by_score_bucket = []
+    for idx in range(5):
+        group = bucket_map[idx]
+        if not group:
+            continue
+        stats = _group_stats(group)
+        wps_in_bucket = [lg["wp"] for lg in group if lg["wp"] is not None]
+        wp_min = round(min(wps_in_bucket), 1) if wps_in_bucket else None  # already 0-100
+        wp_max = round(max(wps_in_bucket), 1) if wps_in_bucket else None
+        wp_range = f"{wp_min}-{wp_max}" if (wp_min is not None and wp_max is not None) else "n/a"
+        by_score_bucket.append({
+            "bucket": _BUCKET_LABELS[idx],
+            "wp_range": wp_range,
+            **stats,
+        })
+
+    # ── By rung × score bucket ────────────────────────────────────────────────
+    cross_map: dict = _dd(list)
+    for lg in legs:
+        idx = bucket_assignments.get(lg["id"], 4)
+        cross_map[(lg["rung"], lg["side"], _BUCKET_LABELS[idx])].append(lg)
+
+    by_rung_score = []
+    for (rung_key, side_key, bucket_label) in sorted(
+        cross_map.keys(),
+        key=lambda x: (float(x[0]) if x[0] != "unknown" else 9999, x[2]),
+    ):
+        group = cross_map[(rung_key, side_key, bucket_label)]
+        stats = _group_stats(group)
+        by_rung_score.append({
+            "rung": rung_key,
+            "side": side_key,
+            "bucket": bucket_label,
+            **{k: v for k, v in stats.items() if k != "no_odds_count"},
+        })
+
+    # ── Calibration bins (5pp bins of predicted wp) ──────────────────────────
+    cal_map: dict = _dd(list)
+    for lg in legs:
+        if lg["wp"] is None:
+            continue
+        wp_pct = lg["wp"]  # already 0-100 scale
+        bin_lo = int(wp_pct // 5) * 5
+        bin_hi = bin_lo + 5
+        bin_label = f"{bin_lo}-{bin_hi}"
+        cal_map[bin_label].append(lg)
+
+    calibration = []
+    for bin_label in sorted(cal_map.keys(), key=lambda x: int(x.split("-")[0])):
+        group = cal_map[bin_label]
+        n_bin = len(group)
+        settled_bin = [lg for lg in group if lg["status"] != "PENDING"]
+        s_bin = len(settled_bin)
+        wps = [lg["wp"] for lg in group if lg["wp"] is not None]
+        avg_pred = round(sum(wps) / len(wps), 4) if wps else None  # already 0-100
+        won_bin = sum(1 for lg in settled_bin if lg["status"] == "WON")
+        realized = round(won_bin / s_bin, 6) if s_bin > 0 else None
+        gap = round((realized * 100) - avg_pred, 2) if (realized is not None and avg_pred is not None) else None  # gap in pp
+        calibration.append({
+            "predicted_bin": bin_label,
+            "n": n_bin,
+            "settled": s_bin,
+            "avg_predicted": avg_pred,
+            "realized": realized,
+            "gap": gap,
+        })
+
+    # ── Leg list (strip internal fields) ─────────────────────────────────────
+    legs_out = [
+        {
+            "id": lg["id"],
+            "date": lg["date"],
+            "description": lg["description"],
+            "rung": lg["rung"],
+            "side": lg["side"],
+            "gate": lg["gate"],
+            "wp": lg["wp"],
+            "odds": lg["odds"],
+            "breakeven": lg["breakeven"],
+            "status": lg["status"],
+            "result": lg["result"],
+        }
+        for lg in legs
+    ]
+
+    return {
+        "summary": summary,
+        "by_rung": by_rung,
+        "by_score_bucket": by_score_bucket,
+        "by_rung_score": by_rung_score,
+        "calibration": calibration,
+        "legs": legs_out,
+    }

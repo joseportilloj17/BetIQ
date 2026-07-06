@@ -333,6 +333,7 @@
   <div class="nav-item" onclick="showPage('attribution')">📈 Attribution</div>
   <div class="nav-item" onclick="showPage('simulation')">🧪 Simulation</div>
   <div class="nav-item" onclick="showPage('negbin')" style="color:var(--purple,#a855f7)">🔬 NegBin Shadow</div>
+  <div class="nav-item" onclick="showPage('atsungated')" style="color:var(--purple,#a855f7)">🎯 ATS Ungated</div>
   <div class="nav-item" onclick="showPage('bankroll')">💰 Bankroll</div>
   <div class="nav-item" id="nav-recommend" onclick="showPage('recommend')" style="color:var(--amber);font-weight:600">⭐ Today's Picks</div>
   <div class="nav-item active" onclick="showPage('dashboard')">📊 Dashboard</div>
@@ -2373,6 +2374,80 @@ Rockets +4.5  Alt Spread  -950"
   </div>
 </div>
 
+<!-- ── ATS Ungated Shadow Tracker ── -->
+<div class="page" id="page-atsungated">
+  <div class="page-header">
+    <div>
+      <div class="page-title">ATS Ungated Shadow</div>
+      <div class="page-sub">All gate-rejected spread legs &middot; Rung &times; side &times; score &middot; Real-odds ROI &middot; Accumulating</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <select id="au-days" onchange="loadAtsUngated()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+        <option value="7">7 days</option>
+        <option value="14">14 days</option>
+        <option value="30" selected>30 days</option>
+        <option value="90">90 days</option>
+      </select>
+      <button class="btn btn-ghost btn-sm" onclick="loadAtsUngated()">Refresh</button>
+    </div>
+  </div>
+
+  <!-- Status strip -->
+  <div id="au-status" style="margin-bottom:16px;padding:9px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)">
+    <span>Loading...</span>
+  </div>
+
+  <!-- Rung × Side table -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:12px">Performance by Rung &times; Side</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Real-odds breakeven from stored runline prices &middot; N shown everywhere &middot; ROI = PnL / risked</div>
+    <div id="au-rung-table"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- Score bucket discrimination -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:12px">Discrimination by Model Score</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Quintiles by model WP &middot; Does the gate leave money on the table?</div>
+    <div id="au-score-table"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- Rung × Score cross-tab -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:12px">Rung &times; Score Cross-Tab</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Per-rung score buckets &middot; Where is model discrimination strongest?</div>
+    <div id="au-cross-table"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- Calibration -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:12px">Calibration (Predicted vs Realized)</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Forward calibration on full rejected range &middot; Includes tails the live gate hides</div>
+    <div id="au-calibration"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- Leg log -->
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div>
+        <div class="card-title" style="margin:0">Leg Log</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">Individual scored legs &middot; source=ats_ungated</div>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select id="au-log-rung" onchange="renderAuLog()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:6px;font-size:11px">
+          <option value="">All Rungs</option>
+        </select>
+        <select id="au-log-status" onchange="renderAuLog()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:6px;font-size:11px">
+          <option value="">All Status</option>
+          <option value="PENDING">Pending</option>
+          <option value="WON">Won</option>
+          <option value="LOST">Lost</option>
+        </select>
+      </div>
+    </div>
+    <div id="au-leg-log" class="table-wrap"><div class="loading">Loading...</div></div>
+  </div>
+</div>
+
 <!-- ── A/B Test (Phase 8) ── -->
 <div class="page" id="page-abtest">
   <div class="page-header">
@@ -3278,6 +3353,7 @@ function showPage(name, skipHash) {
     theses:      loadThesesPage,
     abtest:      loadAbTest,
     negbin:      loadNegbin,
+    atsungated:  loadAtsUngated,
   };
   loaders[name]?.();
 }
@@ -14076,6 +14152,225 @@ function showNbDrill(id) {
 
   content.innerHTML = html;
   modal.style.display = 'flex';
+}
+
+// ── ATS Ungated Shadow Tracker ───────────────────────────────────────────────
+var _auData = null;
+
+async function loadAtsUngated() {
+  const days = document.getElementById('au-days')?.value || '30';
+  ['au-rung-table','au-score-table','au-cross-table','au-calibration','au-leg-log'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '<div class="loading">Loading...</div>';
+  });
+  try {
+    _auData = await apiFetch(`/api/ats-ungated/tracker?days=${days}`);
+    renderAuStatus();
+    renderAuRungs();
+    renderAuScore();
+    renderAuCross();
+    renderAuCalibration();
+    renderAuLog();
+  } catch(e) {
+    document.getElementById('au-status').innerHTML =
+      `<span style="color:var(--red)">Error: ${e.message}</span>`;
+  }
+}
+
+function _auPct(v, d) { return v != null ? (v * 100).toFixed(d || 1) + '%' : '—'; }
+function _auPnl(v) {
+  if (v == null) return '—';
+  const c = v >= 0 ? 'var(--green)' : 'var(--red)';
+  return `<span style="color:${c}">${v >= 0 ? '+' : ''}$${v.toFixed(2)}</span>`;
+}
+function _auRoi(v) {
+  if (v == null) return '—';
+  const c = v >= 0 ? 'var(--green)' : 'var(--red)';
+  return `<span style="color:${c}">${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}%</span>`;
+}
+function _auQuality(n) {
+  if (n >= 30) return '<span style="color:var(--green)">RELIABLE</span>';
+  if (n >= 10) return '<span style="color:var(--amber)">DIRECTIONAL</span>';
+  return '<span style="color:var(--muted)">TOO THIN</span>';
+}
+
+function renderAuStatus() {
+  const d = _auData; if (!d || !d.summary) return;
+  const s = d.summary;
+  const strip = document.getElementById('au-status');
+  strip.innerHTML = `
+    <span>Legs: <strong>${s.total}</strong> |
+    Settled: <strong>${s.settled}</strong> (${s.won}W / ${s.lost}L) |
+    Pending: <strong>${s.pending}</strong> |
+    PnL: ${_auPnl(s.pnl)} |
+    ROI: ${_auRoi(s.roi)} |
+    Quality: ${_auQuality(s.settled)}</span>
+    <span>${s.first_date ? `Since ${s.first_date} (${s.days_active}d)` : 'No data'} &middot; <em style="color:var(--amber)">Accumulating</em></span>`;
+}
+
+function renderAuRungs() {
+  const d = _auData; if (!d || !d.by_rung) return;
+  const el = document.getElementById('au-rung-table');
+  if (!d.by_rung.length) { el.innerHTML = '<div style="color:var(--muted);font-size:12px">No data yet</div>'; return; }
+  let h = `<table class="data-table" style="font-size:12px;width:100%">
+    <thead><tr>
+      <th>Rung</th><th>Side</th><th>N</th><th>Settled</th>
+      <th>Avg WP</th><th>Avg Odds</th><th>BE (real)</th>
+      <th>Cover</th><th>PnL</th><th>ROI</th><th>Quality</th>
+    </tr></thead><tbody>`;
+  for (const r of d.by_rung) {
+    h += `<tr>
+      <td><strong>${r.rung}</strong></td>
+      <td>${r.side}</td>
+      <td>${r.n}</td>
+      <td>${r.settled}</td>
+      <td>${r.avg_wp?.toFixed(1) || '—'}%</td>
+      <td>${r.avg_odds?.toFixed(3) || '—'}</td>
+      <td>${_auPct(r.avg_breakeven)}</td>
+      <td>${_auPct(r.cover_rate)}</td>
+      <td>${_auPnl(r.pnl)}</td>
+      <td>${_auRoi(r.roi)}</td>
+      <td>${_auQuality(r.settled)}</td>
+    </tr>`;
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+function renderAuScore() {
+  const d = _auData; if (!d || !d.by_score_bucket) return;
+  const el = document.getElementById('au-score-table');
+  if (!d.by_score_bucket.length) { el.innerHTML = '<div style="color:var(--muted);font-size:12px">No data yet</div>'; return; }
+  let h = `<table class="data-table" style="font-size:12px;width:100%">
+    <thead><tr>
+      <th>Bucket</th><th>WP Range</th><th>N</th><th>Settled</th>
+      <th>Avg WP</th><th>Avg Odds</th><th>BE (real)</th>
+      <th>Cover</th><th>PnL</th><th>ROI</th><th>Quality</th>
+    </tr></thead><tbody>`;
+  for (const b of d.by_score_bucket) {
+    h += `<tr>
+      <td><strong>${b.bucket}</strong></td>
+      <td style="color:var(--muted)">${b.wp_range}</td>
+      <td>${b.n}</td>
+      <td>${b.settled}</td>
+      <td>${b.avg_wp?.toFixed(1) || '—'}%</td>
+      <td>${b.avg_odds?.toFixed(3) || '—'}</td>
+      <td>${_auPct(b.avg_breakeven)}</td>
+      <td>${_auPct(b.cover_rate)}</td>
+      <td>${_auPnl(b.pnl)}</td>
+      <td>${_auRoi(b.roi)}</td>
+      <td>${_auQuality(b.settled)}</td>
+    </tr>`;
+  }
+  h += '</tbody></table>';
+  // Flag no-odds legs
+  const noOdds = d.by_score_bucket.reduce((s, b) => s + (b.no_odds_count || 0), 0);
+  if (noOdds > 0) h += `<div style="margin-top:8px;font-size:11px;color:var(--amber)">${noOdds} leg(s) missing real odds — excluded from ROI/breakeven</div>`;
+  el.innerHTML = h;
+}
+
+function renderAuCross() {
+  const d = _auData; if (!d || !d.by_rung_score) return;
+  const el = document.getElementById('au-cross-table');
+  if (!d.by_rung_score.length) { el.innerHTML = '<div style="color:var(--muted);font-size:12px">No data yet</div>'; return; }
+  // Group by rung+side
+  const groups = {};
+  for (const r of d.by_rung_score) {
+    const key = `${r.rung} (${r.side})`;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(r);
+  }
+  let h = '';
+  for (const [key, buckets] of Object.entries(groups)) {
+    h += `<div style="margin-bottom:16px">
+      <div style="font-weight:600;font-size:13px;margin-bottom:6px">${key}</div>
+      <table class="data-table" style="font-size:11px;width:100%">
+        <thead><tr><th>Bucket</th><th>N</th><th>Settled</th><th>Avg WP</th><th>BE</th><th>Cover</th><th>ROI</th></tr></thead>
+        <tbody>`;
+    for (const b of buckets) {
+      h += `<tr>
+        <td>${b.bucket}</td><td>${b.n}</td><td>${b.settled}</td>
+        <td>${b.avg_wp?.toFixed(1) || '—'}%</td>
+        <td>${_auPct(b.avg_breakeven)}</td>
+        <td>${_auPct(b.cover_rate)}</td>
+        <td>${_auRoi(b.roi)}</td>
+      </tr>`;
+    }
+    h += '</tbody></table></div>';
+  }
+  el.innerHTML = h;
+}
+
+function renderAuCalibration() {
+  const d = _auData; if (!d || !d.calibration) return;
+  const el = document.getElementById('au-calibration');
+  if (!d.calibration.length) { el.innerHTML = '<div style="color:var(--muted);font-size:12px">No settled data for calibration yet</div>'; return; }
+  let h = `<table class="data-table" style="font-size:12px;width:100%">
+    <thead><tr>
+      <th>Predicted WP</th><th>N</th><th>Settled</th>
+      <th>Avg Predicted</th><th>Realized</th><th>Gap</th><th>Quality</th>
+    </tr></thead><tbody>`;
+  for (const c of d.calibration) {
+    const gapColor = c.gap != null ? (Math.abs(c.gap) > 5 ? 'var(--red)' : 'var(--green)') : '';
+    h += `<tr>
+      <td>${c.predicted_bin}%</td>
+      <td>${c.n}</td>
+      <td>${c.settled}</td>
+      <td>${c.avg_predicted?.toFixed(1) || '—'}%</td>
+      <td>${c.realized != null ? (c.realized * 100).toFixed(1) + '%' : '—'}</td>
+      <td style="color:${gapColor}">${c.gap != null ? (c.gap >= 0 ? '+' : '') + c.gap.toFixed(1) + 'pp' : '—'}</td>
+      <td>${_auQuality(c.settled)}</td>
+    </tr>`;
+  }
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+function renderAuLog() {
+  const d = _auData; if (!d || !d.legs) return;
+  const el = document.getElementById('au-leg-log');
+  const rungFilter = document.getElementById('au-log-rung')?.value || '';
+  const statusFilter = document.getElementById('au-log-status')?.value || '';
+
+  // Populate rung filter options (once)
+  const rungSelect = document.getElementById('au-log-rung');
+  if (rungSelect && rungSelect.options.length <= 1) {
+    const rungs = [...new Set(d.legs.map(l => l.rung))].sort();
+    for (const r of rungs) {
+      const opt = document.createElement('option');
+      opt.value = r; opt.textContent = r;
+      rungSelect.appendChild(opt);
+    }
+  }
+
+  let filtered = d.legs;
+  if (rungFilter) filtered = filtered.filter(l => l.rung === rungFilter);
+  if (statusFilter) filtered = filtered.filter(l => l.status === statusFilter);
+
+  if (!filtered.length) { el.innerHTML = '<div style="color:var(--muted);font-size:12px">No legs match filters</div>'; return; }
+
+  let h = `<table class="data-table" style="font-size:11px;width:100%">
+    <thead><tr>
+      <th>Date</th><th>Description</th><th>Rung</th><th>Side</th><th>Gate</th>
+      <th>WP</th><th>Odds</th><th>BE</th><th>Status</th>
+    </tr></thead><tbody>`;
+  for (const l of filtered.slice(0, 200)) {
+    const statusColor = l.status === 'WON' ? 'var(--green)' : l.status === 'LOST' ? 'var(--red)' : 'var(--muted)';
+    h += `<tr>
+      <td style="white-space:nowrap">${l.date}</td>
+      <td>${l.description}</td>
+      <td><strong>${l.rung}</strong></td>
+      <td>${l.side}</td>
+      <td style="font-size:10px;color:var(--muted)">${l.gate}</td>
+      <td>${l.wp?.toFixed(1)}%</td>
+      <td>${l.odds?.toFixed(3) || '—'}</td>
+      <td>${_auPct(l.breakeven)}</td>
+      <td style="color:${statusColor};font-weight:600">${l.status}</td>
+    </tr>`;
+  }
+  h += '</tbody></table>';
+  if (filtered.length > 200) h += `<div style="margin-top:6px;font-size:11px;color:var(--muted)">Showing 200 of ${filtered.length} legs</div>`;
+  el.innerHTML = h;
 }
 
 </script>
