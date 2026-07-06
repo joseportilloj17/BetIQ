@@ -158,7 +158,6 @@ def _store_ungated_legs(db, scored_legs, today_str):
         db.add(mock)
 
         mock_leg = MockBetLeg(
-            id=str(uuid.uuid4()),
             mock_bet_id=mock_id,
             leg_index=0,
             description=desc,
@@ -167,7 +166,7 @@ def _store_ungated_legs(db, scored_legs, today_str):
             win_prob=wp,
             ev=ev,
             fixture_id=leg.get("fixture_id"),
-            is_alt_line=1 if mkt == "alternate_spreads" else 0,
+            is_alt_line=(mkt == "alternate_spreads"),
         )
         db.add(mock_leg)
         stored += 1
