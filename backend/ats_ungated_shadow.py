@@ -167,9 +167,6 @@ def _store_ungated_legs(db, scored_legs, today_str):
             win_prob=wp,
             ev=ev,
             fixture_id=leg.get("fixture_id"),
-            spread_value=sv,
-            spread_abs=abs(sv) if sv is not None else None,
-            is_favorite_spread=1 if sv is not None and sv < 0 else 0,
             is_alt_line=1 if mkt == "alternate_spreads" else 0,
         )
         db.add(mock_leg)
