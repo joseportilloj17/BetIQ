@@ -6802,6 +6802,15 @@ def settle_mock_bets(db: Session) -> dict:
         except Exception as _pcfe:
             print(f"[settle] pi_concentration_flags error (non-fatal): {_pcfe}")
 
+    # ── ATS gap-sizing asymmetry monitor (post-settlement) ────────────
+    _atscap_report = None
+    if settled > 0:
+        try:
+            from negbin_shadow import _report_atscap_asymmetry
+            _report_atscap_asymmetry(db)
+        except Exception as _ace:
+            print(f"[settle] atscap asymmetry report error (non-fatal): {_ace}")
+
     return {
         "settled": settled,
         "expired": expired,
@@ -7671,10 +7680,13 @@ def get_mock_performance(
     days: int = 30,
     bet_category: Optional[str] = None,
     game_date: Optional[str] = None,
+    source: Optional[str] = "simulation",
 ) -> dict:
     """
     Aggregate win rate, P&L, and trust metrics for settled mock bets.
 
+    source: 'simulation' (default) filters to _LQ_SIM_SOURCES only.
+            None or 'all' includes everything.
     bet_category: 'team' | 'player_prop' | None (all).
     game_date:    'YYYY-MM-DD' or 'today' — filter by game_date instead of settled_at window.
 
@@ -7696,35 +7708,51 @@ def get_mock_performance(
 
     since = datetime.utcnow() - timedelta(days=days)
 
+    # Resolve source filter to a list of allowed source values
+    _src_filter: list[str] | None = None
+    if source == "simulation":
+        _src_filter = list(_LQ_SIM_SOURCES)
+    elif source and source != "all":
+        _src_filter = [source]
+    # None / "all" → no source filter
+
     if bet_category:
         # Only include bets where every leg matches the category.
         # Use a raw SQL subquery to avoid loading thousands of IDs into Python
         # (large IN clauses cause SQLite page errors on big databases).
         from sqlalchemy import text as _text
+        _src_clause = ""
+        _params: dict = {"cat": bet_category}
+        if _src_filter:
+            _src_placeholders = ",".join(f":src{i}" for i in range(len(_src_filter)))
+            _src_clause = f" AND source IN ({_src_placeholders})"
+            _params.update({f"src{i}": s for i, s in enumerate(_src_filter)})
         if game_date:
-            cat_subq = _text("""
+            cat_subq = _text(f"""
                 SELECT id FROM mock_bets
                 WHERE status IN ('SETTLED_WIN','SETTLED_LOSS')
-                  AND game_date = :gdate
+                  AND game_date = :gdate{_src_clause}
                   AND id IN (
                       SELECT mock_bet_id FROM mock_bet_legs
                       GROUP BY mock_bet_id
                       HAVING SUM(CASE WHEN COALESCE(bet_category,'team')=:cat THEN 1 ELSE 0 END)=COUNT(*)
                   )
             """)
-            matched_ids = [row[0] for row in db.execute(cat_subq, {"gdate": game_date, "cat": bet_category})]
+            _params["gdate"] = game_date
+            matched_ids = [row[0] for row in db.execute(cat_subq, _params)]
         else:
-            cat_subq = _text("""
+            cat_subq = _text(f"""
                 SELECT id FROM mock_bets
                 WHERE status IN ('SETTLED_WIN','SETTLED_LOSS')
-                  AND settled_at >= :since
+                  AND settled_at >= :since{_src_clause}
                   AND id IN (
                       SELECT mock_bet_id FROM mock_bet_legs
                       GROUP BY mock_bet_id
                       HAVING SUM(CASE WHEN COALESCE(bet_category,'team')=:cat THEN 1 ELSE 0 END)=COUNT(*)
                   )
             """)
-            matched_ids = [row[0] for row in db.execute(cat_subq, {"since": since, "cat": bet_category})]
+            _params["since"] = since
+            matched_ids = [row[0] for row in db.execute(cat_subq, _params)]
         if not matched_ids:
             settled = []
         else:
@@ -7734,15 +7762,21 @@ def get_mock_performance(
                 chunk = matched_ids[i:i+500]
                 settled += db.query(MockBet).filter(MockBet.id.in_(chunk)).all()
     elif game_date:
-        settled = db.query(MockBet).filter(
+        q = db.query(MockBet).filter(
             MockBet.status.in_(["SETTLED_WIN", "SETTLED_LOSS"]),
             MockBet.game_date == game_date,
-        ).all()
+        )
+        if _src_filter:
+            q = q.filter(MockBet.source.in_(_src_filter))
+        settled = q.all()
     else:
-        settled = db.query(MockBet).filter(
+        q = db.query(MockBet).filter(
             MockBet.status.in_(["SETTLED_WIN", "SETTLED_LOSS"]),
             MockBet.settled_at >= since,
-        ).all()
+        )
+        if _src_filter:
+            q = q.filter(MockBet.source.in_(_src_filter))
+        settled = q.all()
 
     total_settled = len(settled)
     wins          = sum(1 for m in settled if m.status == "SETTLED_WIN")
@@ -7836,12 +7870,18 @@ def get_mock_performance(
             """)
             pending_count = db.execute(_pend_subq, {"cat": bet_category}).scalar() or 0
     elif game_date:
-        pending_count = db.query(MockBet).filter(
+        _pq = db.query(MockBet).filter(
             MockBet.status == "PENDING",
             MockBet.game_date == game_date,
-        ).count()
+        )
+        if _src_filter:
+            _pq = _pq.filter(MockBet.source.in_(_src_filter))
+        pending_count = _pq.count()
     else:
-        pending_count = db.query(MockBet).filter(MockBet.status == "PENDING").count()
+        _pq = db.query(MockBet).filter(MockBet.status == "PENDING")
+        if _src_filter:
+            _pq = _pq.filter(MockBet.source.in_(_src_filter))
+        pending_count = _pq.count()
 
     # Recent daily trend (last 7 days) — bucket by game_date (match start date),
     # not settlement date, so late-night games stay on the day they were played.

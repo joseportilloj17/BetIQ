@@ -1996,6 +1996,9 @@ def _run_negbin_shadow_am() -> dict:
         from negbin_shadow import (
             generate_negbin_shadow_picks,
             generate_negbin_recal_shadow_picks,
+            generate_atscap_counterfactual,
+            generate_edgegate_counterfactual,
+            generate_fullstack_counterfactual,
             _get_todays_fixtures,
         )
         from datetime import datetime as _dt
@@ -2022,7 +2025,27 @@ def _run_negbin_shadow_am() -> dict:
             # Stamp Shadow B as done too
             _scheduler_state["last_negbin_recal_shadow_am"] = today_str
 
-            return {"shadow_a": count_a, "shadow_b": count_b}
+            # ATS Asymmetric Cap — counterfactual on A's parlays (separate shadow arm)
+            result_cap = generate_atscap_counterfactual(db, today_str=today_str)
+            count_cap = len(result_cap) if result_cap else 0
+            print(f"[Scheduler] NegBin ATS-cap counterfactual: {count_cap} parlays "
+                  f"(from {count_a} A parlays)")
+
+            # Edge gate — counterfactual on A's parlays (separate shadow arm)
+            result_edge = generate_edgegate_counterfactual(db, today_str=today_str)
+            count_edge = len(result_edge) if result_edge else 0
+            print(f"[Scheduler] NegBin edge-gate counterfactual: {count_edge} parlays "
+                  f"(from {count_a} A parlays, gate={12}pp)")
+
+            # Full-stack: NegBin select → edge gate → dist_wp quarter-Kelly
+            result_fs = generate_fullstack_counterfactual(db, today_str=today_str)
+            count_fs = len(result_fs) if result_fs else 0
+            print(f"[Scheduler] NegBin full-stack counterfactual: {count_fs} parlays "
+                  f"(select→gate→dist_wp Kelly)")
+
+            return {"shadow_a": count_a, "shadow_b": count_b,
+                    "atscap": count_cap, "edgegate": count_edge,
+                    "fullstack": count_fs}
         finally:
             db.close()
     except Exception as exc:

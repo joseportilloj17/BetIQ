@@ -6395,6 +6395,7 @@ def mock_bets_performance(
     days: int = Query(30, ge=1, le=365),
     bet_category: Optional[str] = Query(None, description="'team' | 'player_prop' | omit for all"),
     game_date: Optional[str] = Query(None, description="'YYYY-MM-DD' or 'today' — filter by game_date"),
+    source: str = Query("simulation", description="'simulation' (default), specific source, or 'all'"),
     db: Session = Depends(get_db),
 ):
     """
@@ -6404,9 +6405,10 @@ def mock_bets_performance(
     daily trend, breakdowns by confidence / sport / model.
     bet_category=team shows only team bets; bet_category=player_prop shows only prop bets.
     game_date=today (or YYYY-MM-DD) filters to a single day instead of rolling window.
+    source=simulation (default) filters to prospective/top_picks_page/etc. only.
     """
     return mb_module.get_mock_performance(db, days=days, bet_category=bet_category,
-                                          game_date=game_date)
+                                          game_date=game_date, source=source)
 
 
 @app.get("/api/mock-bets/leg-accuracy")
@@ -10272,9 +10274,9 @@ def ats_ungated_tracker(
 
         # Status / result
         leg_result = row.get("leg_result")
-        if leg_result == "W":
+        if leg_result in ("W", "WIN"):
             status = "WON"
-        elif leg_result == "L":
+        elif leg_result in ("L", "LOSS"):
             status = "LOST"
         else:
             status = "PENDING"

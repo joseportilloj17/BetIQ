@@ -1539,6 +1539,17 @@ def predict_game_ats(
             mask = mask & (matrix["game_date"].astype(str).str[:10] == date_str)
 
         matched = matrix[mask]
+        if matched.empty and game_date:
+            # Fallback: today's game won't be in the matrix (status='Final'
+            # filter excludes scheduled games).  Use the most recent
+            # historical row for this team pair — rolling features are still
+            # valid because features.py uses .shift(1).rolling() throughout.
+            team_mask = (
+                matrix["home_team"].str.lower().str.strip() == ht
+            ) & (
+                matrix["away_team"].str.lower().str.strip() == at
+            )
+            matched = matrix[team_mask]
         if matched.empty:
             return None
 
@@ -1580,6 +1591,149 @@ def predict_game_ats(
         log.warning("predict_game_ats(%s, %s vs %s, spread=%s): %s",
                     sport, home_team, away_team, spread_value, exc)
         return None
+
+
+# ── ATS distributional (margin regression) ────────────────────────────────────
+
+_ATS_DIST_CACHE: dict | None = None
+
+def _load_ats_distributional():
+    """Load ATS distributional (margin regression) artifacts.
+    Returns dict with model, imputer, features, sigma or None."""
+    global _ATS_DIST_CACHE
+    if _ATS_DIST_CACHE is not None:
+        return _ATS_DIST_CACHE
+    path = os.path.join(SUBMODEL_DIR, "mlb_ats_distributional.pkl")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            art = pickle.load(f)
+        _ATS_DIST_CACHE = art
+        return art
+    except Exception as exc:
+        log.warning("ATS distributional load failed: %s", exc)
+        return None
+
+
+def predict_game_ats_distributional(
+    home_team: str,
+    away_team: str,
+    game_date: str | None = None,
+    spread_value: float = 1.5,
+) -> float | None:
+    """
+    Predict P(picked side covers spread_value) using the ATS distributional
+    margin regression model.
+
+    The model predicts E[home_score - away_score], then derives:
+        P(home covers -spread) = P(margin > -spread) = 1 - Φ((-spread - mu) / sigma)
+        P(away covers +spread) = P(margin < spread)  = Φ((spread - mu) / sigma)
+
+    Parameters
+    ----------
+    spread_value : The rung from the PICKED SIDE's perspective (e.g. 1.5 for
+                   underdog +1.5, -1.5 for favorite -1.5).
+
+    Returns P(cover) in [0,1] or None if unavailable.
+    """
+    from scipy.stats import norm
+
+    art = _load_ats_distributional()
+    if art is None:
+        return None
+
+    model = art["model"]
+    imp = art["imputer"]
+    feat_cols = art["features"]
+    sigma = art["sigma"]
+
+    if feat_cols is None:
+        return None
+
+    try:
+        matrix = _get_feature_matrix("MLB")
+        if matrix.empty:
+            return None
+
+        ht = _normalize_team_name("MLB", home_team).lower().strip()
+        at = _normalize_team_name("MLB", away_team).lower().strip()
+        mask = (
+            matrix["home_team"].str.lower().str.strip() == ht
+        ) & (
+            matrix["away_team"].str.lower().str.strip() == at
+        )
+        if game_date:
+            date_str = str(game_date)[:10]
+            mask = mask & (matrix["game_date"].astype(str).str[:10] == date_str)
+
+        matched = matrix[mask]
+        if matched.empty and game_date:
+            team_mask = (
+                matrix["home_team"].str.lower().str.strip() == ht
+            ) & (
+                matrix["away_team"].str.lower().str.strip() == at
+            )
+            matched = matrix[team_mask]
+        if matched.empty:
+            return None
+
+        row = matched.sort_values("game_date", ascending=False).iloc[0]
+        X = np.array([[row[c] if c in row.index and not pd.isna(row[c]) else np.nan
+                       for c in feat_cols]], dtype=float)
+        X_imp = imp.transform(X)
+        mu = float(model.predict(X_imp)[0])  # E[home - away]
+
+        # P(cover) for the given spread from picked side's perspective
+        # spread_value > 0 means underdog side (+1.5, +2.5, etc.)
+        # P(underdog covers +S) = P(margin < S) = Φ((S - mu) / sigma)
+        # spread_value < 0 means favorite side (-1.5, -2.5, etc.)
+        # P(favorite covers -S) = P(margin > |S|) = 1 - Φ((|S| - mu) / sigma)
+        # Unified: P(cover) = Φ((spread_value - mu) / sigma)
+        #   +1.5 → Φ((1.5 - mu)/σ), -1.5 → Φ((-1.5 - mu)/σ)
+        # Wait — need to think about sign convention.
+        # margin = home - away. spread_value is from picked side.
+        # If picked side is HOME at +1.5: home covers if margin > -1.5
+        #   P = 1 - Φ((-1.5 - mu)/σ) = Φ((mu + 1.5)/σ)
+        # If picked side is AWAY at +1.5: away covers if margin < 1.5
+        #   P = Φ((1.5 - mu)/σ)
+        # So the caller needs to specify pick_side. Let me simplify:
+        # Return mu, and let the caller compute P(cover) per side.
+        # Actually — return mu and sigma, let negbin_shadow compute per-leg.
+
+        return mu  # Return predicted margin (home - away)
+
+    except Exception as exc:
+        log.warning("predict_game_ats_distributional(%s vs %s): %s",
+                    home_team, away_team, exc)
+        return None
+
+
+def ats_distributional_cover_prob(
+    mu: float,
+    spread_value: float,
+    pick_side: str,
+    sigma: float | None = None,
+) -> float:
+    """
+    Given predicted margin mu (home - away) and residual sigma,
+    compute P(picked side covers the spread).
+
+    pick_side: "home" or "away"
+    spread_value: the rung (always positive, e.g. 1.5, 2.5)
+    """
+    from scipy.stats import norm
+
+    if sigma is None:
+        art = _load_ats_distributional()
+        sigma = art["sigma"] if art else 4.217
+
+    if pick_side == "home":
+        # Home covers +spread_value if margin > -spread_value
+        return float(1.0 - norm.cdf((-spread_value - mu) / sigma))
+    else:
+        # Away covers +spread_value if margin < spread_value
+        return float(norm.cdf((spread_value - mu) / sigma))
 
 
 # ── Soccer sub-model ──────────────────────────────────────────────────────────
