@@ -67,6 +67,7 @@ def _ensure_shadow_columns():
         ("mock_bet_legs", "ats_dist_wp",       "ALTER TABLE mock_bet_legs ADD COLUMN ats_dist_wp REAL"),
         ("mock_bet_legs", "bayes_team_wp",     "ALTER TABLE mock_bet_legs ADD COLUMN bayes_team_wp REAL"),
         ("mock_bet_legs", "mkt_disagree_dist", "ALTER TABLE mock_bet_legs ADD COLUMN mkt_disagree_dist REAL"),
+        ("mock_bet_legs", "ridge_composite",   "ALTER TABLE mock_bet_legs ADD COLUMN ridge_composite REAL"),
         ("mock_bets",     "negbin_odds_band",  "ALTER TABLE mock_bets ADD COLUMN negbin_odds_band TEXT"),
         ("mock_bets",     "negbin_cell_adj",   "ALTER TABLE mock_bets ADD COLUMN negbin_cell_adj REAL"),
         ("mock_bets",     "negbin_leg_count",  "ALTER TABLE mock_bets ADD COLUMN negbin_leg_count INTEGER"),
@@ -176,6 +177,65 @@ def _lookup_market_implied(fixture_id: str, team: str, spread_value) -> float | 
         return None
     except Exception:
         return None
+
+
+# ── Ridge composite model cache ──
+# Ridge logistic: bayes_team_wp + ats_dist_wp, C=0.005 (nested-CV selected).
+# OOS validated: Brier 0.1340 (nested CV), +0.017 over raw dist_wp.
+# Tracked column only — not wired into gates or sizing.
+_RIDGE_MODEL: tuple | None = None  # (scaler, model) or None
+
+
+def _build_ridge_model():
+    """Fit ridge logistic on settled shadow_negbin legs with both signals.
+
+    Uses C=0.005 (selected by nested purged CV, not in-sample picked).
+    Requires ≥200 legs with both bayes_team_wp and ats_dist_wp.
+    """
+    global _RIDGE_MODEL
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import StandardScaler
+
+        con = sqlite3.connect(_BETS_DB, timeout=15)
+        rows = con.execute("""
+            SELECT mbl.bayes_team_wp, mbl.ats_dist_wp, mbl.leg_result
+            FROM mock_bet_legs mbl
+            JOIN mock_bets mb ON mb.id = mbl.mock_bet_id
+            WHERE mb.source = 'shadow_negbin'
+            AND mbl.leg_result IN ('WIN', 'LOSS')
+            AND mbl.bayes_team_wp IS NOT NULL
+            AND mbl.ats_dist_wp IS NOT NULL
+        """).fetchall()
+        con.close()
+
+        if len(rows) < 200:
+            print(f"[negbin-shadow] Ridge model: insufficient data ({len(rows)} legs)")
+            return
+
+        X = np.array([[r[0], r[1]] for r in rows])
+        y = np.array([1 if r[2] == "WIN" else 0 for r in rows])
+
+        sc = StandardScaler()
+        X_s = sc.fit_transform(X)
+        lr = LogisticRegression(max_iter=1000, C=0.005, penalty="l2", solver="lbfgs")
+        lr.fit(X_s, y)
+
+        _RIDGE_MODEL = (sc, lr)
+        print(f"[negbin-shadow] Ridge model built: {len(rows)} legs, "
+              f"coefs=[bayes={lr.coef_[0][0]:+.3f}, dist={lr.coef_[0][1]:+.3f}], "
+              f"intercept={lr.intercept_[0]:+.3f}")
+    except Exception as exc:
+        print(f"[negbin-shadow] Ridge model error: {exc}")
+
+
+def _ridge_predict(bayes_wp: float, dist_wp: float) -> float | None:
+    """Score a single leg with the ridge composite model."""
+    if _RIDGE_MODEL is None:
+        return None
+    sc, lr = _RIDGE_MODEL
+    X = sc.transform([[bayes_wp, dist_wp]])
+    return float(lr.predict_proba(X)[0, 1])
 
 
 def _get_todays_fixtures(today_str: str, only_unstarted: bool = True):
@@ -557,6 +617,10 @@ def generate_negbin_shadow_picks(db=None, today_str=None,
     # Build Bayesian team cover cache if needed (lazy, once per session)
     if _BAYES_TEAM_CACHE is None:
         _build_bayes_team_cache()
+
+    # Build ridge composite model if needed (lazy, once per session)
+    if _RIDGE_MODEL is None:
+        _build_ridge_model()
 
     model = load_negbin_model()
     if model is None:
@@ -2303,6 +2367,7 @@ def _store_shadow_parlays(db, parlays, today_str, source_tag="shadow_negbin"):
             # James-Stein shrinkage of picked-team historical cover rate toward
             # grand mean.  Provides genuine discrimination (OOS rho=+0.435,
             # quintile Q0=45% → Q4=98%, monotonic rho=+0.422).
+            bwp = None  # used by ridge composite scorer below
             try:
                 picked_team_name = leg.get("pick_team", "")
                 if picked_team_name and _BAYES_TEAM_CACHE is not None:
@@ -2329,6 +2394,18 @@ def _store_shadow_parlays(db, parlays, today_str, source_tag="shadow_negbin"):
                         ), {"mdd": round(mdd, 4), "lid": leg_obj.id})
             except Exception as exc:
                 print(f"[negbin-shadow] Market disagree score error: {exc}")
+
+            # ── Ridge composite (bayes_team_wp + ats_dist_wp, C=0.005) ──
+            # Fitted probability from ridge logistic. Tracked column only.
+            try:
+                if bwp is not None and dist_wp is not None:
+                    rc = _ridge_predict(bwp, dist_wp)
+                    if rc is not None:
+                        db.execute(_text(
+                            "UPDATE mock_bet_legs SET ridge_composite=:rc WHERE id=:lid"
+                        ), {"rc": round(rc, 4), "lid": leg_obj.id})
+            except Exception as exc:
+                print(f"[negbin-shadow] Ridge composite score error: {exc}")
 
         stored += 1
 
