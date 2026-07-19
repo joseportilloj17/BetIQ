@@ -9611,14 +9611,27 @@ def _negbin_view_filter(view: str) -> str:
     return ""  # "measurement" — no filter, show all
 
 
+_VALID_SHADOW_SOURCES = {
+    "shadow_negbin", "shadow_negbin_recal",
+    "shadow_negbin_edgegate", "shadow_negbin_fullstack",
+    "shadow_negbin_composite", "shadow_negbin_atscap",
+    "shadow_negbin_distwp_gate", "shadow_negbin_bothgates",
+}
+
+
 def _negbin_source_filter(source: str) -> str:
-    """Filter by shadow source for A/B comparison."""
+    """Filter by shadow source for A/B comparison or specific arm detail."""
     if source == "shadow_a":
         return "AND mb.source = 'shadow_negbin'"
     if source == "shadow_b":
         return "AND mb.source = 'shadow_negbin_recal'"
-    # "all" — both A and B
-    return "AND mb.source IN ('shadow_negbin', 'shadow_negbin_recal')"
+    if source == "all":
+        return "AND mb.source IN ('shadow_negbin', 'shadow_negbin_recal')"
+    # Direct source tag — validate to prevent injection
+    if source in _VALID_SHADOW_SOURCES:
+        return f"AND mb.source = '{source}'"
+    # Fallback: A only
+    return "AND mb.source = 'shadow_negbin'"
 
 
 @app.get("/api/negbin/tracker")
@@ -10200,6 +10213,110 @@ def negbin_parlay_detail(parlay_id: str):
         "cell_adj": r.get("negbin_cell_adj"),
         "pnl": pnl,
         "legs": legs_out,
+    }
+
+
+@app.get("/api/negbin/arms_comparison")
+def negbin_arms_comparison(
+    days: int = Query(30, ge=1, le=365),
+):
+    """
+    Comparative view of all active shadow counterfactual arms.
+    Returns per-arm summary metrics + daily cumulative PnL series.
+    """
+    from collections import defaultdict as _dd
+
+    _ARMS = [
+        ("shadow_negbin", "A (control)"),
+        ("shadow_negbin_recal", "B (recal)"),
+        ("shadow_negbin_edgegate", "Edge Gate"),
+        ("shadow_negbin_fullstack", "Full-Stack"),
+        ("shadow_negbin_composite", "Composite"),
+        ("shadow_negbin_atscap", "ATS Cap"),
+        ("shadow_negbin_distwp_gate", "dist_wp Gate"),
+        ("shadow_negbin_bothgates", "Both Gates"),
+    ]
+
+    con = _negbin_db_connect()
+    cur = con.cursor()
+
+    arms_out = []
+    daily_series = {}  # source → [{date, cum_pnl}, ...]
+
+    for source_tag, label in _ARMS:
+        # Fetch settled + pending parlays for this arm
+        cur.execute("""
+            SELECT mb.id, mb.odds, mb.status, mb.game_date, mb.amount, mb.weight,
+                   GROUP_CONCAT(mbl.leg_result, ',') AS leg_results,
+                   COUNT(mbl.id) AS n_legs
+            FROM mock_bets mb
+            JOIN mock_bet_legs mbl ON mbl.mock_bet_id = mb.id
+            WHERE mb.source = ?
+              AND mb.cohort = 'clean'
+              AND mb.game_date >= date('now', '-' || ? || ' days')
+            GROUP BY mb.id
+            ORDER BY mb.game_date
+        """, (source_tag, days))
+        rows = [dict(r) for r in cur.fetchall()]
+
+        n_parlays = len(rows)
+        n_settled = 0
+        n_wins = 0
+        total_pnl = 0.0
+        total_legs = 0
+        settled_dates = set()
+        pnl_by_date = _dd(float)
+
+        for r in rows:
+            total_legs += r.get("n_legs", 0)
+            won = _negbin_is_won(r.get("leg_results"))
+            if won is None:
+                continue  # pending
+            n_settled += 1
+            settled_dates.add(r["game_date"])
+            odds = r.get("odds") or 1.0
+            # Always use flat $10 stake for consistent comparison across arms
+            if won:
+                n_wins += 1
+                pnl = _NEGBIN_STAKE * (odds - 1)
+            else:
+                pnl = -_NEGBIN_STAKE
+            total_pnl += pnl
+            pnl_by_date[r["game_date"]] += pnl
+
+        cover_rate = round(n_wins / n_settled * 100, 2) if n_settled else None
+        # ROI = return per dollar staked (comparable across arms and with backtests)
+        roi = round(total_pnl / (n_settled * _NEGBIN_STAKE) * 100, 2) if n_settled else None
+        settled_days = len(settled_dates)
+
+        # Build daily cumulative series
+        sorted_dates = sorted(pnl_by_date.keys())
+        cum = 0.0
+        series = []
+        for d in sorted_dates:
+            cum += pnl_by_date[d]
+            series.append({"date": d, "cum_pnl": round(cum, 2), "day_pnl": round(pnl_by_date[d], 2)})
+        daily_series[source_tag] = series
+
+        arms_out.append({
+            "source": source_tag,
+            "label": label,
+            "n_parlays": n_parlays,
+            "n_settled": n_settled,
+            "n_legs": total_legs,
+            "cover_rate": cover_rate,
+            "roi": roi,
+            "cum_pnl": round(total_pnl, 2),
+            "settled_days": settled_days,
+            "status": "accumulating" if n_settled < 10 else "active",
+        })
+
+    con.close()
+
+    return {
+        "arms": arms_out,
+        "daily_series": daily_series,
+        "days": days,
     }
 
 
