@@ -48,3 +48,18 @@ Thumbs.db
 # Temp / backups
 /tmp/
 *.bak
+
+# Claude Code memory (personal, session-specific)
+.claude/
+
+# Local ops scripts (machine-specific)
+am_cycle.sh
+server_foreground.sh
+
+# Analysis output / stderr captures
+*_out.txt
+*_stderr.txt
+
+# One-off scratch scripts (root level)
+rfa.py
+stage4_*.py
