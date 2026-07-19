@@ -1966,6 +1966,167 @@ def _should_run_alt_lines_clv(now: datetime) -> bool:
     return True
 
 
+# ── Weather refresh — runs BEFORE NegBin shadow to provide forecast wind ────────
+
+def _should_run_weather_refresh() -> bool:
+    """True if weather hasn't been refreshed today."""
+    ct = _now_ct()
+    today_str = ct.strftime("%Y-%m-%d")
+    if _scheduler_state.get("last_weather_refresh") == today_str:
+        return False
+    # Gate: alt_lines_morning must have completed (we need the fixture list)
+    if _scheduler_state.get("last_alt_lines_fetch_morning") != today_str:
+        return False
+    return True
+
+
+def _run_weather_refresh() -> dict:
+    """Fetch forecast wind for today's games and store in game_weather (historical.db).
+
+    Uses Open-Meteo Forecast API (same as live serving) — the returned wind IS
+    the forecast, so wind_speed_forecast_mph = wind_speed_mph for today's fetch.
+    """
+    import sqlite3
+    import requests
+
+    _HIST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "data", "historical.db")
+    _FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
+    try:
+        from weather import MLB_STADIUMS, _find_stadium, _is_dome
+    except ImportError:
+        from backend.weather import MLB_STADIUMS, _find_stadium, _is_dome
+
+    ct = _now_ct()
+    today_str = ct.strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect(_HIST_DB)
+
+    # Ensure column exists
+    cols = [c[1] for c in conn.execute("PRAGMA table_info(game_weather)").fetchall()]
+    if "wind_speed_forecast_mph" not in cols:
+        conn.execute("ALTER TABLE game_weather ADD COLUMN wind_speed_forecast_mph REAL")
+        conn.commit()
+
+    # Get today's games that need weather
+    games_needing_wx = conn.execute("""
+        SELECT DISTINCT g.home_team
+        FROM games g
+        WHERE g.sport = 'MLB' AND g.game_date = ?
+          AND NOT EXISTS (
+              SELECT 1 FROM game_weather gw
+              WHERE gw.home_team = g.home_team AND gw.game_date = ?
+                AND gw.wind_speed_forecast_mph IS NOT NULL
+          )
+    """, (today_str, today_str)).fetchall()
+
+    if not games_needing_wx:
+        conn.close()
+        return {"status": "ok", "games": 0, "note": "all games already have forecast wind"}
+
+    written = 0
+    failed = 0
+    for (home_team,) in games_needing_wx:
+        stadium_info = _find_stadium(home_team, "mlb")
+        if not stadium_info:
+            failed += 1
+            continue
+        lat, lon, stadium_name = stadium_info
+
+        if _is_dome(stadium_name):
+            # Dome: wind=0, forecast wind=0
+            conn.execute("""
+                INSERT OR REPLACE INTO game_weather
+                    (home_team, game_date, temperature_f, wind_speed_mph,
+                     wind_speed_forecast_mph, wind_direction_deg, is_dome, stadium)
+                VALUES (?, ?, 72.0, 0.0, 0.0, NULL, 1, ?)
+            """, (home_team, today_str, stadium_name))
+            written += 1
+            continue
+
+        try:
+            r = requests.get(_FORECAST_URL, params={
+                "latitude": lat, "longitude": lon,
+                "hourly": "temperature_2m,wind_speed_10m,wind_direction_10m",
+                "temperature_unit": "celsius",
+                "wind_speed_unit": "ms",
+                "timezone": "America/New_York",
+                "forecast_days": 2,
+            }, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as exc:
+            print(f"[Weather] FAILED for {home_team}: {exc}")
+            failed += 1
+            continue
+
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+        temps = hourly.get("temperature_2m", [])
+        winds = hourly.get("wind_speed_10m", [])
+        dirs_ = hourly.get("wind_direction_10m", [])
+
+        # Find 7 PM hour on today
+        idx = None
+        for i, t in enumerate(times):
+            if t.startswith(today_str) and len(t) >= 13 and int(t[11:13]) == 19:
+                idx = i
+                break
+        if idx is None:
+            # Fallback: first hour matching today
+            for i, t in enumerate(times):
+                if t.startswith(today_str):
+                    idx = i
+                    break
+
+        if idx is None:
+            failed += 1
+            continue
+
+        temp_c = temps[idx] if idx < len(temps) and temps[idx] is not None else None
+        wind_ms = winds[idx] if idx < len(winds) and winds[idx] is not None else None
+        wind_dir = dirs_[idx] if idx < len(dirs_) and dirs_[idx] is not None else None
+
+        temp_f = round(temp_c * 9 / 5 + 32, 1) if temp_c is not None else None
+        wind_mph = round(wind_ms * 2.237, 1) if wind_ms is not None else None
+
+        # For today's fetch: the Forecast API IS the forecast, so
+        # wind_speed_forecast_mph = wind_speed_mph (both are forecast values)
+        conn.execute("""
+            INSERT OR REPLACE INTO game_weather
+                (home_team, game_date, temperature_f, wind_speed_mph,
+                 wind_speed_forecast_mph, wind_direction_deg, is_dome, stadium)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+        """, (home_team, today_str, temp_f, wind_mph, wind_mph, wind_dir, stadium_name))
+        written += 1
+        import time as _time
+        _time.sleep(0.1)
+
+    conn.commit()
+    conn.close()
+
+    result = {"status": "ok", "games_written": written, "games_failed": failed}
+
+    # ── LOUD FAILURE ALERT ──
+    if failed > 0 or written == 0:
+        _alert_msg = (f"[WEATHER REFRESH ALERT] {today_str}: "
+                      f"written={written}, failed={failed}")
+        print(f"[Scheduler] ERROR {_alert_msg}")
+        # macOS notification
+        try:
+            os.system(
+                f'osascript -e \'display notification "{_alert_msg}" '
+                f'with title "BetIQ Weather FAIL" sound name "Basso"\''
+            )
+        except Exception:
+            pass
+        result["alert"] = _alert_msg
+
+    print(f"[Scheduler] Weather refresh: {written} written, {failed} failed")
+    return result
+
+
 # ── NegBin shadow AM — runs AFTER alt_lines_morning guarantees full-slate odds ──
 
 def _should_run_negbin_shadow_am() -> bool:
@@ -1999,6 +2160,9 @@ def _run_negbin_shadow_am() -> dict:
             generate_atscap_counterfactual,
             generate_edgegate_counterfactual,
             generate_fullstack_counterfactual,
+            generate_composite_counterfactual,
+            generate_distwp_gated_counterfactual,
+            generate_bothgates_counterfactual,
             _get_todays_fixtures,
         )
         from datetime import datetime as _dt
@@ -2043,9 +2207,28 @@ def _run_negbin_shadow_am() -> dict:
             print(f"[Scheduler] NegBin full-stack counterfactual: {count_fs} parlays "
                   f"(select→gate→dist_wp Kelly)")
 
+            # Composite: ridge_composite leg selection + bayes floor
+            result_comp = generate_composite_counterfactual(db, today_str=today_str)
+            count_comp = len(result_comp) if result_comp else 0
+            print(f"[Scheduler] NegBin composite counterfactual: {count_comp} parlays "
+                  f"(ridge>=0.80, bayes>=0.65)")
+
+            # dist_wp gate: keep legs only where dist_wp >= market_implied
+            result_dwg = generate_distwp_gated_counterfactual(db, today_str=today_str)
+            count_dwg = len(result_dwg) if result_dwg else 0
+            print(f"[Scheduler] NegBin dist_wp-gate counterfactual: {count_dwg} parlays "
+                  f"(dist_wp>=market_implied per leg)")
+
+            # Both gates: dist_wp >= market_implied AND edge < 12pp
+            result_bg = generate_bothgates_counterfactual(db, today_str=today_str)
+            count_bg = len(result_bg) if result_bg else 0
+            print(f"[Scheduler] NegBin both-gates counterfactual: {count_bg} parlays "
+                  f"(dist_wp>=mkt_implied + edge<12pp)")
+
             return {"shadow_a": count_a, "shadow_b": count_b,
                     "atscap": count_cap, "edgegate": count_edge,
-                    "fullstack": count_fs}
+                    "fullstack": count_fs, "composite": count_comp,
+                    "distwp_gate": count_dwg, "bothgates": count_bg}
         finally:
             db.close()
     except Exception as exc:
@@ -3211,9 +3394,13 @@ def _loop(interval_mins: int, auto_retrain: bool):
         # (fires at :00 and :30 CT) — do NOT dispatch here to avoid double-settlement.
         _dispatch("regime_classify",     _should_run_regime_classification, _run_regime_classification,     "last_regime_classify")
         _dispatch("alt_lines_morning",   _should_run_alt_lines_morning,     _run_alt_lines_fetch,           "last_alt_lines_fetch_morning")
-        # NegBin shadow AM — MUST run after alt_lines_morning completes (full-slate odds).
-        # _dispatch is synchronous: alt_lines_morning blocks until done, so this line
-        # only executes after the fetch has returned and state is stamped.
+        # Weather refresh — MUST run after alt_lines_morning (needs fixture list), BEFORE NegBin.
+        # Fetches forecast wind for today's games into game_weather.wind_speed_forecast_mph.
+        # Alerts loudly on failure (prevents silent month-long dropout).
+        _dispatch("weather_refresh",     _should_run_weather_refresh,       _run_weather_refresh,           "last_weather_refresh", use_now_utc=False)
+        # NegBin shadow AM — MUST run after alt_lines_morning + weather_refresh complete.
+        # _dispatch is synchronous: previous jobs block until done, so this line
+        # only executes after weather has landed and state is stamped.
         _dispatch("negbin_shadow_am",    _should_run_negbin_shadow_am,      _run_negbin_shadow_am,          "last_negbin_shadow_am", use_now_utc=False)
         # Shadow B (recalibrated) stamped inside _run_negbin_shadow_am — same fixture snapshot
         # ATS ungated shadow — scores ALL MLB spread legs (no gates) for discrimination analysis

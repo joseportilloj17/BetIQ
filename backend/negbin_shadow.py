@@ -72,6 +72,9 @@ def _ensure_shadow_columns():
         ("mock_bets",     "negbin_cell_adj",   "ALTER TABLE mock_bets ADD COLUMN negbin_cell_adj REAL"),
         ("mock_bets",     "negbin_leg_count",  "ALTER TABLE mock_bets ADD COLUMN negbin_leg_count INTEGER"),
         ("mock_bets",     "live_realistic",    "ALTER TABLE mock_bets ADD COLUMN live_realistic INTEGER DEFAULT 0"),
+        ("mock_bets",     "mean_leg_dist_wp",  "ALTER TABLE mock_bets ADD COLUMN mean_leg_dist_wp REAL"),
+        ("mock_bets",     "min_leg_dist_wp",   "ALTER TABLE mock_bets ADD COLUMN min_leg_dist_wp REAL"),
+        ("mock_bets",     "concentrated_risk", "ALTER TABLE mock_bets ADD COLUMN concentrated_risk INTEGER DEFAULT 0"),
     ]
     try:
         con = sqlite3.connect(_BETS_DB, timeout=15)
@@ -97,63 +100,73 @@ def _build_bayes_team_cache():
 
     OOS discrimination confirmed: rho=+0.435, quintile Q0=45%→Q4=98%.
     Uses only source='shadow_negbin' settled legs to avoid leakage.
+    Retries once on transient SQLite lock (fix for 2026-07-18 silent failure).
     """
     global _BAYES_TEAM_CACHE
-    try:
-        con = sqlite3.connect(_BETS_DB, timeout=15)
-        rows = con.execute("""
-            SELECT mbl.description, mbl.leg_result
-            FROM mock_bet_legs mbl
-            JOIN mock_bets mb ON mb.id = mbl.mock_bet_id
-            WHERE mb.source = 'shadow_negbin'
-            AND mbl.leg_result IN ('WIN', 'LOSS')
-            AND mbl.negbin_wp IS NOT NULL
-        """).fetchall()
-        con.close()
+    import time as _time
 
-        if len(rows) < 100:
-            print(f"[negbin-shadow] Bayes cache: insufficient data ({len(rows)} legs)")
-            return
+    for attempt in range(2):
+        try:
+            con = sqlite3.connect(_BETS_DB, timeout=30)
+            rows = con.execute("""
+                SELECT mbl.description, mbl.leg_result
+                FROM mock_bet_legs mbl
+                JOIN mock_bets mb ON mb.id = mbl.mock_bet_id
+                WHERE mb.source = 'shadow_negbin'
+                AND mbl.leg_result IN ('WIN', 'LOSS')
+                AND mbl.negbin_wp IS NOT NULL
+            """).fetchall()
+            con.close()
 
-        # Parse team name from description (e.g. "Detroit Tigers +1.5" → "Detroit Tigers")
-        import re
-        team_wins = defaultdict(int)
-        team_n = defaultdict(int)
-        for desc, result in rows:
-            if not desc:
-                continue
-            m = re.match(r'(.+?)\s+[+-]?\d+\.?\d*$', desc.strip())
-            if m:
-                team = m.group(1).strip()
-                team_n[team] += 1
-                if result == "WIN":
-                    team_wins[team] += 1
+            if len(rows) < 100:
+                print(f"[negbin-shadow] Bayes cache: insufficient data ({len(rows)} legs)")
+                return
 
-        if not team_n:
-            return
+            # Parse team name from description (e.g. "Detroit Tigers +1.5" → "Detroit Tigers")
+            import re
+            team_wins = defaultdict(int)
+            team_n = defaultdict(int)
+            for desc, result in rows:
+                if not desc:
+                    continue
+                m = re.match(r'(.+?)\s+[+-]?\d+\.?\d*$', desc.strip())
+                if m:
+                    team = m.group(1).strip()
+                    team_n[team] += 1
+                    if result == "WIN":
+                        team_wins[team] += 1
 
-        grand_wr = sum(team_wins.values()) / sum(team_n.values())
-        grand_var = grand_wr * (1 - grand_wr)
+            if not team_n:
+                return
 
-        # James-Stein shrinkage
-        team_rates = {t: team_wins[t] / team_n[t] for t in team_n}
-        avg_n = np.mean(list(team_n.values()))
-        rate_var = np.var(list(team_rates.values()))
-        between_var = max(rate_var - grand_var / avg_n, 0.001)
+            grand_wr = sum(team_wins.values()) / sum(team_n.values())
+            grand_var = grand_wr * (1 - grand_wr)
 
-        cache = {}
-        for team in team_n:
-            n = team_n[team]
-            shrinkage = between_var / (between_var + grand_var / n)
-            raw_rate = team_wins[team] / n
-            shrunk = shrinkage * raw_rate + (1 - shrinkage) * grand_wr
-            cache[team] = shrunk
+            # James-Stein shrinkage
+            team_rates = {t: team_wins[t] / team_n[t] for t in team_n}
+            avg_n = np.mean(list(team_n.values()))
+            rate_var = np.var(list(team_rates.values()))
+            between_var = max(rate_var - grand_var / avg_n, 0.001)
 
-        _BAYES_TEAM_CACHE = cache
-        print(f"[negbin-shadow] Bayes cache built: {len(cache)} teams, "
-              f"grand WR={grand_wr:.3f}, avg shrinkage={np.mean([between_var / (between_var + grand_var / team_n[t]) for t in team_n]):.3f}")
-    except Exception as exc:
-        print(f"[negbin-shadow] Bayes cache error: {exc}")
+            cache = {}
+            for team in team_n:
+                n = team_n[team]
+                shrinkage = between_var / (between_var + grand_var / n)
+                raw_rate = team_wins[team] / n
+                shrunk = shrinkage * raw_rate + (1 - shrinkage) * grand_wr
+                cache[team] = shrunk
+
+            _BAYES_TEAM_CACHE = cache
+            print(f"[negbin-shadow] Bayes cache built: {len(cache)} teams, "
+                  f"grand WR={grand_wr:.3f}, avg shrinkage={np.mean([between_var / (between_var + grand_var / team_n[t]) for t in team_n]):.3f}")
+            return  # success
+        except Exception as exc:
+            if attempt == 0:
+                print(f"[negbin-shadow] Bayes cache attempt 1 failed ({exc}), retrying in 5s...")
+                _time.sleep(5)
+            else:
+                print(f"CRITICAL [negbin-shadow] Bayes cache FAILED after retry: {exc}")
+                print(f"[negbin-shadow] All downstream signals (ridge_composite, mkt_disagree) will be NULL this run")
 
 
 def _lookup_market_implied(fixture_id: str, team: str, spread_value) -> float | None:
@@ -1549,6 +1562,11 @@ _KELLY_BASE_STAKE = 10.0     # notional bankroll unit
 _KELLY_MAX_WEIGHT = 2.5      # cap at 2.5x base (conservative)
 _KELLY_MIN_WEIGHT = 0.10     # floor (no zero-weight parlays)
 _CORR_FIXTURE_CAP = 0.70     # daily fixture concentration cap for correlation adj
+_NOTIONAL_BANKROLL = 1000.0  # notional bankroll for sizing ($10 base = 1% per unit)
+_DAILY_EXPOSURE_CAP = 0.15   # max 15% of notional bankroll at risk per day
+                              # Rationale: effective-N per day ≈ 22 (8.6x correlated),
+                              # worst day -37% → -8.9% at zero Sharpe cost (0.428 constant).
+                              # Correlated-slate risk = the drawdown driver, not concentration.
 
 
 def generate_fullstack_counterfactual(db=None, today_str=None):
@@ -1867,6 +1885,22 @@ def generate_fullstack_counterfactual(db=None, today_str=None):
                 parlay_weights[pid] = max(parlay_weights[pid] * dampen,
                                           _KELLY_MIN_WEIGHT)
 
+    # ── Layer 5: Daily exposure cap ──
+    # Scale all weights proportionally so total daily staked ≤ 15% of bankroll.
+    # Effective-N ≈ 22/day (8.6x correlated) → the slate is ~1 bet.
+    # Cap is a pure volatility dial: Sharpe constant at 0.428 regardless of level.
+    max_daily = _DAILY_EXPOSURE_CAP * _NOTIONAL_BANKROLL
+    pre_cap_staked = sum(w * _KELLY_BASE_STAKE for w in parlay_weights.values())
+    if pre_cap_staked > max_daily:
+        scale = max_daily / pre_cap_staked
+        for pid in parlay_weights:
+            parlay_weights[pid] = round(parlay_weights[pid] * scale, 6)
+        print(f"[fullstack] Daily exposure cap: ${pre_cap_staked:.1f} → "
+              f"${max_daily:.1f} (scale={scale:.3f})")
+    else:
+        print(f"[fullstack] Daily exposure: ${pre_cap_staked:.1f} "
+              f"within ${max_daily:.1f} cap — no scaling needed")
+
     # ── Summary stats ──
     weights = list(parlay_weights.values())
     total_staked = sum(w * _KELLY_BASE_STAKE for w in weights)
@@ -1974,6 +2008,1158 @@ def generate_fullstack_counterfactual(db=None, today_str=None):
 
     # ── Tracker ──
     _report_fullstack_tracker(db)
+
+    return after_gate
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMPOSITE ARM — ridge_composite leg selection + bayes_team_wp floor
+# ═══════════════════════════════════════════════════════════════════════════
+_COMPOSITE_SOURCE = "shadow_negbin_composite"
+_COMPOSITE_RIDGE_FLOOR = 0.80       # leg must have ridge_composite >= this
+_COMPOSITE_BAYES_FLOOR = 0.65       # leg must have bayes_team_wp >= this
+_COMPOSITE_PARLAY_MIN_RC = 0.75     # min(ridge_composite) across parlay legs
+
+
+def generate_composite_counterfactual(db=None, today_str=None):
+    """Composite counterfactual: ridge_composite leg selection + bayes floor.
+
+    Architecture:
+      1. Start from Shadow A parlays (same as fullstack)
+      2. Edge gate (same as fullstack: reject max edge_pp >= 12)
+      3. Leg screening: reject legs where ridge_composite < 0.80 OR bayes_team_wp < 0.65
+         → kills CIN (bayes 0.24, composite 0.49) and OAK (bayes 0.11, composite 0.36)
+      4. Parlay screening: reject parlays where min(ridge_composite) < 0.75
+      5. Quarter-Kelly sizing on remaining parlays (same as fullstack)
+
+    Source tag: shadow_negbin_composite
+    """
+    from database import MockBet, MockBetLeg
+    from sqlalchemy import text as _text
+    import re
+
+    if today_str is None:
+        today_str = datetime.now(_CT).strftime("%Y-%m-%d")
+
+    print(f"\n[composite] Generating composite counterfactual for {today_str} "
+          f"(ridge>={_COMPOSITE_RIDGE_FLOOR}, bayes>={_COMPOSITE_BAYES_FLOOR})")
+
+    # ── Dedup ──
+    existing = db.execute(_text(
+        "SELECT COUNT(*) FROM mock_bets "
+        "WHERE source=:src AND game_date=:gd"
+    ), {"src": _COMPOSITE_SOURCE, "gd": today_str}).scalar()
+    if existing > 0:
+        print(f"[composite] Already {existing} composite parlays for {today_str} — skipping")
+        return []
+
+    # ── Read Shadow A's parlays for today ──
+    a_parlays = db.execute(_text(
+        "SELECT id, bet_info, odds, composite_score, negbin_odds_band, "
+        "       negbin_leg_count, predicted_win_prob "
+        "FROM mock_bets "
+        "WHERE source='shadow_negbin' AND game_date=:gd "
+        "  AND cohort='clean' "
+        "ORDER BY composite_score DESC"
+    ), {"gd": today_str}).fetchall()
+
+    if not a_parlays:
+        print("[composite] No Shadow A parlays found for today")
+        return []
+
+    # ── Read all legs with signals (including ridge_composite + bayes_team_wp) ──
+    leg_data = db.execute(_text(
+        "SELECT l.mock_bet_id, l.description, l.win_prob, l.negbin_edge_pp, "
+        "       l.fixture_id, l.leg_index, l.ats_cover_wp, l.negbin_wp, "
+        "       l.negbin_mu_home, l.negbin_mu_away, l.negbin_cell, l.ats_dist_wp, "
+        "       l.ridge_composite, l.bayes_team_wp "
+        "FROM mock_bet_legs l "
+        "JOIN mock_bets b ON l.mock_bet_id = b.id "
+        "WHERE b.source='shadow_negbin' AND b.game_date=:gd AND b.cohort='clean'"
+    ), {"gd": today_str}).fetchall()
+
+    parlay_legs = defaultdict(list)
+    for row_l in leg_data:
+        (mid, desc, wp, edge, fix_id, idx, ats, nb_wp,
+         mu_h, mu_a, cell, dist_wp, ridge_c, bayes_wp) = row_l
+        parlay_legs[mid].append({
+            "description": desc, "win_prob": wp, "negbin_edge_pp": edge,
+            "fixture_id": fix_id, "leg_index": idx, "ats_cover_wp": ats,
+            "negbin_wp": nb_wp, "negbin_mu_home": mu_h, "negbin_mu_away": mu_a,
+            "negbin_cell": cell, "ats_dist_wp": dist_wp,
+            "ridge_composite": ridge_c, "bayes_team_wp": bayes_wp,
+        })
+
+    # ── Layer 1: Edge gate (same as fullstack) ──
+    after_gate = []
+    n_rejected_edge = 0
+    for row in a_parlays:
+        pid = row[0]
+        legs = parlay_legs.get(pid, [])
+        edges = [leg["negbin_edge_pp"] for leg in legs
+                 if leg["negbin_edge_pp"] is not None]
+        max_edge = max(edges) if edges else 0
+        if max_edge >= _EDGE_GATE_THRESHOLD_PP:
+            n_rejected_edge += 1
+        else:
+            after_gate.append(row)
+
+    print(f"[composite] Edge gate: {len(a_parlays)} → {len(after_gate)} "
+          f"({n_rejected_edge} rejected)")
+
+    if not after_gate:
+        print("[composite] All parlays rejected by edge gate")
+        return []
+
+    # ── Layer 2: Leg-level composite screening ──
+    # Reject parlays that contain ANY leg with ridge_composite < floor OR bayes_team_wp < floor
+    after_leg_screen = []
+    n_rejected_leg = 0
+    n_missing_signal = 0
+
+    for row in after_gate:
+        pid = row[0]
+        legs = parlay_legs.get(pid, [])
+        reject = False
+        has_signal = False
+        for leg in legs:
+            rc = leg["ridge_composite"]
+            bwp = leg["bayes_team_wp"]
+            if rc is None or bwp is None:
+                # Can't evaluate — reject (conservative: don't pass unscored legs)
+                reject = True
+                n_missing_signal += 1
+                break
+            has_signal = True
+            if rc < _COMPOSITE_RIDGE_FLOOR:
+                reject = True
+                break
+            if bwp < _COMPOSITE_BAYES_FLOOR:
+                reject = True
+                break
+        if reject:
+            n_rejected_leg += 1
+        else:
+            after_leg_screen.append(row)
+
+    print(f"[composite] Leg screen: {len(after_gate)} → {len(after_leg_screen)} "
+          f"({n_rejected_leg} rejected, {n_missing_signal} missing signals)")
+
+    if not after_leg_screen:
+        print("[composite] All parlays rejected by leg screening")
+        return []
+
+    # ── Layer 3: Parlay-level min(ridge_composite) check ──
+    after_parlay_screen = []
+    n_rejected_parlay = 0
+
+    for row in after_leg_screen:
+        pid = row[0]
+        legs = parlay_legs.get(pid, [])
+        min_rc = min(leg["ridge_composite"] for leg in legs)
+        if min_rc < _COMPOSITE_PARLAY_MIN_RC:
+            n_rejected_parlay += 1
+        else:
+            after_parlay_screen.append(row)
+
+    print(f"[composite] Parlay min-RC screen: {len(after_leg_screen)} → {len(after_parlay_screen)} "
+          f"({n_rejected_parlay} rejected, floor={_COMPOSITE_PARLAY_MIN_RC})")
+
+    if not after_parlay_screen:
+        print("[composite] All parlays rejected by parlay min-RC screen")
+        return []
+
+    # ── Layer 4: dist_wp parlay-level cover probability ──
+    parlay_dist_wp = {}
+    n_missing_dist = 0
+
+    for row in after_parlay_screen:
+        pid = row[0]
+        legs = parlay_legs.get(pid, [])
+        leg_probs = []
+        for leg in legs:
+            dist = leg["ats_dist_wp"]
+            if dist is not None and dist > 0:
+                leg_probs.append(dist)
+            else:
+                mkt = leg["win_prob"]
+                if mkt is not None and mkt > 0:
+                    leg_probs.append(mkt)
+                    n_missing_dist += 1
+                else:
+                    leg_probs.append(0.75)
+                    n_missing_dist += 1
+
+        parlay_prob = 1.0
+        for p in leg_probs:
+            parlay_prob *= p
+        parlay_dist_wp[pid] = parlay_prob
+
+    if n_missing_dist > 0:
+        print(f"[composite] {n_missing_dist} legs missing dist_wp — used market fallback")
+
+    # ── Layer 5: Quarter-Kelly sizing (same logic as fullstack) ──
+    dist_pairs = [(row[0], parlay_dist_wp[row[0]]) for row in after_parlay_screen]
+    dist_pairs.sort(key=lambda x: x[1])
+    n_parlays = len(dist_pairs)
+
+    _Q_WRS = [0.60, 0.70, 0.75, 0.80, 0.90]
+
+    parlay_weights = {}
+    for rank_idx, (pid, dp) in enumerate(dist_pairs):
+        rank_frac = rank_idx / max(n_parlays - 1, 1)
+        q_idx = rank_frac * 4
+        q_lo = int(q_idx)
+        q_hi = min(q_lo + 1, 4)
+        frac = q_idx - q_lo
+        p_mapped = _Q_WRS[q_lo] * (1 - frac) + _Q_WRS[q_hi] * frac
+
+        odds = dict((r[0], r[2] or 2.0) for r in after_parlay_screen)[pid]
+
+        edge = p_mapped * odds - 1.0
+        if edge <= 0 or odds <= 1.0:
+            kelly_frac = 0.0
+        else:
+            kelly_frac = edge / (odds - 1.0)
+
+        quarter_kelly = kelly_frac * _KELLY_FRACTION
+        weight = max(min(quarter_kelly, _KELLY_MAX_WEIGHT), _KELLY_MIN_WEIGHT)
+        parlay_weights[pid] = weight
+
+    # ── Layer 6: Correlation-aware fixture concentration dampening ──
+    fixture_counts = defaultdict(int)
+    n_kept = len(after_parlay_screen)
+    for row in after_parlay_screen:
+        pid = row[0]
+        legs = parlay_legs.get(pid, [])
+        seen = set()
+        for leg in legs:
+            fid = leg["fixture_id"]
+            if fid and fid not in seen:
+                fixture_counts[fid] += 1
+                seen.add(fid)
+
+    concentrated = {fid: cnt for fid, cnt in fixture_counts.items()
+                    if cnt / n_kept > _CORR_FIXTURE_CAP}
+    if concentrated:
+        print(f"[composite] Fixture concentration dampening: "
+              f"{len(concentrated)} fixtures above {_CORR_FIXTURE_CAP*100:.0f}% cap")
+        for row in after_parlay_screen:
+            pid = row[0]
+            legs = parlay_legs.get(pid, [])
+            max_conc = 0
+            for leg in legs:
+                fid = leg["fixture_id"]
+                if fid in concentrated:
+                    conc_ratio = fixture_counts[fid] / n_kept
+                    max_conc = max(max_conc, conc_ratio)
+            if max_conc > _CORR_FIXTURE_CAP:
+                dampen = _CORR_FIXTURE_CAP / max_conc
+                parlay_weights[pid] = max(parlay_weights[pid] * dampen,
+                                          _KELLY_MIN_WEIGHT)
+
+    # ── Layer 7: Daily exposure cap ──
+    max_daily = _DAILY_EXPOSURE_CAP * _NOTIONAL_BANKROLL
+    pre_cap_staked = sum(w * _KELLY_BASE_STAKE for w in parlay_weights.values())
+    if pre_cap_staked > max_daily:
+        scale = max_daily / pre_cap_staked
+        for pid in parlay_weights:
+            parlay_weights[pid] = round(parlay_weights[pid] * scale, 6)
+        print(f"[composite] Daily exposure cap: ${pre_cap_staked:.1f} → "
+              f"${max_daily:.1f} (scale={scale:.3f})")
+    else:
+        print(f"[composite] Daily exposure: ${pre_cap_staked:.1f} "
+              f"within ${max_daily:.1f} cap — no scaling needed")
+
+    # ── Summary ──
+    weights = list(parlay_weights.values())
+    total_staked = sum(w * _KELLY_BASE_STAKE for w in weights)
+    equal_staked = n_kept * _KELLY_BASE_STAKE
+    neg_edge = sum(1 for row in after_parlay_screen
+                   if parlay_weights[row[0]] <= _KELLY_MIN_WEIGHT)
+
+    print(f"[composite] {n_kept} kept parlays: "
+          f"avg_weight={np.mean(weights):.3f}, "
+          f"median={np.median(weights):.3f}, "
+          f"staked=${total_staked:.1f}/${equal_staked:.1f} "
+          f"({total_staked/equal_staked*100:.0f}%), "
+          f"neg_edge={neg_edge}")
+
+    # ── Store as shadow_negbin_composite ──
+    run_id = str(uuid.uuid4())
+    stored = 0
+    for row in after_parlay_screen:
+        pid, bet_info, odds, comp, band, lc, wp = row
+        weight = round(parlay_weights[pid], 4)
+        sized_amount = round(_KELLY_BASE_STAKE * weight, 2)
+        dist_prob = parlay_dist_wp[pid]
+        mock_id = str(uuid.uuid4())
+
+        mock = MockBet(
+            id=mock_id,
+            generation_run_id=run_id,
+            game_date=today_str,
+            sport="MLB",
+            bet_type="parlay" if (lc or 2) > 1 else "straight",
+            odds=odds,
+            amount=sized_amount,
+            legs=lc or 2,
+            bet_info=bet_info,
+            predicted_win_prob=dist_prob,
+            model_used="negbin_v1+ridge_composite",
+            status="PENDING",
+            source=_COMPOSITE_SOURCE,
+            composite_score=comp,
+            cohort="clean",
+            weight=weight,
+        )
+        db.add(mock)
+        db.flush()
+
+        try:
+            db.execute(_text(
+                "UPDATE mock_bets SET negbin_odds_band=:band, negbin_leg_count=:lc "
+                "WHERE id=:mid"
+            ), {"band": band, "lc": lc, "mid": mock_id})
+        except Exception:
+            pass
+
+        # Copy legs with all columns
+        legs = parlay_legs.get(pid, [])
+        for leg in legs:
+            leg_obj = MockBetLeg(
+                mock_bet_id=mock_id,
+                leg_index=leg["leg_index"],
+                description=leg["description"],
+                market_type="alternate_spreads",
+                sport="MLB",
+                win_prob=leg["win_prob"],
+                fixture_id=leg["fixture_id"],
+                is_alt_line=True,
+            )
+            db.add(leg_obj)
+            db.flush()
+            updates = {}
+            if leg["negbin_wp"] is not None:
+                updates["negbin_wp"] = leg["negbin_wp"]
+            if leg["negbin_edge_pp"] is not None:
+                updates["negbin_edge_pp"] = leg["negbin_edge_pp"]
+            if leg["negbin_mu_home"] is not None:
+                updates["negbin_mu_home"] = leg["negbin_mu_home"]
+            if leg["negbin_mu_away"] is not None:
+                updates["negbin_mu_away"] = leg["negbin_mu_away"]
+            if leg["negbin_cell"] is not None:
+                updates["negbin_cell"] = leg["negbin_cell"]
+            if leg["ats_cover_wp"] is not None:
+                updates["ats_cover_wp"] = leg["ats_cover_wp"]
+            if leg["ats_dist_wp"] is not None:
+                updates["ats_dist_wp"] = leg["ats_dist_wp"]
+            if leg["bayes_team_wp"] is not None:
+                updates["bayes_team_wp"] = leg["bayes_team_wp"]
+            if leg["ridge_composite"] is not None:
+                updates["ridge_composite"] = leg["ridge_composite"]
+            if updates:
+                set_clause = ", ".join(f"{k}=:{k}" for k in updates)
+                updates["lid"] = leg_obj.id
+                try:
+                    db.execute(_text(
+                        f"UPDATE mock_bet_legs SET {set_clause} WHERE id=:lid"
+                    ), updates)
+                except Exception:
+                    pass
+
+        stored += 1
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[composite] DB commit failed: {e}")
+        return []
+
+    print(f"[composite] Stored {stored} composite parlays "
+          f"(source={_COMPOSITE_SOURCE})")
+
+    return after_parlay_screen
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# REAL MARKET-IMPLIED HELPER — used by dist_wp gate and both-gates arms
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Cache: fixture_id → (home_team, away_team) — populated per-day
+_fixture_teams_cache = {}
+
+
+def _get_fixture_teams(fixture_id, db):
+    """Resolve fixture_id → (home_team, away_team) from betiq.db fixtures table."""
+    if fixture_id in _fixture_teams_cache:
+        return _fixture_teams_cache[fixture_id]
+    from sqlalchemy import text as _text
+    row = db.execute(_text(
+        "SELECT home_team, away_team FROM fixtures WHERE id=:fid"
+    ), {"fid": fixture_id}).first()
+    if row:
+        _fixture_teams_cache[fixture_id] = (row[0], row[1])
+        return (row[0], row[1])
+    return (None, None)
+
+
+def _real_market_implied_for_leg(leg, game_date, db):
+    """Get real market-implied probability from alt_lines for a counterfactual leg.
+
+    Parses leg description ("TeamName +1.5") to extract pick_team and rung,
+    then queries alt_lines for actual decimal odds.
+    Falls back to back-derivation (negbin_wp - edge_pp/100) if alt_lines miss.
+
+    Returns: market_implied probability (float) or None if completely unavailable.
+    """
+    import re
+    desc = leg.get("description", "")
+    # Parse "TeamName +1.5" or "TeamName +2.5" etc.
+    m = re.match(r"^(.+?)\s+\+(\d+\.?\d*)$", desc)
+    if not m:
+        # Fallback: back-derive
+        nb_wp = leg.get("negbin_wp")
+        edge_pp = leg.get("negbin_edge_pp")
+        if nb_wp is not None and edge_pp is not None:
+            return nb_wp - edge_pp / 100.0
+        return None
+
+    pick_team = m.group(1).strip()
+    rung = float(m.group(2))
+
+    # Resolve fixture to get home/away
+    fixture_id = leg.get("fixture_id")
+    if fixture_id:
+        home_team, away_team = _get_fixture_teams(fixture_id, db)
+    else:
+        home_team, away_team = None, None
+
+    if home_team is None or away_team is None:
+        # Fallback: back-derive
+        nb_wp = leg.get("negbin_wp")
+        edge_pp = leg.get("negbin_edge_pp")
+        if nb_wp is not None and edge_pp is not None:
+            return nb_wp - edge_pp / 100.0
+        return None
+
+    # Determine side
+    if pick_team == home_team:
+        side = "home"
+    elif pick_team == away_team:
+        side = "away"
+    else:
+        # Fuzzy: team name might be abbreviated — fallback
+        nb_wp = leg.get("negbin_wp")
+        edge_pp = leg.get("negbin_edge_pp")
+        if nb_wp is not None and edge_pp is not None:
+            return nb_wp - edge_pp / 100.0
+        return None
+
+    mkt_wp, dec_odds = _get_market_implied(home_team, away_team, game_date, rung, side)
+    if mkt_wp is not None:
+        return mkt_wp
+
+    # Final fallback: back-derive
+    nb_wp = leg.get("negbin_wp")
+    edge_pp = leg.get("negbin_edge_pp")
+    if nb_wp is not None and edge_pp is not None:
+        return nb_wp - edge_pp / 100.0
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DIST_WP GATE ARM — dist_wp > market_implied per-leg inclusion gate
+# ═══════════════════════════════════════════════════════════════════════════
+_DISTWP_GATE_SOURCE = "shadow_negbin_distwp_gate"
+
+
+def generate_distwp_gated_counterfactual(db=None, today_str=None):
+    """dist_wp-gated counterfactual: keep legs only where dist_wp > market implied.
+
+    Architecture:
+      1. Start from Shadow A parlays (same fixture snapshot)
+      2. For each leg, derive market_implied = negbin_wp - negbin_edge_pp/100
+      3. Gate: keep leg only if ats_dist_wp >= market_implied
+      4. Reject parlay if ANY leg fails the gate (no partial parlays)
+      5. Quarter-Kelly sizing on remaining parlays (same dist_wp quintile-mapped WRs)
+
+    Rationale:
+      dist_wp has rho=0.285 discrimination vs NegBin rho=0.077 (3.7x).
+      On disagreement legs (50%), dist_wp is within 2.65pp of actual;
+      NegBin overconfident by 14.44pp. Gate validated at +0.118/unit on real rung odds.
+
+    Source tag: shadow_negbin_distwp_gate
+    """
+    from database import MockBet, MockBetLeg
+    from sqlalchemy import text as _text
+
+    if today_str is None:
+        today_str = datetime.now(_CT).strftime("%Y-%m-%d")
+
+    print(f"\n[distwp-gate] Generating dist_wp-gated counterfactual for {today_str}")
+
+    # ── Dedup ──
+    existing = db.execute(_text(
+        "SELECT COUNT(*) FROM mock_bets "
+        "WHERE source=:src AND game_date=:gd"
+    ), {"src": _DISTWP_GATE_SOURCE, "gd": today_str}).scalar()
+    if existing > 0:
+        print(f"[distwp-gate] Already {existing} parlays for {today_str} — skipping")
+        return []
+
+    # ── Read Shadow A's parlays for today ──
+    a_parlays = db.execute(_text(
+        "SELECT id, bet_info, odds, composite_score, negbin_odds_band, "
+        "       negbin_leg_count, predicted_win_prob "
+        "FROM mock_bets "
+        "WHERE source='shadow_negbin' AND game_date=:gd "
+        "  AND cohort='clean' "
+        "ORDER BY composite_score DESC"
+    ), {"gd": today_str}).fetchall()
+
+    if not a_parlays:
+        print("[distwp-gate] No Shadow A parlays found for today")
+        return []
+
+    # ── Read all legs with signals ──
+    leg_data = db.execute(_text(
+        "SELECT l.mock_bet_id, l.description, l.win_prob, l.negbin_edge_pp, "
+        "       l.fixture_id, l.leg_index, l.ats_cover_wp, l.negbin_wp, "
+        "       l.negbin_mu_home, l.negbin_mu_away, l.negbin_cell, l.ats_dist_wp, "
+        "       l.ridge_composite, l.bayes_team_wp "
+        "FROM mock_bet_legs l "
+        "JOIN mock_bets b ON l.mock_bet_id = b.id "
+        "WHERE b.source='shadow_negbin' AND b.game_date=:gd AND b.cohort='clean'"
+    ), {"gd": today_str}).fetchall()
+
+    parlay_legs = defaultdict(list)
+    for row_l in leg_data:
+        (mid, desc, wp, edge, fix_id, idx, ats, nb_wp,
+         mu_h, mu_a, cell, dist_wp, ridge_c, bayes_wp) = row_l
+        parlay_legs[mid].append({
+            "description": desc, "win_prob": wp, "negbin_edge_pp": edge,
+            "fixture_id": fix_id, "leg_index": idx, "ats_cover_wp": ats,
+            "negbin_wp": nb_wp, "negbin_mu_home": mu_h, "negbin_mu_away": mu_a,
+            "negbin_cell": cell, "ats_dist_wp": dist_wp,
+            "ridge_composite": ridge_c, "bayes_team_wp": bayes_wp,
+        })
+
+    # ── Gate: dist_wp >= market_implied per leg ──
+    # Uses REAL market-implied from alt_lines (actual odds), back-derive as fallback
+    after_gate = []
+    n_rejected = 0
+    n_missing = 0
+    n_legs_rejected = 0
+    n_legs_total = 0
+    n_real_odds = 0
+    n_fallback = 0
+
+    for row in a_parlays:
+        pid = row[0]
+        legs = parlay_legs.get(pid, [])
+        reject = False
+        for leg in legs:
+            n_legs_total += 1
+            dist_wp = leg["ats_dist_wp"]
+
+            if dist_wp is None:
+                reject = True
+                n_missing += 1
+                break
+
+            # Get real market-implied from alt_lines
+            market_implied = _real_market_implied_for_leg(leg, today_str, db)
+
+            if market_implied is None:
+                reject = True
+                n_missing += 1
+                break
+
+            # Track source (real odds vs fallback)
+            nb_wp = leg.get("negbin_wp")
+            edge_pp = leg.get("negbin_edge_pp")
+            if nb_wp is not None and edge_pp is not None:
+                back_derived = nb_wp - edge_pp / 100.0
+                if abs(market_implied - back_derived) > 0.001:
+                    n_real_odds += 1  # meaningfully different = came from real odds
+                else:
+                    n_fallback += 1
+            else:
+                n_real_odds += 1
+
+            if dist_wp < market_implied:
+                reject = True
+                n_legs_rejected += 1
+                break
+
+        if reject:
+            n_rejected += 1
+        else:
+            after_gate.append(row)
+
+    print(f"[distwp-gate] Market-implied source: {n_real_odds} real-odds, "
+          f"{n_fallback} back-derived (matched)")
+
+    print(f"[distwp-gate] dist_wp gate: {len(a_parlays)} → {len(after_gate)} "
+          f"({n_rejected} rejected, {n_missing} missing signals, "
+          f"{n_legs_rejected} legs failed gate)")
+
+    if not after_gate:
+        print("[distwp-gate] All parlays rejected by dist_wp gate")
+        return []
+
+    # ── dist_wp parlay-level cover probability ──
+    parlay_dist_wp = {}
+    for row in after_gate:
+        pid = row[0]
+        legs = parlay_legs.get(pid, [])
+        leg_probs = []
+        for leg in legs:
+            dist = leg["ats_dist_wp"]
+            if dist is not None and dist > 0:
+                leg_probs.append(dist)
+            else:
+                leg_probs.append(leg["win_prob"] or 0.75)
+
+        parlay_prob = 1.0
+        for p in leg_probs:
+            parlay_prob *= p
+        parlay_dist_wp[pid] = parlay_prob
+
+    # ── Quarter-Kelly sizing (same logic as fullstack) ──
+    dist_pairs = [(row[0], parlay_dist_wp[row[0]]) for row in after_gate]
+    dist_pairs.sort(key=lambda x: x[1])
+    n_parlays = len(dist_pairs)
+
+    _Q_WRS = [0.60, 0.70, 0.75, 0.80, 0.90]
+
+    parlay_weights = {}
+    for rank_idx, (pid, dp) in enumerate(dist_pairs):
+        rank_frac = rank_idx / max(n_parlays - 1, 1)
+        q_idx = rank_frac * 4
+        q_lo = int(q_idx)
+        q_hi = min(q_lo + 1, 4)
+        frac = q_idx - q_lo
+        p_mapped = _Q_WRS[q_lo] * (1 - frac) + _Q_WRS[q_hi] * frac
+
+        odds = dict((r[0], r[2] or 2.0) for r in after_gate)[pid]
+
+        edge = p_mapped * odds - 1.0
+        if edge <= 0 or odds <= 1.0:
+            kelly_frac = 0.0
+        else:
+            kelly_frac = edge / (odds - 1.0)
+
+        quarter_kelly = kelly_frac * _KELLY_FRACTION
+        weight = max(min(quarter_kelly, _KELLY_MAX_WEIGHT), _KELLY_MIN_WEIGHT)
+        parlay_weights[pid] = weight
+
+    # ── Correlation-aware fixture concentration dampening ──
+    fixture_counts = defaultdict(int)
+    n_kept = len(after_gate)
+    for row in after_gate:
+        pid = row[0]
+        legs = parlay_legs.get(pid, [])
+        seen = set()
+        for leg in legs:
+            fid = leg["fixture_id"]
+            if fid and fid not in seen:
+                fixture_counts[fid] += 1
+                seen.add(fid)
+
+    concentrated = {fid: cnt for fid, cnt in fixture_counts.items()
+                    if cnt / n_kept > _CORR_FIXTURE_CAP}
+    if concentrated:
+        print(f"[distwp-gate] Fixture concentration dampening: "
+              f"{len(concentrated)} fixtures above {_CORR_FIXTURE_CAP*100:.0f}% cap")
+        for row in after_gate:
+            pid = row[0]
+            legs = parlay_legs.get(pid, [])
+            max_conc = 0
+            for leg in legs:
+                fid = leg["fixture_id"]
+                if fid in concentrated:
+                    conc_ratio = fixture_counts[fid] / n_kept
+                    max_conc = max(max_conc, conc_ratio)
+            if max_conc > _CORR_FIXTURE_CAP:
+                dampen = _CORR_FIXTURE_CAP / max_conc
+                parlay_weights[pid] = max(parlay_weights[pid] * dampen,
+                                          _KELLY_MIN_WEIGHT)
+
+    # ── Daily exposure cap ──
+    max_daily = _DAILY_EXPOSURE_CAP * _NOTIONAL_BANKROLL
+    pre_cap_staked = sum(w * _KELLY_BASE_STAKE for w in parlay_weights.values())
+    if pre_cap_staked > max_daily:
+        scale = max_daily / pre_cap_staked
+        for pid in parlay_weights:
+            parlay_weights[pid] = round(parlay_weights[pid] * scale, 6)
+        print(f"[distwp-gate] Daily exposure cap: ${pre_cap_staked:.1f} → "
+              f"${max_daily:.1f} (scale={scale:.3f})")
+    else:
+        print(f"[distwp-gate] Daily exposure: ${pre_cap_staked:.1f} "
+              f"within ${max_daily:.1f} cap — no scaling needed")
+
+    # ── Summary ──
+    weights = list(parlay_weights.values())
+    total_staked = sum(w * _KELLY_BASE_STAKE for w in weights)
+    equal_staked = n_kept * _KELLY_BASE_STAKE
+    neg_edge = sum(1 for row in after_gate
+                   if parlay_weights[row[0]] <= _KELLY_MIN_WEIGHT)
+
+    print(f"[distwp-gate] {n_kept} kept parlays: "
+          f"avg_weight={np.mean(weights):.3f}, "
+          f"median={np.median(weights):.3f}, "
+          f"staked=${total_staked:.1f}/${equal_staked:.1f} "
+          f"({total_staked/equal_staked*100:.0f}%), "
+          f"neg_edge={neg_edge}")
+
+    # ── Store as shadow_negbin_distwp_gate ──
+    run_id = str(uuid.uuid4())
+    stored = 0
+    for row in after_gate:
+        pid, bet_info, odds, comp, band, lc, wp = row
+        weight = round(parlay_weights[pid], 4)
+        sized_amount = round(_KELLY_BASE_STAKE * weight, 2)
+        dist_prob = parlay_dist_wp[pid]
+        mock_id = str(uuid.uuid4())
+
+        mock = MockBet(
+            id=mock_id,
+            generation_run_id=run_id,
+            game_date=today_str,
+            sport="MLB",
+            bet_type="parlay" if (lc or 2) > 1 else "straight",
+            odds=odds,
+            amount=sized_amount,
+            legs=lc or 2,
+            bet_info=bet_info,
+            predicted_win_prob=dist_prob,
+            model_used="negbin_v1+distwp_gate",
+            status="PENDING",
+            source=_DISTWP_GATE_SOURCE,
+            composite_score=comp,
+            cohort="clean",
+            weight=weight,
+        )
+        db.add(mock)
+        db.flush()
+
+        try:
+            db.execute(_text(
+                "UPDATE mock_bets SET negbin_odds_band=:band, negbin_leg_count=:lc "
+                "WHERE id=:mid"
+            ), {"band": band, "lc": lc, "mid": mock_id})
+        except Exception:
+            pass
+
+        # Copy legs with all columns
+        legs = parlay_legs.get(pid, [])
+        for leg in legs:
+            leg_obj = MockBetLeg(
+                mock_bet_id=mock_id,
+                leg_index=leg["leg_index"],
+                description=leg["description"],
+                market_type="alternate_spreads",
+                sport="MLB",
+                win_prob=leg["win_prob"],
+                fixture_id=leg["fixture_id"],
+                is_alt_line=True,
+            )
+            db.add(leg_obj)
+            db.flush()
+            updates = {}
+            if leg["negbin_wp"] is not None:
+                updates["negbin_wp"] = leg["negbin_wp"]
+            if leg["negbin_edge_pp"] is not None:
+                updates["negbin_edge_pp"] = leg["negbin_edge_pp"]
+            if leg["negbin_mu_home"] is not None:
+                updates["negbin_mu_home"] = leg["negbin_mu_home"]
+            if leg["negbin_mu_away"] is not None:
+                updates["negbin_mu_away"] = leg["negbin_mu_away"]
+            if leg["negbin_cell"] is not None:
+                updates["negbin_cell"] = leg["negbin_cell"]
+            if leg["ats_cover_wp"] is not None:
+                updates["ats_cover_wp"] = leg["ats_cover_wp"]
+            if leg["ats_dist_wp"] is not None:
+                updates["ats_dist_wp"] = leg["ats_dist_wp"]
+            if leg["bayes_team_wp"] is not None:
+                updates["bayes_team_wp"] = leg["bayes_team_wp"]
+            if leg["ridge_composite"] is not None:
+                updates["ridge_composite"] = leg["ridge_composite"]
+            if updates:
+                set_clause = ", ".join(f"{k}=:{k}" for k in updates)
+                updates["lid"] = leg_obj.id
+                try:
+                    db.execute(_text(
+                        f"UPDATE mock_bet_legs SET {set_clause} WHERE id=:lid"
+                    ), updates)
+                except Exception:
+                    pass
+
+        stored += 1
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[distwp-gate] DB commit failed: {e}")
+        return []
+
+    print(f"[distwp-gate] Stored {stored} dist_wp-gated parlays "
+          f"(source={_DISTWP_GATE_SOURCE})")
+
+    return after_gate
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BOTH-GATES ARM — dist_wp >= market_implied AND edge < 12pp (toxicity gate)
+# ═══════════════════════════════════════════════════════════════════════════
+_BOTHGATES_SOURCE = "shadow_negbin_bothgates"
+
+
+def generate_bothgates_counterfactual(db=None, today_str=None):
+    """Both-gates counterfactual: dist_wp gate + edge toxicity gate per leg.
+
+    Architecture:
+      1. Start from Shadow A parlays (same fixture snapshot)
+      2. Per-leg dual gate:
+         (a) dist_wp >= market_implied (real odds from alt_lines)
+         (b) negbin_edge_pp < 12 (toxicity gate — reject overconfident legs)
+      3. Reject parlay if ANY leg fails EITHER gate
+      4. Quarter-Kelly sizing on remaining parlays (same dist_wp quintile-mapped WRs)
+
+    Rationale:
+      dist_wp gate alone: +0.118/unit. Both gates: +0.158/unit (higher rate,
+      slightly fewer bets). The edge toxicity gate removes legs where NegBin
+      is overconfident (>12pp claimed edge) which are empirically -EV.
+
+    Source tag: shadow_negbin_bothgates
+    """
+    from database import MockBet, MockBetLeg
+    from sqlalchemy import text as _text
+
+    if today_str is None:
+        today_str = datetime.now(_CT).strftime("%Y-%m-%d")
+
+    print(f"\n[bothgates] Generating both-gates counterfactual for {today_str} "
+          f"(dist_wp>=mkt_implied AND edge<{_EDGE_GATE_THRESHOLD_PP}pp)")
+
+    # ── Dedup ──
+    existing = db.execute(_text(
+        "SELECT COUNT(*) FROM mock_bets "
+        "WHERE source=:src AND game_date=:gd"
+    ), {"src": _BOTHGATES_SOURCE, "gd": today_str}).scalar()
+    if existing > 0:
+        print(f"[bothgates] Already {existing} parlays for {today_str} — skipping")
+        return []
+
+    # ── Read Shadow A's parlays for today ──
+    a_parlays = db.execute(_text(
+        "SELECT id, bet_info, odds, composite_score, negbin_odds_band, "
+        "       negbin_leg_count, predicted_win_prob "
+        "FROM mock_bets "
+        "WHERE source='shadow_negbin' AND game_date=:gd "
+        "  AND cohort='clean' "
+        "ORDER BY composite_score DESC"
+    ), {"gd": today_str}).fetchall()
+
+    if not a_parlays:
+        print("[bothgates] No Shadow A parlays found for today")
+        return []
+
+    # ── Read all legs with signals ──
+    leg_data = db.execute(_text(
+        "SELECT l.mock_bet_id, l.description, l.win_prob, l.negbin_edge_pp, "
+        "       l.fixture_id, l.leg_index, l.ats_cover_wp, l.negbin_wp, "
+        "       l.negbin_mu_home, l.negbin_mu_away, l.negbin_cell, l.ats_dist_wp, "
+        "       l.ridge_composite, l.bayes_team_wp "
+        "FROM mock_bet_legs l "
+        "JOIN mock_bets b ON l.mock_bet_id = b.id "
+        "WHERE b.source='shadow_negbin' AND b.game_date=:gd AND b.cohort='clean'"
+    ), {"gd": today_str}).fetchall()
+
+    parlay_legs = defaultdict(list)
+    for row_l in leg_data:
+        (mid, desc, wp, edge, fix_id, idx, ats, nb_wp,
+         mu_h, mu_a, cell, dist_wp, ridge_c, bayes_wp) = row_l
+        parlay_legs[mid].append({
+            "description": desc, "win_prob": wp, "negbin_edge_pp": edge,
+            "fixture_id": fix_id, "leg_index": idx, "ats_cover_wp": ats,
+            "negbin_wp": nb_wp, "negbin_mu_home": mu_h, "negbin_mu_away": mu_a,
+            "negbin_cell": cell, "ats_dist_wp": dist_wp,
+            "ridge_composite": ridge_c, "bayes_team_wp": bayes_wp,
+        })
+
+    # ── Dual gate: dist_wp >= market_implied AND edge < 12pp ──
+    after_gate = []
+    n_rejected = 0
+    n_missing = 0
+    n_legs_failed_distwp = 0
+    n_legs_failed_edge = 0
+    n_legs_total = 0
+    n_real_odds = 0
+    n_fallback = 0
+
+    for row in a_parlays:
+        pid = row[0]
+        legs = parlay_legs.get(pid, [])
+        reject = False
+        for leg in legs:
+            n_legs_total += 1
+            dist_wp = leg["ats_dist_wp"]
+            edge_pp = leg["negbin_edge_pp"]
+
+            # Gate (b): edge toxicity — reject if edge >= 12pp
+            if edge_pp is not None and edge_pp >= _EDGE_GATE_THRESHOLD_PP:
+                reject = True
+                n_legs_failed_edge += 1
+                break
+
+            # Gate (a): dist_wp >= market_implied
+            if dist_wp is None:
+                reject = True
+                n_missing += 1
+                break
+
+            market_implied = _real_market_implied_for_leg(leg, today_str, db)
+
+            if market_implied is None:
+                reject = True
+                n_missing += 1
+                break
+
+            # Track source
+            nb_wp = leg.get("negbin_wp")
+            if nb_wp is not None and edge_pp is not None:
+                back_derived = nb_wp - edge_pp / 100.0
+                if abs(market_implied - back_derived) > 0.001:
+                    n_real_odds += 1
+                else:
+                    n_fallback += 1
+            else:
+                n_real_odds += 1
+
+            if dist_wp < market_implied:
+                reject = True
+                n_legs_failed_distwp += 1
+                break
+
+        if reject:
+            n_rejected += 1
+        else:
+            after_gate.append(row)
+
+    print(f"[bothgates] Dual gate: {len(a_parlays)} → {len(after_gate)} "
+          f"({n_rejected} rejected: {n_legs_failed_distwp} dist_wp, "
+          f"{n_legs_failed_edge} edge, {n_missing} missing)")
+    print(f"[bothgates] Market-implied source: {n_real_odds} real-odds, "
+          f"{n_fallback} back-derived (matched)")
+
+    if not after_gate:
+        print("[bothgates] All parlays rejected by dual gate")
+        return []
+
+    # ── dist_wp parlay-level cover probability ──
+    parlay_dist_wp = {}
+    for row in after_gate:
+        pid = row[0]
+        legs = parlay_legs.get(pid, [])
+        leg_probs = []
+        for leg in legs:
+            dist = leg["ats_dist_wp"]
+            if dist is not None and dist > 0:
+                leg_probs.append(dist)
+            else:
+                leg_probs.append(leg["win_prob"] or 0.75)
+
+        parlay_prob = 1.0
+        for p in leg_probs:
+            parlay_prob *= p
+        parlay_dist_wp[pid] = parlay_prob
+
+    # ── Quarter-Kelly sizing ──
+    dist_pairs = [(row[0], parlay_dist_wp[row[0]]) for row in after_gate]
+    dist_pairs.sort(key=lambda x: x[1])
+    n_parlays = len(dist_pairs)
+
+    _Q_WRS = [0.60, 0.70, 0.75, 0.80, 0.90]
+
+    parlay_weights = {}
+    for rank_idx, (pid, dp) in enumerate(dist_pairs):
+        rank_frac = rank_idx / max(n_parlays - 1, 1)
+        q_idx = rank_frac * 4
+        q_lo = int(q_idx)
+        q_hi = min(q_lo + 1, 4)
+        frac = q_idx - q_lo
+        p_mapped = _Q_WRS[q_lo] * (1 - frac) + _Q_WRS[q_hi] * frac
+
+        odds = dict((r[0], r[2] or 2.0) for r in after_gate)[pid]
+
+        edge = p_mapped * odds - 1.0
+        if edge <= 0 or odds <= 1.0:
+            kelly_frac = 0.0
+        else:
+            kelly_frac = edge / (odds - 1.0)
+
+        quarter_kelly = kelly_frac * _KELLY_FRACTION
+        weight = max(min(quarter_kelly, _KELLY_MAX_WEIGHT), _KELLY_MIN_WEIGHT)
+        parlay_weights[pid] = weight
+
+    # ── Fixture concentration dampening ──
+    fixture_counts = defaultdict(int)
+    n_kept = len(after_gate)
+    for row in after_gate:
+        pid = row[0]
+        legs = parlay_legs.get(pid, [])
+        seen = set()
+        for leg in legs:
+            fid = leg["fixture_id"]
+            if fid and fid not in seen:
+                fixture_counts[fid] += 1
+                seen.add(fid)
+
+    concentrated = {fid: cnt for fid, cnt in fixture_counts.items()
+                    if cnt / n_kept > _CORR_FIXTURE_CAP}
+    if concentrated:
+        print(f"[bothgates] Fixture concentration dampening: "
+              f"{len(concentrated)} fixtures above {_CORR_FIXTURE_CAP*100:.0f}% cap")
+        for row in after_gate:
+            pid = row[0]
+            legs = parlay_legs.get(pid, [])
+            max_conc = 0
+            for leg in legs:
+                fid = leg["fixture_id"]
+                if fid in concentrated:
+                    conc_ratio = fixture_counts[fid] / n_kept
+                    max_conc = max(max_conc, conc_ratio)
+            if max_conc > _CORR_FIXTURE_CAP:
+                dampen = _CORR_FIXTURE_CAP / max_conc
+                parlay_weights[pid] = max(parlay_weights[pid] * dampen,
+                                          _KELLY_MIN_WEIGHT)
+
+    # ── Daily exposure cap ──
+    max_daily = _DAILY_EXPOSURE_CAP * _NOTIONAL_BANKROLL
+    pre_cap_staked = sum(w * _KELLY_BASE_STAKE for w in parlay_weights.values())
+    if pre_cap_staked > max_daily:
+        scale = max_daily / pre_cap_staked
+        for pid in parlay_weights:
+            parlay_weights[pid] = round(parlay_weights[pid] * scale, 6)
+        print(f"[bothgates] Daily exposure cap: ${pre_cap_staked:.1f} → "
+              f"${max_daily:.1f} (scale={scale:.3f})")
+    else:
+        print(f"[bothgates] Daily exposure: ${pre_cap_staked:.1f} "
+              f"within ${max_daily:.1f} cap — no scaling needed")
+
+    # ── Summary ──
+    weights = list(parlay_weights.values())
+    total_staked = sum(w * _KELLY_BASE_STAKE for w in weights)
+    equal_staked = n_kept * _KELLY_BASE_STAKE
+    neg_edge = sum(1 for row in after_gate
+                   if parlay_weights[row[0]] <= _KELLY_MIN_WEIGHT)
+
+    print(f"[bothgates] {n_kept} kept parlays: "
+          f"avg_weight={np.mean(weights):.3f}, "
+          f"median={np.median(weights):.3f}, "
+          f"staked=${total_staked:.1f}/${equal_staked:.1f} "
+          f"({total_staked/equal_staked*100:.0f}%), "
+          f"neg_edge={neg_edge}")
+
+    # ── Store as shadow_negbin_bothgates ──
+    run_id = str(uuid.uuid4())
+    stored = 0
+    for row in after_gate:
+        pid, bet_info, odds, comp, band, lc, wp = row
+        weight = round(parlay_weights[pid], 4)
+        sized_amount = round(_KELLY_BASE_STAKE * weight, 2)
+        dist_prob = parlay_dist_wp[pid]
+        mock_id = str(uuid.uuid4())
+
+        mock = MockBet(
+            id=mock_id,
+            generation_run_id=run_id,
+            game_date=today_str,
+            sport="MLB",
+            bet_type="parlay" if (lc or 2) > 1 else "straight",
+            odds=odds,
+            amount=sized_amount,
+            legs=lc or 2,
+            bet_info=bet_info,
+            predicted_win_prob=dist_prob,
+            model_used="negbin_v1+distwp_gate+edge_gate",
+            status="PENDING",
+            source=_BOTHGATES_SOURCE,
+            composite_score=comp,
+            cohort="clean",
+            weight=weight,
+        )
+        db.add(mock)
+        db.flush()
+
+        try:
+            db.execute(_text(
+                "UPDATE mock_bets SET negbin_odds_band=:band, negbin_leg_count=:lc "
+                "WHERE id=:mid"
+            ), {"band": band, "lc": lc, "mid": mock_id})
+        except Exception:
+            pass
+
+        # Copy legs with all columns
+        legs = parlay_legs.get(pid, [])
+        for leg in legs:
+            leg_obj = MockBetLeg(
+                mock_bet_id=mock_id,
+                leg_index=leg["leg_index"],
+                description=leg["description"],
+                market_type="alternate_spreads",
+                sport="MLB",
+                win_prob=leg["win_prob"],
+                fixture_id=leg["fixture_id"],
+                is_alt_line=True,
+            )
+            db.add(leg_obj)
+            db.flush()
+            updates = {}
+            if leg["negbin_wp"] is not None:
+                updates["negbin_wp"] = leg["negbin_wp"]
+            if leg["negbin_edge_pp"] is not None:
+                updates["negbin_edge_pp"] = leg["negbin_edge_pp"]
+            if leg["negbin_mu_home"] is not None:
+                updates["negbin_mu_home"] = leg["negbin_mu_home"]
+            if leg["negbin_mu_away"] is not None:
+                updates["negbin_mu_away"] = leg["negbin_mu_away"]
+            if leg["negbin_cell"] is not None:
+                updates["negbin_cell"] = leg["negbin_cell"]
+            if leg["ats_cover_wp"] is not None:
+                updates["ats_cover_wp"] = leg["ats_cover_wp"]
+            if leg["ats_dist_wp"] is not None:
+                updates["ats_dist_wp"] = leg["ats_dist_wp"]
+            if leg["bayes_team_wp"] is not None:
+                updates["bayes_team_wp"] = leg["bayes_team_wp"]
+            if leg["ridge_composite"] is not None:
+                updates["ridge_composite"] = leg["ridge_composite"]
+            if updates:
+                set_clause = ", ".join(f"{k}=:{k}" for k in updates)
+                updates["lid"] = leg_obj.id
+                try:
+                    db.execute(_text(
+                        f"UPDATE mock_bet_legs SET {set_clause} WHERE id=:lid"
+                    ), updates)
+                except Exception:
+                    pass
+
+        stored += 1
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[bothgates] DB commit failed: {e}")
+        return []
+
+    print(f"[bothgates] Stored {stored} both-gates parlays "
+          f"(source={_BOTHGATES_SOURCE})")
 
     return after_gate
 
@@ -2292,6 +3478,8 @@ def _store_shadow_parlays(db, parlays, today_str, source_tag="shadow_negbin"):
         except Exception:
             pass
 
+        leg_dist_wps = []  # collect per-leg dist_wp for parlay-level stats
+
         for i, leg in enumerate(legs):
             leg_obj = MockBetLeg(
                 mock_bet_id=mock_id,
@@ -2360,6 +3548,7 @@ def _store_shadow_parlays(db, parlays, today_str, source_tag="shadow_negbin"):
                         db.execute(_text(
                             "UPDATE mock_bet_legs SET ats_dist_wp=:dwp WHERE id=:lid"
                         ), {"dwp": round(dist_wp, 4), "lid": leg_obj.id})
+                        leg_dist_wps.append(dist_wp)
             except Exception as exc:
                 print(f"[negbin-shadow] ATS distributional score error: {exc}")
 
@@ -2407,6 +3596,21 @@ def _store_shadow_parlays(db, parlays, today_str, source_tag="shadow_negbin"):
             except Exception as exc:
                 print(f"[negbin-shadow] Ridge composite score error: {exc}")
 
+        # ── Parlay-level dist_wp stats (mean + min + concentrated-risk flag) ──
+        if leg_dist_wps:
+            _mean_dw = sum(leg_dist_wps) / len(leg_dist_wps)
+            _min_dw = min(leg_dist_wps)
+            _max_dw = max(leg_dist_wps)
+            _conc_risk = 1 if (_max_dw - _min_dw) > 0.15 else 0
+            try:
+                db.execute(_text(
+                    "UPDATE mock_bets SET mean_leg_dist_wp=:mdw, min_leg_dist_wp=:mindw, "
+                    "concentrated_risk=:cr WHERE id=:mid"
+                ), {"mdw": round(_mean_dw, 4), "mindw": round(_min_dw, 4),
+                    "cr": _conc_risk, "mid": mock_id})
+            except Exception as exc:
+                print(f"[negbin-shadow] mean/min dist_wp store error: {exc}")
+
         stored += 1
 
     try:
@@ -2417,6 +3621,31 @@ def _store_shadow_parlays(db, parlays, today_str, source_tag="shadow_negbin"):
         return
 
     print(f"[negbin-shadow] Stored {stored} shadow parlays (source={source_tag})")
+
+    # ── Post-dispatch validation: verify signal scoring populated ──
+    # Catches silent failures like the 2026-07-18 bayes cache lock issue.
+    if stored > 0 and source_tag == "shadow_negbin":
+        try:
+            check = db.execute(_text(
+                "SELECT COUNT(*) as total, "
+                "SUM(CASE WHEN bayes_team_wp IS NOT NULL THEN 1 ELSE 0 END) as has_bayes, "
+                "SUM(CASE WHEN ats_dist_wp IS NOT NULL THEN 1 ELSE 0 END) as has_dwp "
+                "FROM mock_bet_legs WHERE mock_bet_id IN "
+                "(SELECT id FROM mock_bets WHERE source='shadow_negbin' AND game_date=:gd)"
+            ), {"gd": today_str}).fetchone()
+            total, has_bayes, has_dwp = check
+            if total > 0 and has_bayes == 0:
+                print(f"CRITICAL [negbin-shadow] Post-dispatch validation FAILED: "
+                      f"0/{total} legs have bayes_team_wp — cache likely failed to build. "
+                      f"Ridge composite will also be NULL.")
+            elif total > 0 and has_dwp == 0:
+                print(f"CRITICAL [negbin-shadow] Post-dispatch validation FAILED: "
+                      f"0/{total} legs have ats_dist_wp — distributional model error.")
+            else:
+                print(f"[negbin-shadow] Post-dispatch OK: {has_bayes}/{total} bayes, "
+                      f"{has_dwp}/{total} dist_wp")
+        except Exception:
+            pass  # validation check itself shouldn't block the pipeline
 
 
 # ═══════════════════════════════════════════════════════════════
