@@ -144,7 +144,8 @@ GAME_COLS = [
     "hard_hit_diff",      # h_hard_hit_pct - a_hard_hit_pct
     # Weather features — game-day temperature/wind at venue (Open-Meteo Archive)
     "temperature_f",      # game-time temperature (°F), dome=72
-    "wind_speed_mph",     # game-time wind speed (mph), dome=0
+    "wind_speed_mph",     # game-time wind speed (mph), dome=0 — OBSERVED actuals
+    "wind_speed_forecast_mph",  # 1-day-ahead forecast wind (Previous Runs API) — train/serve matched
     "wind_direction_deg", # wind direction (degrees), dome=NaN
     "is_dome",            # 1=retractable/dome, 0=outdoor
 ]
@@ -174,8 +175,9 @@ _MODEL_EXCLUDE = frozenset({
     "pi_confidence",                           # derived from Pi — meaningless without it
     "h_sp_hr9_3", "a_sp_hr9_3", "sp_hr9_3_diff",  # rolling HR/9 — pending B2 backfill
     "h_sp_hr9_5", "a_sp_hr9_5", "sp_hr9_5_diff",  # rolling HR/9 — pending B2 backfill
-    "temperature_f", "wind_speed_mph",             # weather — pending B3 backfill
-    "wind_direction_deg", "is_dome",               # weather — pending B3 backfill
+    "temperature_f", "wind_speed_mph",             # weather — observed actuals (train/serve mismatch)
+    "wind_direction_deg", "is_dome",               # weather — noise (validated OOS)
+    # NOTE: wind_speed_forecast_mph is NOT excluded — it's the train/serve-matched feature
 })
 MODEL_FEATURE_COLS: list[str] = [
     c for c in (ROLLING_COLS + SCHEDULE_COLS + DIFFERENTIAL_COLS + GAME_COLS)
@@ -1250,14 +1252,16 @@ def build_feature_matrix(
             except Exception as exc:
                 log.warning("MLB team batting stats failed: %s", exc)
 
-        # ── 7b. Weather features (temperature, wind, dome) ────────────────
-        for col in ["temperature_f", "wind_speed_mph", "wind_direction_deg", "is_dome"]:
+        # ��─ 7b. Weather features (temperature, wind, dome) ────────────────
+        _wx_cols = ["temperature_f", "wind_speed_mph", "wind_speed_forecast_mph",
+                    "wind_direction_deg", "is_dome"]
+        for col in _wx_cols:
             if col not in matrix.columns:
                 matrix[col] = np.nan
         try:
             wx_df = pd.read_sql_query(
                 "SELECT home_team, game_date, temperature_f, wind_speed_mph, "
-                "wind_direction_deg, is_dome FROM game_weather",
+                "wind_speed_forecast_mph, wind_direction_deg, is_dome FROM game_weather",
                 conn,
             )
             if not wx_df.empty:
@@ -1267,13 +1271,13 @@ def build_feature_matrix(
                     wx_df, on=["home_team", "game_date"], how="left",
                     suffixes=("", "_wx"),
                 )
-                for col in ["temperature_f", "wind_speed_mph", "wind_direction_deg", "is_dome"]:
+                for col in _wx_cols:
                     dup = col + "_wx"
                     if dup in matrix.columns:
                         matrix[col] = matrix[dup].combine_first(matrix[col])
                         matrix.drop(columns=[dup], inplace=True)
-                fill = matrix["temperature_f"].notna().mean()
-                log.info("  MLB weather fill rate: %.1f%%", fill * 100)
+                fill = matrix["wind_speed_forecast_mph"].notna().mean()
+                log.info("  MLB weather fill rate (forecast wind): %.1f%%", fill * 100)
         except Exception as exc:
             log.warning("MLB weather join failed: %s", exc)
 
