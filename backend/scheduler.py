@@ -195,8 +195,8 @@ def _run_cycle(auto_retrain: bool = True) -> dict:
                     try:
                         from auto_settle import run_auto_settle as _ras
                         _ras(db, days_back=1, auto_retrain=True)
-                    except Exception:
-                        pass
+                    except Exception as _ras_exc:
+                        print(f"[Scheduler] auto_settle failed silently: {_ras_exc}")
             result["live_bets_checked"]  = len(live_results)
             result["live_bets_settled"]  = len(settled_now)
         except Exception as exc:
@@ -411,8 +411,8 @@ def _run_daily_nhl_etl() -> dict:
             try:
                 import ml_model
                 ml_model._FM_CACHE.pop("NHL", None)
-            except Exception:
-                pass
+            except Exception as _cache_exc:
+                print(f"[Scheduler] NHL cache invalidation failed: {_cache_exc}")
             print("[Scheduler] Daily NHL ETL refresh complete — cache invalidated")
         except Exception as exc:
             print(f"[Scheduler] Daily NHL ETL error: {exc}")
@@ -439,8 +439,8 @@ def _run_daily_mlb_etl() -> dict:
             try:
                 import ml_model
                 ml_model._FM_CACHE.pop("MLB", None)
-            except Exception:
-                pass
+            except Exception as _cache_exc:
+                print(f"[Scheduler] MLB cache invalidation failed: {_cache_exc}")
             print("[Scheduler] Daily MLB ETL refresh complete — cache invalidated")
         except Exception as exc:
             print(f"[Scheduler] Daily MLB ETL error: {exc}")

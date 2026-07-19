@@ -9630,7 +9630,9 @@ def _negbin_source_filter(source: str) -> str:
     # Direct source tag — validate to prevent injection
     if source in _VALID_SHADOW_SOURCES:
         return f"AND mb.source = '{source}'"
-    # Fallback: A only
+    # Unrecognized source — log loud warning, default to A
+    print(f"[WARNING] _negbin_source_filter: unrecognized source '{source}', "
+          f"defaulting to shadow_negbin. Valid: {_VALID_SHADOW_SOURCES}")
     return "AND mb.source = 'shadow_negbin'"
 
 
