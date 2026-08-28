@@ -368,6 +368,50 @@ def _compute_rolling_pitcher_hr9(
     return df[["player_id", "game_date", col]].copy()
 
 
+def _compute_rolling_pitcher_fip(
+    conn: sqlite3.Connection,
+    n: int,
+) -> pd.DataFrame:
+    """
+    Rolling FIP over the last *n* starts (shift(1) → zero lookahead).
+    FIP = (13*HR + 3*BB - 2*K) / IP + 3.10
+
+    Returns DataFrame keyed on (player_id, game_date) with:
+        rolling_fip_{n}
+    """
+    col = f"rolling_fip_{n}"
+    try:
+        df = pd.read_sql_query(
+            "SELECT player_id, game_date, ip, home_runs, walks, strikeouts "
+            "FROM pitcher_game_logs ORDER BY player_id, game_date",
+            conn,
+        )
+    except Exception:
+        return pd.DataFrame(columns=["player_id", "game_date", col])
+
+    if df.empty or "home_runs" not in df.columns:
+        return pd.DataFrame(columns=["player_id", "game_date", col])
+
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    df = df.sort_values(["player_id", "game_date"]).copy()
+
+    grp = df.groupby("player_id")
+    ip_shifted = grp["ip"].shift(1)
+    hr_shifted = grp["home_runs"].shift(1)
+    bb_shifted = grp["walks"].shift(1)
+    k_shifted  = grp["strikeouts"].shift(1)
+
+    ip_roll = ip_shifted.groupby(df["player_id"]).rolling(n, min_periods=2).sum().droplevel(0)
+    hr_roll = hr_shifted.groupby(df["player_id"]).rolling(n, min_periods=2).sum().droplevel(0)
+    bb_roll = bb_shifted.groupby(df["player_id"]).rolling(n, min_periods=2).sum().droplevel(0)
+    k_roll  = k_shifted.groupby(df["player_id"]).rolling(n, min_periods=2).sum().droplevel(0)
+
+    # FIP = (13*HR + 3*BB - 2*K) / IP + 3.10
+    df[col] = ((13 * hr_roll + 3 * bb_roll - 2 * k_roll) / ip_roll + 3.10).where(ip_roll > 0)
+
+    return df[["player_id", "game_date", col]].copy()
+
+
 def _load_pitcher_stats(conn: sqlite3.Connection) -> pd.DataFrame:
     """
     Load the pitcher_stats table.  Returns an empty DataFrame with correct
@@ -1206,6 +1250,50 @@ def build_feature_matrix(
                         log.info("  MLB rolling HR/9-5 fill rate: %.1f%%", hr9_fill * 100)
                     except Exception as exc:
                         log.warning("MLB rolling HR/9 stats failed: %s", exc)
+
+                    # ── Rolling FIP (3-start and 5-start windows) ──
+                    try:
+                        fip_3 = _compute_rolling_pitcher_fip(conn, 3)
+                        fip_5 = _compute_rolling_pitcher_fip(conn, 5)
+                        for side, pid_col in [("h", "h_pid"), ("a", "a_pid")]:
+                            tmp = sp_df2[["game_id", "game_date", pid_col]].dropna(subset=[pid_col, "game_date"])
+                            tmp = tmp.rename(columns={pid_col: "player_id"})
+                            tmp["player_id"] = tmp["player_id"].astype(int)
+                            tmp["game_date"] = pd.to_datetime(tmp["game_date"])
+                            tmp = tmp.sort_values("game_date")
+
+                            for rdf, n_win in [(fip_3, 3), (fip_5, 5)]:
+                                col_name = f"rolling_fip_{n_win}"
+                                if rdf.empty or col_name not in rdf.columns:
+                                    continue
+                                r = rdf[["player_id", "game_date", col_name]].copy()
+                                r = r.dropna(subset=[col_name])
+                                r["game_date"] = pd.to_datetime(r["game_date"])
+                                r = r.sort_values("game_date")
+                                merged = pd.merge_asof(
+                                    tmp, r.rename(columns={col_name: f"{side}_sp_fip_{n_win}"}),
+                                    on="game_date", by="player_id",
+                                    direction="backward", allow_exact_matches=True,
+                                )
+                                dest_col = f"{side}_sp_fip_{n_win}"
+                                if dest_col in merged.columns:
+                                    mc = merged[["game_id", dest_col]].dropna()
+                                    matrix = matrix.merge(mc, on="game_id", how="left", suffixes=("","_r"))
+                                    dup = dest_col + "_r"
+                                    if dup in matrix.columns:
+                                        matrix[dest_col] = matrix[dup].combine_first(matrix[dest_col])
+                                        matrix.drop(columns=[dup], inplace=True)
+
+                        for col in ["h_sp_fip_3","a_sp_fip_3","h_sp_fip_5","a_sp_fip_5"]:
+                            if col not in matrix.columns:
+                                matrix[col] = np.nan
+                        matrix["sp_fip3_diff"] = matrix["a_sp_fip_3"] - matrix["h_sp_fip_3"]
+                        matrix["sp_fip5_diff"] = matrix["a_sp_fip_5"] - matrix["h_sp_fip_5"]
+
+                        fip_fill = matrix["h_sp_fip_5"].notna().mean()
+                        log.info("  MLB rolling FIP-5 fill rate: %.1f%%", fip_fill * 100)
+                    except Exception as exc:
+                        log.warning("MLB rolling FIP stats failed: %s", exc)
 
                     roll3_fill = matrix["h_sp_era_3"].notna().mean()
                     log.info("  MLB rolling ERA-3 fill rate: %.1f%%", roll3_fill * 100)

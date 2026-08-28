@@ -6992,7 +6992,20 @@ def edit_bet(bet_id: str, req: EditBetRequest, db: Session = Depends(get_db)):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat(), "scheduler": sched.get_state()["running"]}
+    # DB write-health check (catches corruption that silenced all shadow arms Aug 6-28)
+    db_ok = True
+    db_detail = "check_unavailable"
+    try:
+        from scheduler import _verify_db_write_health
+        db_ok, db_detail = _verify_db_write_health()
+    except Exception:
+        pass
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "time": datetime.utcnow().isoformat(),
+        "scheduler": sched.get_state()["running"],
+        "db_write_health": db_detail,
+    }
 
 
 # ── Alt Lines ─────────────────────────────────────────────────────────────────
@@ -9616,6 +9629,11 @@ _VALID_SHADOW_SOURCES = {
     "shadow_negbin_edgegate", "shadow_negbin_fullstack",
     "shadow_negbin_composite", "shadow_negbin_atscap",
     "shadow_negbin_distwp_gate", "shadow_negbin_bothgates",
+    "shadow_negbin_highconv",
+    "shadow_negbin_neg15",
+    "shadow_negbin_plus35",
+    "shadow_negbin_neg15_epp",
+    "shadow_negbin_evaware",
 }
 
 
@@ -10237,6 +10255,17 @@ def negbin_arms_comparison(
         ("shadow_negbin_atscap", "ATS Cap"),
         ("shadow_negbin_distwp_gate", "dist_wp Gate"),
         ("shadow_negbin_bothgates", "Both Gates"),
+        ("shadow_negbin_highconv", "High-Conv"),
+        ("shadow_negbin_neg15", "Neg 1.5"),
+        ("shadow_negbin_plus35", "Plus 3.5"),
+        ("shadow_negbin_neg15_epp", "Neg 1.5 + EPP"),
+        ("shadow_negbin_evaware", "EV-Aware Rung"),
+        ("shadow_lineup", "Lineup Resid"),
+        ("shadow_f5", "F5 (1st 5 Inn)"),
+        ("shadow_altline", "Alt-Line Edge"),
+        ("shadow_underdog_lag", "Underdog Lag"),
+        ("shadow_prop", "Batter Props"),
+        ("shadow_straight_stack", "Straight Stack"),
     ]
 
     con = _negbin_db_connect()
@@ -10269,6 +10298,9 @@ def negbin_arms_comparison(
         settled_dates = set()
         pnl_by_date = _dd(float)
 
+        breakeven_sum = 0.0
+        n_be = 0
+
         for r in rows:
             total_legs += r.get("n_legs", 0)
             won = _negbin_is_won(r.get("leg_results"))
@@ -10277,6 +10309,10 @@ def negbin_arms_comparison(
             n_settled += 1
             settled_dates.add(r["game_date"])
             odds = r.get("odds") or 1.0
+            # Accumulate breakeven for edge calculation
+            if odds > 1.0:
+                breakeven_sum += 1.0 / odds
+                n_be += 1
             # Always use flat $10 stake for consistent comparison across arms
             if won:
                 n_wins += 1
@@ -10287,8 +10323,11 @@ def negbin_arms_comparison(
             pnl_by_date[r["game_date"]] += pnl
 
         cover_rate = round(n_wins / n_settled * 100, 2) if n_settled else None
+        avg_breakeven = round(breakeven_sum / n_be * 100, 2) if n_be else None
         # ROI = return per dollar staked (comparable across arms and with backtests)
         roi = round(total_pnl / (n_settled * _NEGBIN_STAKE) * 100, 2) if n_settled else None
+        # Edge = WR - BE (percentage points)
+        edge_pp = round(cover_rate - avg_breakeven, 2) if (cover_rate is not None and avg_breakeven is not None) else None
         settled_days = len(settled_dates)
 
         # Build daily cumulative series
@@ -10307,6 +10346,8 @@ def negbin_arms_comparison(
             "n_settled": n_settled,
             "n_legs": total_legs,
             "cover_rate": cover_rate,
+            "avg_breakeven": avg_breakeven,
+            "edge_pp": edge_pp,
             "roi": roi,
             "cum_pnl": round(total_pnl, 2),
             "settled_days": settled_days,
@@ -10319,6 +10360,601 @@ def negbin_arms_comparison(
         "arms": arms_out,
         "daily_series": daily_series,
         "days": days,
+    }
+
+
+@app.get("/api/negbin/arm_legs")
+def negbin_arm_legs(
+    source: str = Query(...),
+    days: int = Query(60, ge=1, le=365),
+):
+    """
+    Return individual legs for a given shadow arm source.
+    Shows description, price, rung, settle status, WP, PnL per leg.
+    """
+    con = _negbin_db_connect()
+    cur = con.cursor()
+
+    sql = """
+        SELECT mb.id, mb.odds AS parlay_odds, mb.status, mb.game_date,
+               mb.amount, mb.actual_profit, mb.bet_type,
+               mbl.description, mbl.win_prob, mbl.leg_result, mbl.market_type,
+               mbl.open_odds, mbl.close_odds, mbl.negbin_wp, mbl.ats_dist_wp,
+               mbl.negbin_edge_pp, mbl.ridge_composite, mbl.negbin_cell,
+               mbl.spread_value, mbl.is_alt_line
+        FROM mock_bets mb
+        JOIN mock_bet_legs mbl ON mbl.mock_bet_id = mb.id
+        WHERE mb.source = ?
+          AND mb.game_date >= date('now', '-' || ? || ' days')
+        ORDER BY mb.game_date DESC, mb.id
+    """
+    cur.execute(sql, (source, days))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+
+    legs = []
+    for r in rows:
+        desc = r.get("description") or ""
+        # Extract rung from description like "Team +2.5 (Alt Spread)"
+        rung = None
+        for token in desc.split():
+            try:
+                rung = float(token)
+                break
+            except ValueError:
+                pass
+
+        odds_dec = None
+        if r.get("open_odds"):
+            am = r["open_odds"]
+            if am > 0:
+                odds_dec = round(1 + am / 100, 3)
+            elif am < 0:
+                odds_dec = round(1 + 100 / abs(am), 3)
+
+        pnl = None
+        result = r.get("leg_result")
+        if result == "WIN" and odds_dec:
+            pnl = round((odds_dec - 1) * 10, 2)  # flat $10 reference
+        elif result == "LOSS":
+            pnl = -10.0
+
+        legs.append({
+            "date": r.get("game_date"),
+            "description": desc,
+            "rung": rung,
+            "result": result or "PENDING",
+            "wp": r.get("win_prob"),
+            "negbin_wp": r.get("negbin_wp"),
+            "dist_wp": r.get("ats_dist_wp"),
+            "ridge": r.get("ridge_composite"),
+            "epp": r.get("negbin_edge_pp"),
+            "cell": r.get("negbin_cell"),
+            "odds_am": r.get("open_odds"),
+            "odds_dec": odds_dec,
+            "close_odds": r.get("close_odds"),
+            "pnl_ref": pnl,
+            "status": r.get("status"),
+            "amount": r.get("amount"),
+            "actual_profit": r.get("actual_profit"),
+        })
+
+    return {
+        "source": source,
+        "days": days,
+        "count": len(legs),
+        "legs": legs,
+    }
+
+
+@app.get("/api/negbin/calibration")
+def negbin_calibration(
+    days: int = Query(90, ge=1, le=365),
+):
+    """
+    Calibration-by-sizing diagnostic across all shadow arms.
+
+    For each arm's settled legs, bucket by model confidence (dist_wp or negbin_wp)
+    and compute realized WR vs breakeven per bucket. Returns calibration curves
+    showing where each model is calibrated / noise / anti-calibrated.
+
+    Context splits: negbin_cell (fav/dog × home/away) where available.
+    """
+    con = _negbin_db_connect()
+    cur = con.cursor()
+
+    _CAL_ARMS = [
+        ("shadow_negbin", "A (control)"),
+        ("shadow_negbin_recal", "B (recal)"),
+        ("shadow_negbin_edgegate", "Edge Gate"),
+        ("shadow_negbin_fullstack", "Full-Stack"),
+        ("shadow_negbin_composite", "Composite"),
+        ("shadow_negbin_bothgates", "Both Gates"),
+        ("shadow_negbin_distwp_gate", "dist_wp Gate"),
+        ("shadow_negbin_atscap", "ATS Cap"),
+        ("shadow_altline", "Alt-Line Edge"),
+        ("shadow_straight_stack", "Straight Stack"),
+        ("shadow_prop", "Batter Props"),
+    ]
+
+    # WP bucket boundaries — calibration quintiles
+    _WP_CUTS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 1.01]
+
+    def _bucket_label(wp):
+        for i, hi in enumerate(_WP_CUTS):
+            lo = _WP_CUTS[i - 1] if i > 0 else 0.0
+            if wp < hi:
+                return f"{int(lo*100)}-{int(hi*100)}%"
+        return "90%+"
+
+    arms_out = []
+
+    for src, label in _CAL_ARMS:
+        sql = """
+            SELECT mbl.win_prob, mbl.negbin_wp, mbl.ats_dist_wp,
+                   mbl.negbin_edge_pp, mbl.ridge_composite, mbl.negbin_cell,
+                   mbl.leg_result, mbl.open_odds, mb.odds AS parlay_odds
+            FROM mock_bet_legs mbl
+            JOIN mock_bets mb ON mb.id = mbl.mock_bet_id
+            WHERE mb.source = ?
+              AND mbl.leg_result IN ('WIN', 'LOSS')
+              AND mb.game_date >= date('now', '-' || ? || ' days')
+        """
+        cur.execute(sql, (src, days))
+        rows = [dict(r) for r in cur.fetchall()]
+
+        if not rows:
+            arms_out.append({"source": src, "label": label, "n": 0, "buckets": []})
+            continue
+
+        # Pick best confidence column: dist_wp > negbin_wp > win_prob
+        has_dist = sum(1 for r in rows if r.get("ats_dist_wp") is not None)
+        has_neg  = sum(1 for r in rows if r.get("negbin_wp") is not None)
+        has_wp   = sum(1 for r in rows if r.get("win_prob") is not None)
+
+        if has_dist > len(rows) * 0.5:
+            wp_col, wp_label = "ats_dist_wp", "dist_wp"
+        elif has_neg > len(rows) * 0.5:
+            wp_col, wp_label = "negbin_wp", "negbin_wp"
+        else:
+            wp_col, wp_label = "win_prob", "win_prob"
+
+        # Build buckets
+        from collections import defaultdict as _ddd
+        buckets_data = _ddd(lambda: {"wins": 0, "losses": 0, "be_sum": 0.0, "n_be": 0,
+                                     "wp_sum": 0.0})
+
+        for r in rows:
+            wp = r.get(wp_col)
+            if wp is None:
+                continue
+            # Normalize: some arms store WP as percentage (e.g. 72.5), not decimal (0.725)
+            if wp > 1.0:
+                wp = wp / 100.0
+            bkt = _bucket_label(wp)
+            d = buckets_data[bkt]
+            if r["leg_result"] == "WIN":
+                d["wins"] += 1
+            else:
+                d["losses"] += 1
+            d["wp_sum"] += wp
+
+            # Breakeven from odds (try open_odds first, fall back to parlay_odds)
+            am = r.get("open_odds")
+            if am and am != 0:
+                if am > 0:
+                    be = 100.0 / (am + 100.0)
+                else:
+                    be = abs(am) / (abs(am) + 100.0)
+                d["be_sum"] += be
+                d["n_be"] += 1
+            else:
+                # Fallback: parlay odds (decimal) → breakeven
+                p_odds = r.get("parlay_odds")
+                if p_odds and p_odds > 1.0:
+                    be = 1.0 / p_odds
+                    d["be_sum"] += be
+                    d["n_be"] += 1
+
+        buckets_list = []
+        for bkt_name in sorted(buckets_data.keys()):
+            d = buckets_data[bkt_name]
+            n = d["wins"] + d["losses"]
+            wr = round(100 * d["wins"] / n, 1) if n > 0 else None
+            avg_wp = round(100 * d["wp_sum"] / n, 1) if n > 0 else None
+            avg_be = round(100 * d["be_sum"] / d["n_be"], 1) if d["n_be"] > 0 else None
+            edge = round(wr - avg_be, 1) if wr is not None and avg_be is not None else None
+
+            # Kelly-implied sizing: (p*b - q) / b where p=realized_wr, b=avg_odds-1
+            kelly_frac = None
+            if wr is not None and avg_be is not None and d["n_be"] > 0:
+                p = d["wins"] / n
+                avg_be_dec = d["be_sum"] / d["n_be"]
+                if avg_be_dec > 0 and avg_be_dec < 1:
+                    b = (1.0 / avg_be_dec) - 1.0  # odds-1
+                    if b > 0:
+                        kf = (p * b - (1 - p)) / b
+                        kelly_frac = round(kf, 4)
+
+            buckets_list.append({
+                "bucket": bkt_name,
+                "n": n,
+                "realized_wr": wr,
+                "avg_claimed_wp": avg_wp,
+                "avg_breakeven": avg_be,
+                "edge_pp": edge,
+                "kelly_fraction": kelly_frac,
+                "signal": "calibrated" if edge is not None and edge > 2 else
+                          "noise" if edge is not None and abs(edge) <= 2 else
+                          "anti-calibrated" if edge is not None and edge < -2 else None,
+            })
+
+        # Context splits by negbin_cell (where available)
+        context_splits = []
+        cells = set(r.get("negbin_cell") for r in rows if r.get("negbin_cell"))
+        for cell in sorted(cells):
+            cell_rows = [r for r in rows if r.get("negbin_cell") == cell]
+            n = len(cell_rows)
+            wins = sum(1 for r in cell_rows if r["leg_result"] == "WIN")
+            wr = round(100 * wins / n, 1) if n > 0 else None
+
+            be_vals = []
+            for r in cell_rows:
+                am = r.get("open_odds")
+                if am and am != 0:
+                    if am > 0:
+                        be_vals.append(100.0 / (am + 100.0))
+                    else:
+                        be_vals.append(abs(am) / (abs(am) + 100.0))
+                else:
+                    p_odds = r.get("parlay_odds")
+                    if p_odds and p_odds > 1.0:
+                        be_vals.append(1.0 / p_odds)
+            avg_be = round(100 * sum(be_vals) / len(be_vals), 1) if be_vals else None
+            edge = round(wr - avg_be, 1) if wr is not None and avg_be is not None else None
+
+            context_splits.append({
+                "context": cell,
+                "n": n,
+                "realized_wr": wr,
+                "avg_breakeven": avg_be,
+                "edge_pp": edge,
+            })
+
+        arms_out.append({
+            "source": src,
+            "label": label,
+            "n": sum(d["wins"] + d["losses"] for d in buckets_data.values()),
+            "wp_column": wp_label,
+            "buckets": buckets_list,
+            "context_splits": context_splits,
+        })
+
+    con.close()
+
+    return {
+        "days": days,
+        "arms": arms_out,
+    }
+
+
+@app.get("/api/negbin/calibration_validated")
+def negbin_calibration_validated(
+    days: int = Query(365, ge=1, le=730),
+    min_n: int = Query(30, ge=5, le=200),
+):
+    """
+    OOS-validated calibration self-healing.
+
+    Splits settled legs into time-ordered TRAIN (first half) and TEST (second half).
+    Builds calibration map on TRAIN, checks split-half stability, then tests whether
+    recalibration holds on TEST (out-of-sample).
+
+    Only miscalibrations that are:
+      1. Adequate N (≥min_n per half)
+      2. Split-half stable (same direction in both halves)
+      3. Hold out-of-sample (recalibration improves edge on TEST)
+    are marked as REAL and get a recalibrated WP→size mapping.
+
+    Everything else is marked NOISE — do not recalibrate on it.
+    """
+    from collections import defaultdict as _ddd
+
+    con = _negbin_db_connect()
+    cur = con.cursor()
+
+    _CAL_ARMS = [
+        ("shadow_negbin", "A (control)"),
+        ("shadow_negbin_recal", "B (recal)"),
+        ("shadow_negbin_edgegate", "Edge Gate"),
+        ("shadow_negbin_fullstack", "Full-Stack"),
+        ("shadow_negbin_composite", "Composite"),
+        ("shadow_negbin_bothgates", "Both Gates"),
+        ("shadow_negbin_distwp_gate", "dist_wp Gate"),
+        ("shadow_negbin_atscap", "ATS Cap"),
+        ("shadow_altline", "Alt-Line Edge"),
+        ("shadow_straight_stack", "Straight Stack"),
+        ("shadow_prop", "Batter Props"),
+    ]
+
+    _WP_CUTS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 1.01]
+
+    def _bucket_label(wp):
+        for i, hi in enumerate(_WP_CUTS):
+            lo = _WP_CUTS[i - 1] if i > 0 else 0.0
+            if wp < hi:
+                return f"{int(lo*100)}-{int(hi*100)}%"
+        return "90-101%"
+
+    def _get_be(r):
+        """Extract breakeven from a row (open_odds or parlay_odds fallback)."""
+        am = r.get("open_odds")
+        if am and am != 0:
+            if am > 0:
+                return 100.0 / (am + 100.0)
+            else:
+                return abs(am) / (abs(am) + 100.0)
+        p_odds = r.get("parlay_odds")
+        if p_odds and p_odds > 1.0:
+            return 1.0 / p_odds
+        return None
+
+    def _build_calibration(rows, wp_col):
+        """Build calibration buckets from a set of rows."""
+        buckets = _ddd(lambda: {"wins": 0, "losses": 0, "be_sum": 0.0, "n_be": 0, "wp_sum": 0.0})
+        for r in rows:
+            wp = r.get(wp_col)
+            if wp is None:
+                continue
+            if wp > 1.0:
+                wp = wp / 100.0
+            bkt = _bucket_label(wp)
+            d = buckets[bkt]
+            if r["leg_result"] == "WIN":
+                d["wins"] += 1
+            else:
+                d["losses"] += 1
+            d["wp_sum"] += wp
+            be = _get_be(r)
+            if be is not None:
+                d["be_sum"] += be
+                d["n_be"] += 1
+        result = {}
+        for bkt_name, d in buckets.items():
+            n = d["wins"] + d["losses"]
+            if n == 0:
+                continue
+            wr = d["wins"] / n
+            avg_wp = d["wp_sum"] / n
+            avg_be = d["be_sum"] / d["n_be"] if d["n_be"] > 0 else None
+            edge = (wr - avg_be) if avg_be is not None else None
+            result[bkt_name] = {
+                "n": n, "wins": d["wins"], "losses": d["losses"],
+                "realized_wr": wr, "avg_claimed_wp": avg_wp,
+                "avg_breakeven": avg_be, "edge": edge,
+            }
+        return result
+
+    arms_out = []
+
+    for src, label in _CAL_ARMS:
+        sql = """
+            SELECT mbl.win_prob, mbl.negbin_wp, mbl.ats_dist_wp,
+                   mbl.negbin_edge_pp, mbl.ridge_composite, mbl.negbin_cell,
+                   mbl.leg_result, mbl.open_odds, mb.odds AS parlay_odds,
+                   mb.game_date
+            FROM mock_bet_legs mbl
+            JOIN mock_bets mb ON mb.id = mbl.mock_bet_id
+            WHERE mb.source = ?
+              AND mbl.leg_result IN ('WIN', 'LOSS')
+              AND mb.game_date >= date('now', '-' || ? || ' days')
+            ORDER BY mb.game_date
+        """
+        cur.execute(sql, (src, days))
+        rows = [dict(r) for r in cur.fetchall()]
+
+        if len(rows) < min_n * 2:
+            arms_out.append({
+                "source": src, "label": label, "n": len(rows),
+                "skip_reason": f"insufficient data ({len(rows)} < {min_n*2})",
+                "buckets": [],
+            })
+            continue
+
+        # Pick best WP column
+        has_dist = sum(1 for r in rows if r.get("ats_dist_wp") is not None)
+        has_neg  = sum(1 for r in rows if r.get("negbin_wp") is not None)
+        if has_dist > len(rows) * 0.5:
+            wp_col, wp_label = "ats_dist_wp", "dist_wp"
+        elif has_neg > len(rows) * 0.5:
+            wp_col, wp_label = "negbin_wp", "negbin_wp"
+        else:
+            wp_col, wp_label = "win_prob", "win_prob"
+
+        # Time-ordered split: first half = TRAIN, second half = TEST
+        mid = len(rows) // 2
+        train_rows = rows[:mid]
+        test_rows = rows[mid:]
+
+        train_cal = _build_calibration(train_rows, wp_col)
+        test_cal = _build_calibration(test_rows, wp_col)
+
+        # Date ranges for reporting
+        train_dates = [r["game_date"] for r in train_rows if r.get("game_date")]
+        test_dates = [r["game_date"] for r in test_rows if r.get("game_date")]
+        train_range = (min(train_dates), max(train_dates)) if train_dates else (None, None)
+        test_range = (min(test_dates), max(test_dates)) if test_dates else (None, None)
+
+        # For each bucket: check split-half stability + OOS validation
+        all_buckets = sorted(set(list(train_cal.keys()) + list(test_cal.keys())))
+
+        bucket_results = []
+        real_miscals = 0
+        noise_count = 0
+
+        for bkt in all_buckets:
+            tr = train_cal.get(bkt)
+            te = test_cal.get(bkt)
+
+            entry = {"bucket": bkt}
+
+            # N guard
+            tr_n = tr["n"] if tr else 0
+            te_n = te["n"] if te else 0
+            entry["train_n"] = tr_n
+            entry["test_n"] = te_n
+
+            if tr_n < min_n or te_n < min_n:
+                entry["verdict"] = "INSUFFICIENT_N"
+                entry["reason"] = f"train_n={tr_n}, test_n={te_n}, min={min_n}"
+                noise_count += 1
+                if tr:
+                    entry["train_wr"] = round(tr["realized_wr"] * 100, 1)
+                    entry["train_be"] = round(tr["avg_breakeven"] * 100, 1) if tr["avg_breakeven"] else None
+                    entry["train_edge_pp"] = round(tr["edge"] * 100, 1) if tr["edge"] is not None else None
+                if te:
+                    entry["test_wr"] = round(te["realized_wr"] * 100, 1)
+                    entry["test_be"] = round(te["avg_breakeven"] * 100, 1) if te["avg_breakeven"] else None
+                    entry["test_edge_pp"] = round(te["edge"] * 100, 1) if te["edge"] is not None else None
+                bucket_results.append(entry)
+                continue
+
+            # Both halves have adequate N
+            tr_edge = tr["edge"] * 100 if tr["edge"] is not None else None  # pp
+            te_edge = te["edge"] * 100 if te["edge"] is not None else None
+
+            entry["train_wr"] = round(tr["realized_wr"] * 100, 1)
+            entry["train_be"] = round(tr["avg_breakeven"] * 100, 1) if tr["avg_breakeven"] else None
+            entry["train_edge_pp"] = round(tr_edge, 1) if tr_edge is not None else None
+            entry["train_claimed_wp"] = round(tr["avg_claimed_wp"] * 100, 1)
+
+            entry["test_wr"] = round(te["realized_wr"] * 100, 1)
+            entry["test_be"] = round(te["avg_breakeven"] * 100, 1) if te["avg_breakeven"] else None
+            entry["test_edge_pp"] = round(te_edge, 1) if te_edge is not None else None
+            entry["test_claimed_wp"] = round(te["avg_claimed_wp"] * 100, 1)
+
+            if tr_edge is None or te_edge is None:
+                entry["verdict"] = "NO_BREAKEVEN"
+                entry["reason"] = "Missing breakeven data in one half"
+                noise_count += 1
+                bucket_results.append(entry)
+                continue
+
+            # Split-half stability: same miscalibration direction?
+            def _classify(edge_pp):
+                if edge_pp > 2:
+                    return "calibrated"
+                elif edge_pp < -2:
+                    return "anti-calibrated"
+                return "noise"
+
+            tr_signal = _classify(tr_edge)
+            te_signal = _classify(te_edge)
+            entry["train_signal"] = tr_signal
+            entry["test_signal"] = te_signal
+
+            # Stability check
+            stable = tr_signal == te_signal
+            entry["split_half_stable"] = stable
+
+            if not stable:
+                entry["verdict"] = "NOISE_DIRECTION_FLIP"
+                entry["reason"] = f"train={tr_signal}, test={te_signal} — direction flipped"
+                noise_count += 1
+                bucket_results.append(entry)
+                continue
+
+            # Both halves agree on the direction
+            if tr_signal == "calibrated" and te_signal == "calibrated":
+                # Model is calibrated here — no recalibration needed
+                entry["verdict"] = "CALIBRATED_STABLE"
+                entry["reason"] = f"Both halves calibrated (+{tr_edge:.1f}pp / +{te_edge:.1f}pp) — no healing needed"
+                entry["recalibrate"] = False
+                bucket_results.append(entry)
+                continue
+
+            if tr_signal == "noise" and te_signal == "noise":
+                entry["verdict"] = "NOISE_STABLE"
+                entry["reason"] = f"Both halves noise ({tr_edge:+.1f}pp / {te_edge:+.1f}pp)"
+                entry["recalibrate"] = False
+                noise_count += 1
+                bucket_results.append(entry)
+                continue
+
+            # Both anti-calibrated — REAL miscalibration candidate
+            # Recalibration: use TRAIN realized WR as the new WP for sizing
+            # Test: does applying train's WR as the "true" WP improve the test's sizing?
+            train_recal_wp = tr["realized_wr"]  # what the model SHOULD have said
+            train_claimed = tr["avg_claimed_wp"]
+
+            # The shrinkage: how much to adjust WP in this bucket
+            wp_adjustment = train_recal_wp - train_claimed  # negative = model overconfident
+
+            # Apply to TEST: if we had used train's recalibrated WP, would test edge improve?
+            # The "recalibrated" test WP = test_claimed + wp_adjustment
+            # New "edge" against breakeven = test_wr - test_be (unchanged — recal changes sizing not WR)
+            # What recalibration DOES: it changes the Kelly fraction
+            # Original Kelly on test: kf_orig = (test_wr * b - (1-test_wr)) / b where b from test_be
+            # Recal Kelly: kf_recal uses train_recal_wp instead of claimed_wp for SIZING
+            # The question: is sizing BETTER matched to realized WR?
+            #   Original: size proportional to claimed WP
+            #   Recal: size proportional to train_recal_wp
+            # Better = recal_wp is CLOSER to test_wr than claimed_wp
+
+            recal_wp_for_test = te["avg_claimed_wp"] + wp_adjustment
+            recal_wp_for_test = max(0.01, min(0.99, recal_wp_for_test))
+
+            test_wr_actual = te["realized_wr"]
+            original_gap = abs(te["avg_claimed_wp"] - test_wr_actual)
+            recal_gap = abs(recal_wp_for_test - test_wr_actual)
+
+            holds_oos = recal_gap < original_gap
+
+            entry["recalibrate"] = True
+            entry["wp_adjustment_pp"] = round(wp_adjustment * 100, 1)
+            entry["train_recal_wp"] = round(train_recal_wp * 100, 1)
+            entry["test_original_gap_pp"] = round(original_gap * 100, 1)
+            entry["test_recal_gap_pp"] = round(recal_gap * 100, 1)
+            entry["holds_oos"] = holds_oos
+
+            if holds_oos:
+                entry["verdict"] = "REAL_MISCALIBRATION"
+                entry["reason"] = (
+                    f"Anti-cal in both halves, recal reduces WP-vs-WR gap "
+                    f"from {original_gap*100:.1f}pp to {recal_gap*100:.1f}pp OOS"
+                )
+                real_miscals += 1
+            else:
+                entry["verdict"] = "NOISE_NO_OOS_IMPROVEMENT"
+                entry["reason"] = (
+                    f"Anti-cal in both halves but recal WIDENS gap "
+                    f"({original_gap*100:.1f}pp → {recal_gap*100:.1f}pp) — overshoot"
+                )
+                noise_count += 1
+
+            bucket_results.append(entry)
+
+        arms_out.append({
+            "source": src,
+            "label": label,
+            "n": len(rows),
+            "wp_column": wp_label,
+            "train_range": list(train_range),
+            "test_range": list(test_range),
+            "train_n": len(train_rows),
+            "test_n": len(test_rows),
+            "real_miscalibrations": real_miscals,
+            "noise_buckets": noise_count,
+            "buckets": bucket_results,
+        })
+
+    con.close()
+
+    return {
+        "days": days,
+        "min_n": min_n,
+        "method": "time-ordered split-half with OOS validation",
+        "arms": arms_out,
     }
 
 
@@ -10607,4 +11243,686 @@ def ats_ungated_tracker(
         "by_rung_score": by_rung_score,
         "calibration": calibration,
         "legs": legs_out,
+    }
+
+
+# ─── Shadow Alt-Line Tracker ──────────────────────────────────────────────────
+
+@app.get("/api/shadow-altline/tracker")
+def shadow_altline_tracker(
+    days: int = Query(90, ge=1, le=365),
+    cohort: str = Query("clean"),
+):
+    """
+    Shadow alt-line edge tracker.
+    Returns per-rung × liquidity breakdown, three-lever metrics,
+    cumulative PnL series, and full leg list.
+    Forward read for the mlb_ats_v1 alt-spread edge validation.
+    """
+    import json as _json
+    from collections import defaultdict as _dd
+    from datetime import date as _date
+
+    _STAKE = 10.0
+
+    con = _negbin_db_connect()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT mb.id, mb.odds, mb.status, mb.game_date, mb.predicted_win_prob,
+               mb.notes, mb.bet_info, mb.generated_at,
+               mbl.description, mbl.win_prob, mbl.leg_result, mbl.market_type,
+               mbl.fixture_id, mbl.is_alt_line, mbl.open_odds,
+               mbl.close_odds, mbl.clv_cents, mbl.clv_available,
+               mbl.devig_entry_prob, mbl.devig_close_prob, mbl.overround
+        FROM mock_bets mb
+        JOIN mock_bet_legs mbl ON mbl.mock_bet_id = mb.id
+        WHERE mb.source = 'shadow_altline'
+          AND mb.cohort = ?
+          AND mb.game_date >= date('now', '-' || ? || ' days')
+        ORDER BY mb.game_date DESC, mb.id
+    """, (cohort, days))
+    raw_rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+
+    # ── Parse each row ───────────────────────────────────────────────────────
+    legs = []
+    for row in raw_rows:
+        notes_raw = row.get("notes") or "{}"
+        try:
+            notes = _json.loads(notes_raw)
+        except Exception:
+            notes = {}
+
+        spread_val = notes.get("spread")
+        liquidity = notes.get("liquidity", "unknown")
+        price_type = notes.get("price_type", "unknown")
+        best_book = notes.get("best_book", "unknown")
+        best_dec = notes.get("best_dec")
+        n_bettable = notes.get("n_bettable", 0)
+        pinnacle_dec = notes.get("pinnacle_dec")
+        model_wp = notes.get("model_wp")
+        gate = notes.get("gate", "")
+
+        # Rung label
+        rung = str(spread_val) if spread_val is not None else "unknown"
+        side = "fav" if (spread_val is not None and spread_val < 0) else "dog"
+
+        # Win probability
+        wp_raw = row.get("win_prob") or row.get("predicted_win_prob")
+        try:
+            wp = float(wp_raw) if wp_raw is not None else None
+        except (ValueError, TypeError):
+            wp = None
+
+        # Odds and breakeven
+        odds_raw = row.get("odds")
+        try:
+            odds = float(odds_raw) if odds_raw is not None else None
+        except (ValueError, TypeError):
+            odds = None
+        valid_odds = odds is not None and odds > 1.0
+        breakeven = round(1.0 / odds, 6) if valid_odds else None
+
+        # Devig entry probability
+        devig = row.get("devig_entry_prob")
+        try:
+            devig = float(devig) if devig is not None else None
+        except (ValueError, TypeError):
+            devig = None
+
+        # Devig close probability (for L3 CLV)
+        devig_close = row.get("devig_close_prob")
+        try:
+            devig_close = float(devig_close) if devig_close is not None else None
+        except (ValueError, TypeError):
+            devig_close = None
+
+        # Close odds (American, for L3 CLV fallback)
+        close_am = row.get("close_odds")
+        try:
+            close_am = int(close_am) if close_am is not None else None
+        except (ValueError, TypeError):
+            close_am = None
+        # Convert American close odds to decimal
+        close_dec = None
+        if close_am is not None:
+            if close_am > 0:
+                close_dec = 1.0 + close_am / 100.0
+            elif close_am < 0:
+                close_dec = 1.0 + 100.0 / abs(close_am)
+
+        # L2: edge vs Pinnacle (sharp benchmark)
+        pinnacle_edge_pp = None
+        if pinnacle_dec and pinnacle_dec > 1.0 and valid_odds:
+            # positive = our entry odds better than Pinnacle
+            pinnacle_edge_pp = round((1.0 / pinnacle_dec - 1.0 / odds) * 100, 2)
+
+        # L3: CLV vs close
+        clv_pp = None
+        if valid_odds:
+            if devig_close is not None and devig_close > 0:
+                # Use devigged close probability (most accurate)
+                clv_pp = round((devig_close - 1.0 / odds) * 100, 2)
+            elif close_dec is not None and close_dec > 1.0:
+                # Fallback: raw close odds
+                clv_pp = round((1.0 / close_dec - 1.0 / odds) * 100, 2)
+
+        # Status / result
+        leg_result = row.get("leg_result")
+        if leg_result in ("W", "WIN"):
+            status = "WON"
+        elif leg_result in ("L", "LOSS"):
+            status = "LOST"
+        else:
+            status = "PENDING"
+
+        legs.append({
+            "id": str(row["id"]),
+            "date": row.get("game_date") or "",
+            "description": row.get("description") or "",
+            "rung": rung,
+            "side": side,
+            "spread_val": spread_val,
+            "liquidity": liquidity,
+            "price_type": price_type,
+            "best_book": best_book,
+            "n_bettable": n_bettable,
+            "pinnacle_dec": pinnacle_dec,
+            "gate": gate,
+            "wp": wp,
+            "devig_entry": devig,
+            "devig_close": devig_close,
+            "close_dec": close_dec,
+            "odds": odds,
+            "breakeven": breakeven,
+            "pinnacle_edge_pp": pinnacle_edge_pp,
+            "clv_pp": clv_pp,
+            "status": status,
+            "result": leg_result,
+        })
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    total = len(legs)
+    settled_legs = [lg for lg in legs if lg["status"] != "PENDING"]
+    won_legs = [lg for lg in legs if lg["status"] == "WON"]
+    settled = len(settled_legs)
+    won = len(won_legs)
+
+    def _leg_pnl(lg: dict) -> float:
+        if lg["status"] == "WON":
+            o = lg["odds"] if lg["odds"] and lg["odds"] > 1.0 else 2.0
+            return (o - 1.0) * _STAKE
+        if lg["status"] == "LOST":
+            return -_STAKE
+        return 0.0
+
+    total_pnl = sum(_leg_pnl(lg) for lg in settled_legs)
+    roi = round(total_pnl / (settled * _STAKE) * 100, 2) if settled else None
+    wr = round(won / settled * 100, 2) if settled else None
+
+    dates = [lg["date"] for lg in legs if lg["date"]]
+    first_date = min(dates) if dates else None
+    days_active = None
+    if first_date:
+        try:
+            fd = _date.fromisoformat(first_date)
+            days_active = (_date.today() - fd).days
+        except Exception:
+            pass
+
+    # Deduped game-team count (for progress toward 300-500 threshold)
+    game_team_keys = set()
+    for lg in legs:
+        desc = lg.get("description") or ""
+        date = lg.get("date") or ""
+        # Use date + description as dedup key (same game-team across rungs)
+        # Extract team from description (e.g. "NYY +2.5" → "NYY")
+        team = desc.split()[0] if desc else ""
+        if date and team:
+            game_team_keys.add((date, team))
+    n_deduped = len(game_team_keys)
+
+    summary = {
+        "total": total,
+        "settled": settled,
+        "pending": total - settled,
+        "won": won,
+        "lost": settled - won,
+        "wr": wr,
+        "pnl": round(total_pnl, 2),
+        "roi": roi,
+        "first_date": first_date,
+        "days_active": days_active,
+        "n_deduped": n_deduped,
+        "dedup_target": 500,
+    }
+
+    # ── Helper: compute stats for a group of legs ────────────────────────────
+    def _group_stats(group: list) -> dict:
+        n = len(group)
+        grp_settled = [lg for lg in group if lg["status"] != "PENDING"]
+        grp_won = [lg for lg in group if lg["status"] == "WON"]
+        s = len(grp_settled)
+        w = len(grp_won)
+        pnl = sum(_leg_pnl(lg) for lg in grp_settled)
+        wps = [lg["wp"] for lg in group if lg["wp"] is not None]
+        odds_list = [lg["odds"] for lg in group if lg["odds"] and lg["odds"] > 1.0]
+        be_list = [lg["breakeven"] for lg in group if lg["breakeven"] is not None]
+        devig_list = [lg["devig_entry"] for lg in group if lg["devig_entry"] is not None]
+        avg_wp = round(sum(wps) / len(wps), 2) if wps else None
+        avg_odds = round(sum(odds_list) / len(odds_list), 4) if odds_list else None
+        avg_be = round(sum(be_list) / len(be_list) * 100, 2) if be_list else None
+        avg_devig = round(sum(devig_list) / len(devig_list) * 100, 2) if devig_list else None
+        cover_rate = round(w / s * 100, 2) if s > 0 else None
+        roi_v = round(pnl / (s * _STAKE) * 100, 2) if s > 0 else None
+
+        # L2: avg edge vs Pinnacle (sharp benchmark) — entry-time metric, all legs
+        pinn_edges = [lg["pinnacle_edge_pp"] for lg in group if lg.get("pinnacle_edge_pp") is not None]
+        avg_pinn_edge = round(sum(pinn_edges) / len(pinn_edges), 2) if pinn_edges else None
+        n_pinn = len(pinn_edges)
+
+        # L3: avg CLV vs close — needs settlement + close capture
+        clv_vals = [lg["clv_pp"] for lg in grp_settled if lg.get("clv_pp") is not None]
+        avg_clv = round(sum(clv_vals) / len(clv_vals), 2) if clv_vals else None
+        n_clv = len(clv_vals)
+
+        return {
+            "n": n, "settled": s, "won": w, "lost": s - w,
+            "avg_wp": avg_wp, "avg_odds": avg_odds, "avg_breakeven": avg_be,
+            "avg_devig": avg_devig,
+            "wr": cover_rate, "pnl": round(pnl, 2), "roi": roi_v,
+            "avg_pinnacle_edge_pp": avg_pinn_edge, "n_with_pinnacle": n_pinn,
+            "avg_clv_pp": avg_clv, "n_with_close": n_clv,
+        }
+
+    # ── By rung ──────────────────────────────────────────────────────────────
+    rung_map: dict = _dd(list)
+    for lg in legs:
+        rung_map[lg["rung"]].append(lg)
+
+    by_rung = []
+    for rung_key in sorted(rung_map.keys(), key=lambda x: float(x) if x != "unknown" else 9999):
+        group = rung_map[rung_key]
+        stats = _group_stats(group)
+        # Liquidity breakdown within this rung
+        liq_counts = _dd(int)
+        for lg in group:
+            liq_counts[lg["liquidity"]] += 1
+        by_rung.append({
+            "rung": rung_key,
+            "liquidity_breakdown": dict(liq_counts),
+            **stats,
+        })
+
+    # ── By liquidity tier ────────────────────────────────────────────────────
+    liq_map: dict = _dd(list)
+    for lg in legs:
+        liq_map[lg["liquidity"]].append(lg)
+
+    by_liquidity = []
+    for liq_key in ["liquid", "moderate", "thin", "none"]:
+        if liq_key not in liq_map:
+            continue
+        group = liq_map[liq_key]
+        stats = _group_stats(group)
+        by_liquidity.append({"liquidity": liq_key, **stats})
+
+    # ── By rung × liquidity (the key segmentation) ──────────────────────────
+    cross_map: dict = _dd(list)
+    for lg in legs:
+        cross_map[(lg["rung"], lg["liquidity"])].append(lg)
+
+    by_rung_liquidity = []
+    for (rung_key, liq_key) in sorted(
+        cross_map.keys(),
+        key=lambda x: (float(x[0]) if x[0] != "unknown" else 9999, x[1]),
+    ):
+        group = cross_map[(rung_key, liq_key)]
+        stats = _group_stats(group)
+        by_rung_liquidity.append({
+            "rung": rung_key,
+            "liquidity": liq_key,
+            **stats,
+        })
+
+    # ── By book (which book is entry) ────────────────────────────────────────
+    book_map: dict = _dd(list)
+    for lg in legs:
+        book_map[lg["best_book"]].append(lg)
+
+    by_book = []
+    for bk in sorted(book_map.keys()):
+        group = book_map[bk]
+        stats = _group_stats(group)
+        by_book.append({"book": bk, **stats})
+
+    # ── Daily cumulative PnL series ──────────────────────────────────────────
+    pnl_by_date: dict = _dd(float)
+    for lg in settled_legs:
+        pnl_by_date[lg["date"]] += _leg_pnl(lg)
+
+    cum = 0.0
+    daily_series = []
+    for d in sorted(pnl_by_date.keys()):
+        cum += pnl_by_date[d]
+        daily_series.append({
+            "date": d,
+            "day_pnl": round(pnl_by_date[d], 2),
+            "cum_pnl": round(cum, 2),
+        })
+
+    # ── Three-lever summary (overall) ───────────────────────────────────────
+    overall_stats = _group_stats(legs)
+    three_levers = {
+        "l1_realized": {
+            "label": "Realized PnL",
+            "roi": overall_stats["roi"],
+            "wr": overall_stats["wr"],
+            "avg_breakeven": overall_stats["avg_breakeven"],
+            "pnl": overall_stats["pnl"],
+            "n": overall_stats["settled"],
+        },
+        "l2_pinnacle": {
+            "label": "vs Sharp (Pinnacle)",
+            "avg_edge_pp": overall_stats["avg_pinnacle_edge_pp"],
+            "n": overall_stats["n_with_pinnacle"],
+        },
+        "l3_clv": {
+            "label": "Alt-Close CLV",
+            "avg_clv_pp": overall_stats["avg_clv_pp"],
+            "n": overall_stats["n_with_close"],
+        },
+    }
+
+    # ── Leg list ─────────────────────────────────────────────────────────────
+    legs_out = [
+        {
+            "id": lg["id"],
+            "date": lg["date"],
+            "description": lg["description"],
+            "rung": lg["rung"],
+            "liquidity": lg["liquidity"],
+            "best_book": lg["best_book"],
+            "n_bettable": lg["n_bettable"],
+            "wp": lg["wp"],
+            "devig_entry": lg["devig_entry"],
+            "odds": lg["odds"],
+            "breakeven": lg["breakeven"],
+            "pinnacle_edge_pp": lg.get("pinnacle_edge_pp"),
+            "clv_pp": lg.get("clv_pp"),
+            "status": lg["status"],
+        }
+        for lg in legs
+    ]
+
+    return {
+        "summary": summary,
+        "three_levers": three_levers,
+        "by_rung": by_rung,
+        "by_liquidity": by_liquidity,
+        "by_rung_liquidity": by_rung_liquidity,
+        "by_book": by_book,
+        "daily_series": daily_series,
+        "legs": legs_out,
+    }
+
+
+# ─── Researcher Endpoints ─────────────────────────────────────────────────────
+
+@app.get("/api/researcher/brief")
+def researcher_brief(
+    game_date: str = Query(None),
+    brief_type: str = Query("raw"),
+):
+    """Get the researcher brief for a given date (raw or synthesized)."""
+    from researcher.storage import get_brief, get_item_counts_by_source
+
+    if game_date is None:
+        from datetime import timezone
+        game_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    brief = get_brief(game_date, brief_type)
+    counts = get_item_counts_by_source(game_date)
+
+    return {
+        "game_date": game_date,
+        "brief_type": brief_type,
+        "brief": brief,
+        "source_counts": counts,
+    }
+
+
+@app.post("/api/researcher/run")
+def researcher_run(game_date: str = Query(None)):
+    """Manually trigger a researcher run for a given date."""
+    from researcher.runner import run_daily_research
+
+    if game_date is None:
+        from datetime import timezone
+        game_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    summary = run_daily_research(game_date)
+    return summary
+
+
+@app.get("/api/researcher/items")
+def researcher_items(
+    game_date: str = Query(None),
+    category: str = Query(None),
+):
+    """Get raw researcher items for a date, optionally filtered by category."""
+    from researcher.storage import get_items_for_date
+
+    if game_date is None:
+        from datetime import timezone
+        game_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    items = get_items_for_date(game_date)
+    if category:
+        items = [i for i in items if i["category"] == category]
+
+    return {
+        "game_date": game_date,
+        "count": len(items),
+        "items": items,
+    }
+
+
+# ── Shadow Teaser Tracker ─────────────────────────────────────────────────────
+@app.get("/api/shadow-teaser/tracker")
+def shadow_teaser_tracker(
+    cohort: str = Query("clean"),
+    backfill: str = Query("include"),  # include | exclude | only
+):
+    """
+    Wong teaser structural edge tracker.
+
+    Returns per-season breakdown, fav/dog split, WR vs breakeven
+    at multiple price points, split-half stability, and full leg list.
+    Forward validation for the Wong teaser structural edge.
+    """
+    import json as _json
+    import math as _math
+
+    con = _negbin_db_connect()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT mb.id, mb.odds, mb.status, mb.game_date,
+               mb.predicted_win_prob, mb.notes, mb.bet_info,
+               mb.actual_profit,
+               mbl.description, mbl.leg_result, mbl.market_type,
+               mbl.fixture_id, mbl.resolved_home_score,
+               mbl.resolved_away_score, mbl.resolved_margin,
+               mbl.resolved_adjusted_margin
+        FROM mock_bets mb
+        JOIN mock_bet_legs mbl ON mbl.mock_bet_id = mb.id
+        WHERE mb.source = 'shadow_teaser'
+          AND mb.cohort = ?
+        ORDER BY mb.game_date, mb.id
+    """, (cohort,))
+    raw_rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+
+    # Parse and filter
+    legs = []
+    for row in raw_rows:
+        notes_raw = row.get("notes") or "{}"
+        try:
+            notes = _json.loads(notes_raw)
+        except Exception:
+            notes = {}
+
+        is_bf = notes.get("is_backfill", False)
+        if backfill == "exclude" and is_bf:
+            continue
+        if backfill == "only" and not is_bf:
+            continue
+
+        result = row.get("leg_result")
+        if result in ("W", "WIN"):
+            status = "WON"
+        elif result in ("L", "LOSS"):
+            status = "LOST"
+        elif result == "PUSH":
+            status = "PUSH"
+        else:
+            status = "PENDING"
+
+        legs.append({
+            "id": row["id"],
+            "game_date": row["game_date"],
+            "description": row.get("description", ""),
+            "status": status,
+            "side": notes.get("side", "unknown"),
+            "original_spread": notes.get("original_spread"),
+            "teased_spread": notes.get("teased_spread"),
+            "actual_margin": notes.get("actual_margin"),
+            "season": notes.get("season"),
+            "week": notes.get("week"),
+            "is_backfill": is_bf,
+            "ref_price_am": notes.get("ref_price_am", -120),
+            "profit": row.get("actual_profit"),
+        })
+
+    # Aggregate stats
+    settled = [l for l in legs if l["status"] in ("WON", "LOST")]
+    wins = sum(1 for l in settled if l["status"] == "WON")
+    losses = sum(1 for l in settled if l["status"] == "LOST")
+    pushes = sum(1 for l in legs if l["status"] == "PUSH")
+    n_settled = wins + losses
+    wr = wins / n_settled if n_settled > 0 else None
+
+    # Per-season breakdown
+    season_map = {}
+    for l in settled:
+        s = l.get("season") or "unknown"
+        if s not in season_map:
+            season_map[s] = {"wins": 0, "losses": 0}
+        if l["status"] == "WON":
+            season_map[s]["wins"] += 1
+        else:
+            season_map[s]["losses"] += 1
+
+    seasons = []
+    for s in sorted(season_map.keys(), key=lambda x: str(x)):
+        d = season_map[s]
+        n = d["wins"] + d["losses"]
+        seasons.append({
+            "season": s,
+            "n": n,
+            "wins": d["wins"],
+            "losses": d["losses"],
+            "wr": round(d["wins"] / n, 4) if n > 0 else None,
+        })
+
+    # Fav/dog split
+    fav_settled = [l for l in settled if l["side"] == "fav"]
+    dog_settled = [l for l in settled if l["side"] == "dog"]
+    fav_w = sum(1 for l in fav_settled if l["status"] == "WON")
+    dog_w = sum(1 for l in dog_settled if l["status"] == "WON")
+
+    side_split = {
+        "fav": {
+            "n": len(fav_settled),
+            "wins": fav_w,
+            "losses": len(fav_settled) - fav_w,
+            "wr": round(fav_w / len(fav_settled), 4) if fav_settled else None,
+        },
+        "dog": {
+            "n": len(dog_settled),
+            "wins": dog_w,
+            "losses": len(dog_settled) - dog_w,
+            "wr": round(dog_w / len(dog_settled), 4) if dog_settled else None,
+        },
+    }
+
+    # Breakeven at multiple prices
+    price_analysis = []
+    for label, risk, win_am in [
+        ("-110", 110, 100), ("-120", 120, 100), ("-130", 130, 100), ("-134", 134, 100)
+    ]:
+        overall_be = risk / (risk + win_am)
+        per_leg_be = _math.sqrt(overall_be)
+        edge_pp = (wr - per_leg_be) * 100 if wr is not None else None
+        price_analysis.append({
+            "price": label,
+            "overall_be": round(overall_be, 4),
+            "per_leg_be": round(per_leg_be, 4),
+            "wr": round(wr, 4) if wr is not None else None,
+            "edge_pp": round(edge_pp, 1) if edge_pp is not None else None,
+            "deployable": edge_pp is not None and edge_pp > 0,
+        })
+
+    # Split-half stability (time-ordered)
+    half = len(settled) // 2
+    first_half = settled[:half]
+    second_half = settled[half:]
+    fh_w = sum(1 for l in first_half if l["status"] == "WON")
+    sh_w = sum(1 for l in second_half if l["status"] == "WON")
+    fh_wr = fh_w / len(first_half) if first_half else None
+    sh_wr = sh_w / len(second_half) if second_half else None
+    delta = abs(fh_wr - sh_wr) * 100 if fh_wr is not None and sh_wr is not None else None
+    split_half = {
+        "first_half": {
+            "n": len(first_half),
+            "wr": round(fh_wr, 4) if fh_wr is not None else None,
+        },
+        "second_half": {
+            "n": len(second_half),
+            "wr": round(sh_wr, 4) if sh_wr is not None else None,
+        },
+        "delta_pp": round(delta, 1) if delta is not None else None,
+        "stable": delta is not None and delta < 5.0,
+    }
+
+    # Cumulative PnL at ref price (-120)
+    ref_stake = 10.0
+    ref_dec = 1.0 + 100.0 / 120.0
+    cumulative = []
+    running_pnl = 0.0
+    for l in settled:
+        if l["status"] == "WON":
+            running_pnl += ref_stake * (ref_dec - 1.0)
+        else:
+            running_pnl -= ref_stake
+        cumulative.append({
+            "game_date": l["game_date"],
+            "pnl": round(running_pnl, 2),
+            "n": len(cumulative) + 1,
+        })
+
+    # Forward vs backfill split
+    forward_settled = [l for l in settled if not l.get("is_backfill")]
+    backfill_settled = [l for l in settled if l.get("is_backfill")]
+    fw_w = sum(1 for l in forward_settled if l["status"] == "WON")
+    bf_w = sum(1 for l in backfill_settled if l["status"] == "WON")
+
+    return {
+        "summary": {
+            "total_legs": len(legs),
+            "settled": n_settled,
+            "wins": wins,
+            "losses": losses,
+            "pushes": pushes,
+            "pending": sum(1 for l in legs if l["status"] == "PENDING"),
+            "wr": round(wr, 4) if wr is not None else None,
+            "historical_wr": 0.758,
+        },
+        "forward_vs_backfill": {
+            "forward": {
+                "n": len(forward_settled),
+                "wins": fw_w,
+                "wr": round(fw_w / len(forward_settled), 4) if forward_settled else None,
+            },
+            "backfill": {
+                "n": len(backfill_settled),
+                "wins": bf_w,
+                "wr": round(bf_w / len(backfill_settled), 4) if backfill_settled else None,
+            },
+        },
+        "side_split": side_split,
+        "seasons": seasons,
+        "price_analysis": price_analysis,
+        "split_half": split_half,
+        "sportsbook_pricing": {
+            "draftkings": {"price": "-120", "deployable": True},
+            "bet365": {"price": "-120", "deployable": True},
+            "betmgm": {"price": "-120", "deployable": True},
+            "fanduel": {"price": "-134", "deployable": False},
+            "caesars": {"price": "-130", "deployable": False},
+            "espnbet": {"price": "-155 dynamic", "deployable": False},
+            "bookmaker_eu": {"price": "-110", "deployable": True},
+        },
+        "cumulative_pnl": cumulative[-20:] if len(cumulative) > 20 else cumulative,
+        "cumulative_pnl_total": round(running_pnl, 2) if cumulative else 0,
+        "legs": legs[-50:],  # most recent 50
+        "verdict": {
+            "edge_real": True,
+            "edge_structural": True,
+            "best_regulated_price": "-120 (DraftKings/bet365)",
+            "edge_at_best_price_pp": round((wr - _math.sqrt(120/220)) * 100, 1) if wr else None,
+            "optimal_construction": "dog-weighted narrow Wong (+1.5/+2.5 preferred over fav -7.5/-8.5)",
+        },
     }

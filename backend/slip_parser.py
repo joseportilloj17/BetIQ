@@ -163,8 +163,8 @@ def _enrich(parsed: dict) -> dict:
         leg["decimal_odds"]  = round(dec, 4)
         leg["implied_prob"]  = round(1 / dec * 100, 1) if dec > 1 else 0
 
-    # Model-based combined win prob (85.71% accuracy per leg)
-    MODEL_ACCURACY   = 0.8571
+    # Per-leg spread cover rate (dist_wp calibrated: 77.0% realized on 4303 legs)
+    MODEL_ACCURACY   = 0.770
     model_combined   = MODEL_ACCURACY ** n
     naive_combined   = 1.0
     for leg in legs:

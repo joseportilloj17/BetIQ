@@ -1173,6 +1173,46 @@ class InjuryReport(Base):
     source       = Column(String,  nullable=True)                   # espn | mlb_stats_api
 
 
+class ResearcherItem(Base):
+    """
+    News items ingested by the researcher system.
+
+    Populated by researcher/sources.py from ESPN, MLB.com, FanGraphs, etc.
+    Deduped on (source, headline_hash). Used for Claude synthesis and user briefs.
+    """
+    __tablename__ = "researcher_items"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    headline       = Column(String,  nullable=False)
+    headline_hash  = Column(String,  nullable=False)       # SHA-256 of headline for dedup
+    source         = Column(String,  nullable=False)       # espn_injuries | mlb_api | espn_rss | ...
+    url            = Column(String,  nullable=True)
+    timestamp      = Column(DateTime, nullable=True)       # pub date from source
+    body           = Column(Text,    nullable=True)
+    players        = Column(String,  nullable=True)        # JSON list of player names
+    teams          = Column(String,  nullable=True)        # JSON list of team names
+    category       = Column(String,  nullable=True)        # news | injury | lineup | analysis | roster
+    ingested_at    = Column(DateTime, default=datetime.utcnow)
+    game_date      = Column(String,  nullable=True)        # YYYY-MM-DD target date
+
+
+class ResearcherBrief(Base):
+    """
+    Synthesized daily briefs produced by Claude from researcher items.
+    One row per (game_date, brief_type) pair.
+    """
+    __tablename__ = "researcher_briefs"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    game_date      = Column(String,  nullable=False)       # YYYY-MM-DD
+    brief_type     = Column(String,  nullable=False)       # daily | player | injury
+    content        = Column(Text,    nullable=True)        # markdown brief text
+    model_feed     = Column(Text,    nullable=True)        # JSON structured model feed
+    created_at     = Column(DateTime, default=datetime.utcnow)
+    item_count     = Column(Integer, nullable=True)        # number of source items used
+    token_cost     = Column(Integer, nullable=True)        # approximate tokens used
+
+
 class LineMovementLog(Base):
     """
     Historical odds snapshots for line movement tracking.

@@ -1210,7 +1210,12 @@ def build_parlay(scored_legs: list[dict], stake: float = 10.0) -> dict:
     combined_win_prob = 1.0
     for leg in scored_legs:
         combined_odds    *= leg["odds"]
-        combined_win_prob *= (leg["win_prob"] / 100)
+        # Prefer dist_wp (calibrated) over win_prob (overconfident by ~7pp)
+        dwp = leg.get("dist_wp")
+        if dwp is not None and dwp > 0:
+            combined_win_prob *= dwp
+        else:
+            combined_win_prob *= (leg["win_prob"] / 100)
 
     ev = combined_win_prob * (combined_odds - 1) * stake - (1 - combined_win_prob) * stake
 

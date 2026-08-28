@@ -488,12 +488,12 @@ def _assemble_fav_home_carveout(candidates, odds_bands, cell_boost):
             if lo <= combined_odds < hi:
                 band = band_label
                 break
-        avg_wp = np.mean([c["model_wp"] for c in combo])
+        avg_wp = np.mean([c["ats_dist_wp"] for c in combo])
         avg_lqs = np.mean([c.get("lqs", 50) for c in combo])
         avg_los = np.mean([c.get("los", 0.5) for c in combo])
         combined_wp = 1.0
         for c in combo:
-            combined_wp *= c["model_wp"]
+            combined_wp *= c["ats_dist_wp"]
         norm_ev = max(0, combined_wp * (combined_odds - 1) - (1 - combined_wp))
         composite = (avg_wp * 0.40 + (avg_lqs / 100) * 0.20
                      + avg_los * 0.30 + min(norm_ev, 1.0) * 0.10)
@@ -617,7 +617,7 @@ def generate_negbin_shadow_picks(db=None, today_str=None,
             _get_todays_fixtures() — guarantees A/B see the exact same slate.
     """
     from negbin_model import load_negbin_model, _simulate_margins
-    from ml_model import _get_feature_matrix
+    from ml_model import _get_feature_matrix, ats_distributional_cover_prob
     from walk_forward_backtest import _compute_los, _compute_lqs
     import itertools
 
@@ -724,6 +724,10 @@ def generate_negbin_shadow_picks(db=None, today_str=None,
                     else:
                         cell = "unknown"
 
+                    # dist_wp: calibrated spread-cover probability (vs model_wp which is overconfident)
+                    _dist_wp_home = ats_distributional_cover_prob(
+                        mu_home - mu_away, sv, "home")
+
                     candidates.append({
                         "fixture_id": fix["fixture_id"],
                         "fixture_key": fixture_key,
@@ -732,6 +736,7 @@ def generate_negbin_shadow_picks(db=None, today_str=None,
                         "spread_value": sv, "pick_side": "home",
                         "pick_team": home,
                         "model_wp": home_wp, "market_wp": mkt_home,
+                        "ats_dist_wp": round(_dist_wp_home, 4),
                         "edge_pp": round(edge, 2),
                         "los": round(los, 4), "lqs": lqs,
                         "decimal_odds": dec_odds_home,
@@ -758,6 +763,9 @@ def generate_negbin_shadow_picks(db=None, today_str=None,
                     else:
                         cell = "unknown"
 
+                    _dist_wp_away = ats_distributional_cover_prob(
+                        mu_home - mu_away, sv, "away")
+
                     candidates.append({
                         "fixture_id": fix["fixture_id"],
                         "fixture_key": fixture_key,
@@ -766,6 +774,7 @@ def generate_negbin_shadow_picks(db=None, today_str=None,
                         "spread_value": sv, "pick_side": "away",
                         "pick_team": away,
                         "model_wp": away_wp, "market_wp": mkt_away,
+                        "ats_dist_wp": round(_dist_wp_away, 4),
                         "edge_pp": round(edge, 2),
                         "los": round(los, 4), "lqs": lqs,
                         "decimal_odds": dec_odds_away,
@@ -802,6 +811,28 @@ def generate_negbin_shadow_picks(db=None, today_str=None,
 
     pool = [c for c in candidates
             if c.get("decimal_odds") is not None and c["decimal_odds"] > 1.0]
+
+    # ── Fix 2: epp >= 12 toxicity filter (applied to ALL arms via pool) ──
+    pre_epp = len(pool)
+    pool = [c for c in pool
+            if c.get("edge_pp") is None or c["edge_pp"] < _EDGE_GATE_THRESHOLD_PP]
+    if pre_epp - len(pool) > 0:
+        print(f"[negbin-{tag_label}] epp≥{_EDGE_GATE_THRESHOLD_PP} filter: "
+              f"{pre_epp} → {len(pool)} ({pre_epp - len(pool)} toxic legs removed)")
+
+    # ── Fix 3: min-rung per fixture-team (evaware logic on Shadow A) ──
+    # Group by fixture_key:pick_team, keep only the lowest rung per group.
+    # Lower rungs (+1.5/+2.5) have thicker edge at longer odds; max-dist_wp
+    # funneled 84% of legs to +4.5 (thinnest edge, shortest odds).
+    ft_groups = defaultdict(list)
+    for c in pool:
+        ft_key = f"{c['fixture_key']}:{c['pick_team']}"
+        ft_groups[ft_key].append(c)
+    pool = []
+    for ft_key, group in ft_groups.items():
+        group.sort(key=lambda x: x["spread_value"])
+        pool.append(group[0])  # lowest rung
+
     pool.sort(key=lambda x: -x["los"])
 
     # Assign a leg_id to each candidate: fixture_key:pick_team:spread_value
@@ -822,12 +853,12 @@ def generate_negbin_shadow_picks(db=None, today_str=None,
             if lo <= combined_odds < hi:
                 band = band_label
                 break
-        avg_wp = np.mean([c["model_wp"] for c in combo])
+        avg_wp = np.mean([c["ats_dist_wp"] for c in combo])
         avg_lqs = np.mean([c.get("lqs", 50) for c in combo])
         avg_los = np.mean([c.get("los", 0.5) for c in combo])
         combined_wp = 1.0
         for c in combo:
-            combined_wp *= c["model_wp"]
+            combined_wp *= c["ats_dist_wp"]
         norm_ev = max(0, combined_wp * (combined_odds - 1) - (1 - combined_wp))
         composite = avg_wp * 0.40 + (avg_lqs / 100) * 0.20 + avg_los * 0.30 + min(norm_ev, 1.0) * 0.10
         cell_adj = 1.0
@@ -1771,14 +1802,15 @@ def generate_fullstack_counterfactual(db=None, today_str=None):
             if dist is not None and dist > 0:
                 leg_probs.append(dist)
             else:
-                # Fallback: use market-implied if dist_wp unavailable
-                mkt = leg["win_prob"]
-                if mkt is not None and mkt > 0:
-                    leg_probs.append(mkt)
-                    n_missing_dist += 1
+                # Fallback: use market-implied (conservative), NOT win_prob (overconfident)
+                nb_wp = leg.get("negbin_wp")
+                epp = leg.get("negbin_edge_pp")
+                if nb_wp is not None and epp is not None:
+                    mkt_fb = nb_wp - epp / 100.0
+                    leg_probs.append(max(mkt_fb, 0.30))
                 else:
-                    leg_probs.append(0.75)  # conservative default
-                    n_missing_dist += 1
+                    leg_probs.append(0.65)  # conservative default
+                n_missing_dist += 1
 
         # Parlay cover prob = product (legs are independent: different fixtures)
         parlay_prob = 1.0
@@ -1787,7 +1819,7 @@ def generate_fullstack_counterfactual(db=None, today_str=None):
         parlay_dist_wp[pid] = parlay_prob
 
     if n_missing_dist > 0:
-        print(f"[fullstack] {n_missing_dist} legs still missing dist_wp — used market fallback")
+        print(f"[fullstack] {n_missing_dist} legs still missing dist_wp — used market-implied fallback")
     if n_fallback > 0 and n_scored_live == 0:
         print(f"[fullstack] {n_fallback} legs could not be scored with dist_wp")
 
@@ -2182,13 +2214,15 @@ def generate_composite_counterfactual(db=None, today_str=None):
             if dist is not None and dist > 0:
                 leg_probs.append(dist)
             else:
-                mkt = leg["win_prob"]
-                if mkt is not None and mkt > 0:
-                    leg_probs.append(mkt)
-                    n_missing_dist += 1
+                # Fallback: market-implied (conservative), NOT win_prob (overconfident)
+                nb_wp = leg.get("negbin_wp")
+                epp = leg.get("negbin_edge_pp")
+                if nb_wp is not None and epp is not None:
+                    mkt_fb = nb_wp - epp / 100.0
+                    leg_probs.append(max(mkt_fb, 0.30))
                 else:
-                    leg_probs.append(0.75)
-                    n_missing_dist += 1
+                    leg_probs.append(0.65)
+                n_missing_dist += 1
 
         parlay_prob = 1.0
         for p in leg_probs:
@@ -2556,12 +2590,21 @@ def generate_distwp_gated_counterfactual(db=None, today_str=None):
     n_real_odds = 0
     n_fallback = 0
 
+    n_epp_toxic = 0
     for row in a_parlays:
         pid = row[0]
         legs = parlay_legs.get(pid, [])
         reject = False
         for leg in legs:
             n_legs_total += 1
+
+            # epp >= 12 toxicity filter
+            epp = leg.get("negbin_edge_pp")
+            if epp is not None and epp >= _EDGE_GATE_THRESHOLD_PP:
+                reject = True
+                n_epp_toxic += 1
+                break
+
             dist_wp = leg["ats_dist_wp"]
 
             if dist_wp is None:
@@ -2602,9 +2645,9 @@ def generate_distwp_gated_counterfactual(db=None, today_str=None):
     print(f"[distwp-gate] Market-implied source: {n_real_odds} real-odds, "
           f"{n_fallback} back-derived (matched)")
 
-    print(f"[distwp-gate] dist_wp gate: {len(a_parlays)} → {len(after_gate)} "
+    print(f"[distwp-gate] dist_wp + epp<{_EDGE_GATE_THRESHOLD_PP} gate: {len(a_parlays)} → {len(after_gate)} "
           f"({n_rejected} rejected, {n_missing} missing signals, "
-          f"{n_legs_rejected} legs failed gate)")
+          f"{n_legs_rejected} legs failed gate, {n_epp_toxic} epp toxic)")
 
     if not after_gate:
         print("[distwp-gate] All parlays rejected by dist_wp gate")
@@ -2621,7 +2664,13 @@ def generate_distwp_gated_counterfactual(db=None, today_str=None):
             if dist is not None and dist > 0:
                 leg_probs.append(dist)
             else:
-                leg_probs.append(leg["win_prob"] or 0.75)
+                # Market-implied fallback (conservative), not win_prob
+                nb_wp = leg.get("negbin_wp")
+                epp = leg.get("negbin_edge_pp")
+                if nb_wp is not None and epp is not None:
+                    leg_probs.append(max(nb_wp - epp / 100.0, 0.30))
+                else:
+                    leg_probs.append(0.65)
 
         parlay_prob = 1.0
         for p in leg_probs:
@@ -2972,7 +3021,12 @@ def generate_bothgates_counterfactual(db=None, today_str=None):
             if dist is not None and dist > 0:
                 leg_probs.append(dist)
             else:
-                leg_probs.append(leg["win_prob"] or 0.75)
+                nb_wp = leg.get("negbin_wp")
+                epp = leg.get("negbin_edge_pp")
+                if nb_wp is not None and epp is not None:
+                    leg_probs.append(max(nb_wp - epp / 100.0, 0.30))
+                else:
+                    leg_probs.append(0.65)
 
         parlay_prob = 1.0
         for p in leg_probs:
@@ -3162,6 +3216,1302 @@ def generate_bothgates_counterfactual(db=None, today_str=None):
           f"(source={_BOTHGATES_SOURCE})")
 
     return after_gate
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HIGH-CONVICTION ARM — absolute dist_wp ≥ 0.85 per-leg threshold
+# ═══════════════════════════════════════════════════════════════════════════
+_HIGHCONV_SOURCE = "shadow_negbin_highconv"
+_HIGHCONV_DISTWP_FLOOR = 0.85   # 85-90% band: +16.3pp -1.5 margin, $4.77 EV/$10
+
+# Evidence (conviction_ladder.py, 2026-07-27, N=290 de-duped fixtures):
+#   dist_wp 85-90%: -1.5 WR=50.4% vs BE=34.1% = +16.3pp, split-half STABLE
+#                   +4.5 WR=87.4% vs BE=83.1% = +4.3pp
+#   dist_wp 90%+:   +3.5 WR=89.3% vs BE=77.3% = +11.9pp, split-half STABLE
+#                   -1.5 WR=37.5% vs BE=34.1% = +3.4pp (in noise at N=56)
+# The 0.85 threshold maximises the +EV pool while staying split-half stable.
+# Volume: ~7.3 unique fixtures/day at 0.85+, ~2.8/day at 0.90+.
+
+
+def generate_highconv_counterfactual(db=None, today_str=None):
+    """High-conviction counterfactual: keep legs only where ats_dist_wp >= 0.85.
+
+    Absolute dist_wp threshold (not relative to market).
+    Equal $10 stake (like edgegate) — sizing comes later once -1.5 rung is live.
+
+    Source tag: shadow_negbin_highconv
+    """
+    from database import MockBet, MockBetLeg
+    from sqlalchemy import text as _text
+
+    if today_str is None:
+        today_str = datetime.now(_CT).strftime("%Y-%m-%d")
+
+    print(f"\n[highconv] Generating high-conviction counterfactual for {today_str}")
+
+    # ── Dedup ──
+    existing = db.execute(_text(
+        "SELECT COUNT(*) FROM mock_bets "
+        "WHERE source=:src AND game_date=:gd"
+    ), {"src": _HIGHCONV_SOURCE, "gd": today_str}).scalar()
+    if existing > 0:
+        print(f"[highconv] Already {existing} parlays for {today_str} — skipping")
+        return []
+
+    # ── Read Shadow A's parlays for today ──
+    a_parlays = db.execute(_text(
+        "SELECT id, bet_info, odds, composite_score, negbin_odds_band, "
+        "       negbin_leg_count, predicted_win_prob "
+        "FROM mock_bets "
+        "WHERE source='shadow_negbin' AND game_date=:gd "
+        "  AND cohort='clean' "
+        "ORDER BY composite_score DESC"
+    ), {"gd": today_str}).fetchall()
+
+    if not a_parlays:
+        print("[highconv] No Shadow A parlays found for today")
+        return []
+
+    # ── Read all legs with signals ──
+    leg_data = db.execute(_text(
+        "SELECT l.mock_bet_id, l.description, l.win_prob, l.negbin_edge_pp, "
+        "       l.fixture_id, l.leg_index, l.ats_cover_wp, l.negbin_wp, "
+        "       l.negbin_mu_home, l.negbin_mu_away, l.negbin_cell, l.ats_dist_wp, "
+        "       l.ridge_composite, l.bayes_team_wp "
+        "FROM mock_bet_legs l "
+        "JOIN mock_bets b ON l.mock_bet_id = b.id "
+        "WHERE b.source='shadow_negbin' AND b.game_date=:gd AND b.cohort='clean'"
+    ), {"gd": today_str}).fetchall()
+
+    parlay_legs = defaultdict(list)
+    for row_l in leg_data:
+        (mid, desc, wp, edge, fix_id, idx, ats, nb_wp,
+         mu_h, mu_a, cell, dist_wp, ridge_c, bayes_wp) = row_l
+        parlay_legs[mid].append({
+            "description": desc, "win_prob": wp, "negbin_edge_pp": edge,
+            "fixture_id": fix_id, "leg_index": idx, "ats_cover_wp": ats,
+            "negbin_wp": nb_wp, "negbin_mu_home": mu_h, "negbin_mu_away": mu_a,
+            "negbin_cell": cell, "ats_dist_wp": dist_wp,
+            "ridge_composite": ridge_c, "bayes_team_wp": bayes_wp,
+        })
+
+    # ── Gate: ats_dist_wp >= _HIGHCONV_DISTWP_FLOOR per leg (absolute) ──
+    after_gate = []
+    n_rejected = 0
+    n_missing = 0
+
+    n_epp_toxic = 0
+    for row in a_parlays:
+        pid = row[0]
+        legs = parlay_legs.get(pid, [])
+        reject = False
+        for leg in legs:
+            # epp >= 12 toxicity filter
+            epp = leg.get("negbin_edge_pp")
+            if epp is not None and epp >= _EDGE_GATE_THRESHOLD_PP:
+                reject = True
+                n_epp_toxic += 1
+                break
+            dist_wp = leg["ats_dist_wp"]
+            if dist_wp is None:
+                reject = True
+                n_missing += 1
+                break
+            if dist_wp < _HIGHCONV_DISTWP_FLOOR:
+                reject = True
+                break
+        if reject:
+            n_rejected += 1
+        else:
+            after_gate.append(row)
+
+    print(f"[highconv] dist_wp≥{_HIGHCONV_DISTWP_FLOOR} + epp<{_EDGE_GATE_THRESHOLD_PP} gate: "
+          f"{len(a_parlays)} → {len(after_gate)} "
+          f"({n_rejected} rejected, {n_missing} missing dist_wp, {n_epp_toxic} epp toxic)")
+
+    if not after_gate:
+        print("[highconv] All parlays rejected by high-conviction gate")
+        return []
+
+    # ── Equal $10 stake (flat sizing — same as edgegate) ──
+    run_id = str(uuid.uuid4())
+    stored = 0
+    for row in after_gate:
+        pid, bet_info, odds, comp, band, lc, wp = row
+        legs = parlay_legs.get(pid, [])
+
+        # Parlay-level dist_wp
+        leg_probs = []
+        for leg in legs:
+            d = leg["ats_dist_wp"]
+            if d and d > 0:
+                leg_probs.append(d)
+            else:
+                nb_wp = leg.get("negbin_wp")
+                epp = leg.get("negbin_edge_pp")
+                if nb_wp is not None and epp is not None:
+                    leg_probs.append(max(nb_wp - epp / 100.0, 0.30))
+                else:
+                    leg_probs.append(0.65)
+        parlay_prob = 1.0
+        for p in leg_probs:
+            parlay_prob *= p
+
+        mock_id = str(uuid.uuid4())
+        mock = MockBet(
+            id=mock_id,
+            generation_run_id=run_id,
+            game_date=today_str,
+            sport="MLB",
+            bet_type="parlay" if (lc or 2) > 1 else "straight",
+            odds=odds,
+            amount=10.0,
+            legs=lc or 2,
+            bet_info=bet_info,
+            predicted_win_prob=parlay_prob,
+            model_used="negbin_v1+highconv",
+            status="PENDING",
+            source=_HIGHCONV_SOURCE,
+            composite_score=comp,
+            cohort="clean",
+            weight=1.0,
+        )
+        db.add(mock)
+        db.flush()
+
+        # Set mean/min dist_wp via raw SQL (columns added by ALTER TABLE, not in ORM model)
+        try:
+            db.execute(_text(
+                "UPDATE mock_bets SET mean_leg_dist_wp=:mdw, min_leg_dist_wp=:mindw "
+                "WHERE id=:mid"
+            ), {"mdw": round(float(np.mean(leg_probs)), 4),
+                "mindw": round(float(min(leg_probs)), 4), "mid": mock_id})
+        except Exception:
+            pass
+
+        try:
+            db.execute(_text(
+                "UPDATE mock_bets SET negbin_odds_band=:band, negbin_leg_count=:lc "
+                "WHERE id=:mid"
+            ), {"band": band, "lc": lc, "mid": mock_id})
+        except Exception:
+            pass
+
+        for leg in legs:
+            leg_obj = MockBetLeg(
+                mock_bet_id=mock_id,
+                leg_index=leg["leg_index"],
+                description=leg["description"],
+                market_type="alternate_spreads",
+                sport="MLB",
+                win_prob=leg["win_prob"],
+                fixture_id=leg["fixture_id"],
+                is_alt_line=True,
+            )
+            db.add(leg_obj)
+            db.flush()
+            updates = {}
+            if leg["negbin_wp"] is not None:
+                updates["negbin_wp"] = leg["negbin_wp"]
+            if leg["negbin_edge_pp"] is not None:
+                updates["negbin_edge_pp"] = leg["negbin_edge_pp"]
+            if leg["negbin_mu_home"] is not None:
+                updates["negbin_mu_home"] = leg["negbin_mu_home"]
+            if leg["negbin_mu_away"] is not None:
+                updates["negbin_mu_away"] = leg["negbin_mu_away"]
+            if leg["negbin_cell"] is not None:
+                updates["negbin_cell"] = leg["negbin_cell"]
+            if leg["ats_cover_wp"] is not None:
+                updates["ats_cover_wp"] = leg["ats_cover_wp"]
+            if leg["ats_dist_wp"] is not None:
+                updates["ats_dist_wp"] = leg["ats_dist_wp"]
+            if leg["bayes_team_wp"] is not None:
+                updates["bayes_team_wp"] = leg["bayes_team_wp"]
+            if leg["ridge_composite"] is not None:
+                updates["ridge_composite"] = leg["ridge_composite"]
+            if updates:
+                set_clause = ", ".join(f"{k}=:{k}" for k in updates)
+                updates["lid"] = leg_obj.id
+                try:
+                    db.execute(_text(
+                        f"UPDATE mock_bet_legs SET {set_clause} WHERE id=:lid"
+                    ), updates)
+                except Exception:
+                    pass
+
+        stored += 1
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[highconv] DB commit failed: {e}")
+        return []
+
+    print(f"[highconv] Stored {stored} high-conviction parlays "
+          f"(source={_HIGHCONV_SOURCE})")
+
+    return after_gate
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STRAIGHT -1.5 ARM — bet team -1.5 (win by 2+) on 85-90% dist_wp fixtures
+# ═══════════════════════════════════════════════════════════════════════════
+_NEG15_SOURCE = "shadow_negbin_neg15"
+_NEG15_DISTWP_LO = 0.85
+_NEG15_DISTWP_HI = 0.90
+_NEG15_RUNG = -1.5
+_NEG15_STAKE = 10.0
+_NEG15_FALLBACK_ODDS = 2.929  # avg -1.5 odds from alt_lines (2026-06-28 to 2026-07-26)
+_NEG15_MAX_ODDS = 3.50  # odds ceiling — above this, WR collapses (heavy underdogs can't win by 2+)
+# 3.00-3.50 bucket: WR=53.3% vs BE=32.1% = +21.2pp (keep)
+# 3.50+: WR=16.7% vs BE=27.2% = -10.6pp (cut)
+# N=13 above threshold — mechanically justified (not precisely measured)
+
+# Evidence (conviction_ladder.py + neg15_durability.py, 2026-07-27):
+#   dist_wp 85-90% × -1.5: WR=47.0% vs BE=34.1% = +12.9pp, split-half STABLE
+#   Straight $10: +$505 PnL, +37.7% ROI, 17/24 profit days
+#   Same fixtures at +4.5: +$68, +5.0% ROI — -1.5 is 7.5x the ROI
+#   H2 durability: +5.0pp above BE (edgegate went -4.4pp below — different)
+#   Discrimination IS the lever: P(team wins)=59.7%, P(decisive|won)=78.8% (MLB constant)
+
+
+def _get_spread_odds(pick_team, home_team, away_team, game_date, target_line, fallback_odds):
+    """Look up spread odds from alt_lines for a specific team and line.
+
+    Falls back to fallback_odds if not found.
+    """
+    con = sqlite3.connect(_HIST_DB, timeout=15)
+    from datetime import date as _date, timedelta as _td
+    try:
+        next_date = (_date.fromisoformat(game_date) + _td(days=1)).isoformat()
+    except Exception:
+        next_date = None
+
+    dates_to_try = [game_date]
+    if next_date:
+        dates_to_try.append(next_date)
+
+    for gd in dates_to_try:
+        row = con.execute("""
+            SELECT odds FROM alt_lines
+            WHERE home_team = ? AND away_team = ? AND game_date = ?
+              AND market_key = 'alternate_spreads'
+              AND team = ?
+              AND ABS(line - ?) < 0.26
+              AND odds IS NOT NULL AND odds > 1.0
+            ORDER BY fetched_at DESC LIMIT 1
+        """, (home_team, away_team, gd, pick_team, target_line)).fetchone()
+        if row is not None:
+            con.close()
+            return float(row[0])
+
+    con.close()
+    return fallback_odds
+
+
+def generate_neg15_straight(db=None, today_str=None):
+    """Straight -1.5 bets on 85-90% dist_wp fixtures.
+
+    Architecture:
+      1. Read Shadow A's legs for today (same fixture snapshot)
+      2. De-duplicate by fixture_id → one entry per game-side
+      3. For each fixture: take the max dist_wp across all rungs
+      4. Gate: keep fixtures where max_dist_wp ∈ [0.85, 0.90)
+      5. Look up actual -1.5 odds from alt_lines
+      6. Create one STRAIGHT bet per fixture at $10 flat
+
+    Why straight, not parlay:
+      Non-overlapping parlays: PnL $433 mean (lower than straight $505)
+      Straight: deterministic, uncorrelated, highest absolute PnL
+      The parlay "higher ROI" is on fewer bets with more variance.
+
+    Source tag: shadow_negbin_neg15
+    """
+    from database import MockBet, MockBetLeg
+    from sqlalchemy import text as _text
+    import re
+
+    if today_str is None:
+        today_str = datetime.now(_CT).strftime("%Y-%m-%d")
+
+    print(f"\n[neg15] Generating straight -1.5 bets for {today_str}")
+
+    # ── Dedup ──
+    existing = db.execute(_text(
+        "SELECT COUNT(*) FROM mock_bets "
+        "WHERE source=:src AND game_date=:gd"
+    ), {"src": _NEG15_SOURCE, "gd": today_str}).scalar()
+    if existing > 0:
+        print(f"[neg15] Already {existing} bets for {today_str} — skipping")
+        return []
+
+    # ── Read Shadow A's legs for today ──
+    leg_data = db.execute(_text(
+        "SELECT l.fixture_id, l.description, l.win_prob, l.negbin_edge_pp, "
+        "       l.ats_cover_wp, l.negbin_wp, l.negbin_mu_home, l.negbin_mu_away, "
+        "       l.negbin_cell, l.ats_dist_wp, l.ridge_composite, l.bayes_team_wp "
+        "FROM mock_bet_legs l "
+        "JOIN mock_bets b ON l.mock_bet_id = b.id "
+        "WHERE b.source='shadow_negbin' AND b.game_date=:gd AND b.cohort='clean'"
+    ), {"gd": today_str}).fetchall()
+
+    if not leg_data:
+        print("[neg15] No Shadow A legs found for today")
+        return []
+
+    # ── De-duplicate by fixture: one entry per game-side, max dist_wp ──
+    fixture_legs = {}  # fixture_id → leg dict with max dist_wp
+    for row in leg_data:
+        (fix_id, desc, wp, edge, ats, nb_wp, mu_h, mu_a,
+         cell, dist_wp, ridge, bayes) = row
+
+        if dist_wp is None or fix_id is None:
+            continue
+
+        if fix_id not in fixture_legs or dist_wp > fixture_legs[fix_id]["ats_dist_wp"]:
+            fixture_legs[fix_id] = {
+                "fixture_id": fix_id, "description": desc, "win_prob": wp,
+                "negbin_edge_pp": edge, "ats_cover_wp": ats, "negbin_wp": nb_wp,
+                "negbin_mu_home": mu_h, "negbin_mu_away": mu_a,
+                "negbin_cell": cell, "ats_dist_wp": dist_wp,
+                "ridge_composite": ridge, "bayes_team_wp": bayes,
+            }
+
+    print(f"[neg15] {len(fixture_legs)} unique fixtures found")
+
+    # ── Gate: dist_wp in [0.85, 0.90) + epp < 12 ──
+    qualifying = {}
+    n_epp_toxic = 0
+    for fix_id, leg in fixture_legs.items():
+        dwp = leg["ats_dist_wp"]
+        epp = leg.get("negbin_edge_pp")
+        if epp is not None and epp >= _EDGE_GATE_THRESHOLD_PP:
+            n_epp_toxic += 1
+            continue
+        if _NEG15_DISTWP_LO <= dwp < _NEG15_DISTWP_HI:
+            qualifying[fix_id] = leg
+
+    print(f"[neg15] {len(qualifying)} fixtures pass dist_wp "
+          f"[{_NEG15_DISTWP_LO}, {_NEG15_DISTWP_HI}) + epp<{_EDGE_GATE_THRESHOLD_PP} gate "
+          f"({n_epp_toxic} epp toxic)")
+
+    if not qualifying:
+        print("[neg15] No qualifying fixtures")
+        return []
+
+    # ── Build straight -1.5 bets ──
+    run_id = str(uuid.uuid4())
+    stored = 0
+    n_real_odds = 0
+    n_fallback = 0
+
+    for fix_id, leg in qualifying.items():
+        desc = leg["description"]
+        # Parse team name from "TeamName +X.X"
+        m = re.match(r"^(.+?)\s+\+(\d+\.?\d*)$", desc)
+        if not m:
+            print(f"[neg15] Skipping unparseable: {desc}")
+            continue
+        pick_team = m.group(1).strip()
+
+        # Resolve fixture to home/away teams
+        home_team, away_team = _get_fixture_teams(fix_id, db)
+        if home_team is None or away_team is None:
+            print(f"[neg15] Cannot resolve fixture {fix_id}")
+            continue
+
+        # Look up -1.5 odds
+        neg15_odds = _get_spread_odds(
+            pick_team, home_team, away_team, today_str,
+            _NEG15_RUNG, _NEG15_FALLBACK_ODDS)
+        if abs(neg15_odds - _NEG15_FALLBACK_ODDS) < 0.01:
+            n_fallback += 1
+        else:
+            n_real_odds += 1
+
+        # Odds ceiling: skip heavy underdogs where WR collapses
+        if neg15_odds >= _NEG15_MAX_ODDS:
+            print(f"[neg15] Skipping {pick_team}: odds {neg15_odds:.3f} >= ceiling {_NEG15_MAX_ODDS} "
+                  f"(heavy underdog, WR collapses at long odds)")
+            continue
+
+        # Create straight -1.5 bet
+        neg15_desc = f"{pick_team} -1.5"
+        # Model WP for -1.5 is not directly available; use 1/odds as proxy
+        model_wp = 1.0 / neg15_odds
+
+        mock_id = str(uuid.uuid4())
+        mock = MockBet(
+            id=mock_id,
+            generation_run_id=run_id,
+            game_date=today_str,
+            sport="MLB",
+            bet_type="straight",
+            odds=neg15_odds,
+            amount=_NEG15_STAKE,
+            legs=1,
+            bet_info=json.dumps({
+                "type": "straight_neg15",
+                "team": pick_team,
+                "rung": -1.5,
+                "dist_wp_at_best_rung": round(leg["ats_dist_wp"], 4),
+                "negbin_cell": leg["negbin_cell"],
+                "neg15_odds": round(neg15_odds, 3),
+                "baseline_rung": float(m.group(2)),
+            }),
+            predicted_win_prob=model_wp,
+            model_used="negbin_v1+neg15_straight",
+            status="PENDING",
+            source=_NEG15_SOURCE,
+            cohort="clean",
+            weight=1.0,
+        )
+        db.add(mock)
+        db.flush()
+
+        # Set mean/min dist_wp via raw SQL (columns added by ALTER TABLE, not in ORM model)
+        try:
+            db.execute(_text(
+                "UPDATE mock_bets SET mean_leg_dist_wp=:mdw, min_leg_dist_wp=:mindw "
+                "WHERE id=:mid"
+            ), {"mdw": round(leg["ats_dist_wp"], 4),
+                "mindw": round(leg["ats_dist_wp"], 4), "mid": mock_id})
+        except Exception:
+            pass
+
+        # Create the single leg
+        leg_obj = MockBetLeg(
+            mock_bet_id=mock_id,
+            leg_index=0,
+            description=neg15_desc,
+            market_type="alternate_spreads",
+            sport="MLB",
+            win_prob=model_wp,
+            fixture_id=fix_id,
+            is_alt_line=True,
+        )
+        db.add(leg_obj)
+        db.flush()
+
+        # Set spread_value via raw SQL (column added by ALTER TABLE, not in ORM model)
+        try:
+            db.execute(_text(
+                "UPDATE mock_bet_legs SET spread_value=:sv WHERE id=:lid"
+            ), {"sv": -1.5, "lid": leg_obj.id})
+        except Exception:
+            pass
+
+        # Copy signal columns
+        updates = {}
+        if leg["negbin_wp"] is not None:
+            updates["negbin_wp"] = leg["negbin_wp"]
+        if leg["negbin_edge_pp"] is not None:
+            updates["negbin_edge_pp"] = leg["negbin_edge_pp"]
+        if leg["negbin_mu_home"] is not None:
+            updates["negbin_mu_home"] = leg["negbin_mu_home"]
+        if leg["negbin_mu_away"] is not None:
+            updates["negbin_mu_away"] = leg["negbin_mu_away"]
+        if leg["negbin_cell"] is not None:
+            updates["negbin_cell"] = leg["negbin_cell"]
+        if leg["ats_cover_wp"] is not None:
+            updates["ats_cover_wp"] = leg["ats_cover_wp"]
+        if leg["ats_dist_wp"] is not None:
+            updates["ats_dist_wp"] = leg["ats_dist_wp"]
+        if leg["bayes_team_wp"] is not None:
+            updates["bayes_team_wp"] = leg["bayes_team_wp"]
+        if leg["ridge_composite"] is not None:
+            updates["ridge_composite"] = leg["ridge_composite"]
+        if updates:
+            set_clause = ", ".join(f"{k}=:{k}" for k in updates)
+            updates["lid"] = leg_obj.id
+            try:
+                db.execute(_text(
+                    f"UPDATE mock_bet_legs SET {set_clause} WHERE id=:lid"
+                ), updates)
+            except Exception:
+                pass
+
+        stored += 1
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[neg15] DB commit failed: {e}")
+        return []
+
+    print(f"[neg15] Stored {stored} straight -1.5 bets "
+          f"({n_real_odds} real odds, {n_fallback} fallback) "
+          f"(source={_NEG15_SOURCE})")
+
+    return list(qualifying.values())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STRAIGHT +3.5 ARM — bet team +3.5 (don't lose by 4+) on 90%+ dist_wp fixtures
+# ═══════════════════════════════════════════════════════════════════════════
+_PLUS35_SOURCE = "shadow_negbin_plus35"
+_PLUS35_DISTWP_LO = 0.90
+_PLUS35_RUNG = 3.5
+_PLUS35_STAKE = 10.0
+_PLUS35_FALLBACK_ODDS = 1.299  # avg +3.5 odds from alt_lines
+_PLUS35_MIN_ODDS = 1.12  # odds floor — below this, BE > WR (edge inverts)
+
+# Evidence (conviction_ladder.py, 2026-07-27):
+#   dist_wp 90%+ × +3.5: +$1.54/$10, split-half stable
+#   Disjoint from neg15 (neg15 = [0.85, 0.90), this = 0.90+)
+#   Odds floor: odds < 1.12 → BE ~90%+ → edge 0.3pp (noise); odds >= 1.12 → edge +2.7pp
+
+
+def generate_plus35_straight(db=None, today_str=None):
+    """Straight +3.5 bets on 90%+ dist_wp fixtures.
+
+    Companion to neg15: captures the second validated conviction-ladder cell.
+    dist_wp >= 0.90 → bet +3.5 (team gets 3.5, covers unless loses by 4+).
+    Disjoint from neg15 (different band, different rung).
+
+    Source tag: shadow_negbin_plus35
+    """
+    from database import MockBet, MockBetLeg
+    from sqlalchemy import text as _text
+    import re
+
+    if today_str is None:
+        today_str = datetime.now(_CT).strftime("%Y-%m-%d")
+
+    print(f"\n[plus35] Generating straight +3.5 bets for {today_str}")
+
+    # ── Dedup ──
+    existing = db.execute(_text(
+        "SELECT COUNT(*) FROM mock_bets "
+        "WHERE source=:src AND game_date=:gd"
+    ), {"src": _PLUS35_SOURCE, "gd": today_str}).scalar()
+    if existing > 0:
+        print(f"[plus35] Already {existing} bets for {today_str} — skipping")
+        return []
+
+    # ── Read Shadow A's legs for today ──
+    leg_data = db.execute(_text(
+        "SELECT l.fixture_id, l.description, l.win_prob, l.negbin_edge_pp, "
+        "       l.ats_cover_wp, l.negbin_wp, l.negbin_mu_home, l.negbin_mu_away, "
+        "       l.negbin_cell, l.ats_dist_wp, l.ridge_composite, l.bayes_team_wp "
+        "FROM mock_bet_legs l "
+        "JOIN mock_bets b ON l.mock_bet_id = b.id "
+        "WHERE b.source='shadow_negbin' AND b.game_date=:gd AND b.cohort='clean'"
+    ), {"gd": today_str}).fetchall()
+
+    if not leg_data:
+        print("[plus35] No Shadow A legs found for today")
+        return []
+
+    # ── De-duplicate by fixture: one entry per game-side, max dist_wp ──
+    fixture_legs = {}
+    for row in leg_data:
+        (fix_id, desc, wp, edge, ats, nb_wp, mu_h, mu_a,
+         cell, dist_wp, ridge, bayes) = row
+
+        if dist_wp is None or fix_id is None:
+            continue
+
+        if fix_id not in fixture_legs or dist_wp > fixture_legs[fix_id]["ats_dist_wp"]:
+            fixture_legs[fix_id] = {
+                "fixture_id": fix_id, "description": desc, "win_prob": wp,
+                "negbin_edge_pp": edge, "ats_cover_wp": ats, "negbin_wp": nb_wp,
+                "negbin_mu_home": mu_h, "negbin_mu_away": mu_a,
+                "negbin_cell": cell, "ats_dist_wp": dist_wp,
+                "ridge_composite": ridge, "bayes_team_wp": bayes,
+            }
+
+    print(f"[plus35] {len(fixture_legs)} unique fixtures found")
+
+    # ── Gate: dist_wp >= 0.90 + epp < 12 ──
+    qualifying = {}
+    n_epp_toxic = 0
+    for fix_id, leg in fixture_legs.items():
+        dwp = leg["ats_dist_wp"]
+        epp = leg.get("negbin_edge_pp")
+        if epp is not None and epp >= _EDGE_GATE_THRESHOLD_PP:
+            n_epp_toxic += 1
+            continue
+        if dwp >= _PLUS35_DISTWP_LO:
+            qualifying[fix_id] = leg
+
+    print(f"[plus35] {len(qualifying)} fixtures pass dist_wp >= {_PLUS35_DISTWP_LO} "
+          f"+ epp<{_EDGE_GATE_THRESHOLD_PP} gate ({n_epp_toxic} epp toxic)")
+
+    if not qualifying:
+        print("[plus35] No qualifying fixtures")
+        return []
+
+    # ── Build straight +3.5 bets ──
+    run_id = str(uuid.uuid4())
+    stored = 0
+    n_real_odds = 0
+    n_fallback = 0
+
+    for fix_id, leg in qualifying.items():
+        desc = leg["description"]
+        m = re.match(r"^(.+?)\s+\+(\d+\.?\d*)$", desc)
+        if not m:
+            print(f"[plus35] Skipping unparseable: {desc}")
+            continue
+        pick_team = m.group(1).strip()
+
+        # Resolve fixture to home/away teams
+        home_team, away_team = _get_fixture_teams(fix_id, db)
+        if home_team is None or away_team is None:
+            print(f"[plus35] Cannot resolve fixture {fix_id}")
+            continue
+
+        # Look up +3.5 odds
+        plus35_odds = _get_spread_odds(
+            pick_team, home_team, away_team, today_str,
+            _PLUS35_RUNG, _PLUS35_FALLBACK_ODDS)
+        if abs(plus35_odds - _PLUS35_FALLBACK_ODDS) < 0.01:
+            n_fallback += 1
+        else:
+            n_real_odds += 1
+
+        # Odds floor: skip bets where BE > historical WR (edge inverts at short odds)
+        if plus35_odds < _PLUS35_MIN_ODDS:
+            print(f"[plus35] Skipping {pick_team}: odds {plus35_odds:.3f} < floor {_PLUS35_MIN_ODDS} "
+                  f"(BE={1/plus35_odds*100:.1f}% too high)")
+            continue
+
+        # Create straight +3.5 bet
+        plus35_desc = f"{pick_team} +3.5"
+        model_wp = 1.0 / plus35_odds
+
+        mock_id = str(uuid.uuid4())
+        mock = MockBet(
+            id=mock_id,
+            generation_run_id=run_id,
+            game_date=today_str,
+            sport="MLB",
+            bet_type="straight",
+            odds=plus35_odds,
+            amount=_PLUS35_STAKE,
+            legs=1,
+            bet_info=json.dumps({
+                "type": "straight_plus35",
+                "team": pick_team,
+                "rung": 3.5,
+                "dist_wp_at_best_rung": round(leg["ats_dist_wp"], 4),
+                "negbin_cell": leg["negbin_cell"],
+                "plus35_odds": round(plus35_odds, 3),
+                "baseline_rung": float(m.group(2)),
+            }),
+            predicted_win_prob=model_wp,
+            model_used="negbin_v1+plus35_straight",
+            status="PENDING",
+            source=_PLUS35_SOURCE,
+            cohort="clean",
+            weight=1.0,
+        )
+        db.add(mock)
+        db.flush()
+
+        # Set mean/min dist_wp via raw SQL (columns added by ALTER TABLE, not in ORM model)
+        try:
+            db.execute(_text(
+                "UPDATE mock_bets SET mean_leg_dist_wp=:mdw, min_leg_dist_wp=:mindw "
+                "WHERE id=:mid"
+            ), {"mdw": round(leg["ats_dist_wp"], 4),
+                "mindw": round(leg["ats_dist_wp"], 4), "mid": mock_id})
+        except Exception:
+            pass
+
+        leg_obj = MockBetLeg(
+            mock_bet_id=mock_id,
+            leg_index=0,
+            description=plus35_desc,
+            market_type="alternate_spreads",
+            sport="MLB",
+            win_prob=model_wp,
+            fixture_id=fix_id,
+            is_alt_line=True,
+        )
+        db.add(leg_obj)
+        db.flush()
+
+        # Set spread_value via raw SQL (column added by ALTER TABLE, not in ORM model)
+        try:
+            db.execute(_text(
+                "UPDATE mock_bet_legs SET spread_value=:sv WHERE id=:lid"
+            ), {"sv": 3.5, "lid": leg_obj.id})
+        except Exception:
+            pass
+
+        # Copy signal columns
+        updates = {}
+        if leg["negbin_wp"] is not None:
+            updates["negbin_wp"] = leg["negbin_wp"]
+        if leg["negbin_edge_pp"] is not None:
+            updates["negbin_edge_pp"] = leg["negbin_edge_pp"]
+        if leg["negbin_mu_home"] is not None:
+            updates["negbin_mu_home"] = leg["negbin_mu_home"]
+        if leg["negbin_mu_away"] is not None:
+            updates["negbin_mu_away"] = leg["negbin_mu_away"]
+        if leg["negbin_cell"] is not None:
+            updates["negbin_cell"] = leg["negbin_cell"]
+        if leg["ats_cover_wp"] is not None:
+            updates["ats_cover_wp"] = leg["ats_cover_wp"]
+        if leg["ats_dist_wp"] is not None:
+            updates["ats_dist_wp"] = leg["ats_dist_wp"]
+        if leg["bayes_team_wp"] is not None:
+            updates["bayes_team_wp"] = leg["bayes_team_wp"]
+        if leg["ridge_composite"] is not None:
+            updates["ridge_composite"] = leg["ridge_composite"]
+        if updates:
+            set_clause = ", ".join(f"{k}=:{k}" for k in updates)
+            updates["lid"] = leg_obj.id
+            try:
+                db.execute(_text(
+                    f"UPDATE mock_bet_legs SET {set_clause} WHERE id=:lid"
+                ), updates)
+            except Exception:
+                pass
+
+        stored += 1
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[plus35] DB commit failed: {e}")
+        return []
+
+    print(f"[plus35] Stored {stored} straight +3.5 bets "
+          f"({n_real_odds} real odds, {n_fallback} fallback) "
+          f"(source={_PLUS35_SOURCE})")
+
+    return list(qualifying.values())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEG15 + EDGE_PP FILTER — variant arm: exclude high-edge legs
+# ═══════════════════════════════════════════════════════════════════════════
+_NEG15_EPP_SOURCE = "shadow_negbin_neg15_epp"
+_NEG15_EPP_THRESHOLD = 5.0  # PROVISIONAL — failed split-half at N=54 (H1=31.6%/H2=58.8%); revisit at N~120
+
+# Evidence (2026-08-02, N=54 neg15 settled):
+#   edge_pp < 5: 44.4% WR, +5.4pp, EV=$+1.09 (N=36) — flips arm to +EV
+#   edge_pp >= 5: 22.2% WR, -15.9pp (N=18) — deeply -EV
+#   The inversion (rho=-0.127): NegBin overconfident → market right → loses
+#   Split-half on dist_wp>=0.85 shadow: 66.3%/66.1% — STABLE
+
+
+def generate_neg15_epp_filtered(db=None, today_str=None):
+    """Straight -1.5 bets with edge_pp filter.
+
+    Same as neg15 but excludes legs where negbin_edge_pp >= _NEG15_EPP_THRESHOLD.
+    Deployed as SEPARATE variant arm to forward-test the edge_pp filter
+    independently of the plain neg15 arm.
+
+    Source tag: shadow_negbin_neg15_epp
+    """
+    from database import MockBet, MockBetLeg
+    from sqlalchemy import text as _text
+    import re
+
+    if today_str is None:
+        today_str = datetime.now(_CT).strftime("%Y-%m-%d")
+
+    print(f"\n[neg15_epp] Generating edge_pp-filtered -1.5 bets for {today_str}")
+
+    # ── Dedup ──
+    existing = db.execute(_text(
+        "SELECT COUNT(*) FROM mock_bets "
+        "WHERE source=:src AND game_date=:gd"
+    ), {"src": _NEG15_EPP_SOURCE, "gd": today_str}).scalar()
+    if existing > 0:
+        print(f"[neg15_epp] Already {existing} bets for {today_str} — skipping")
+        return []
+
+    # ── Read Shadow A's legs for today ──
+    leg_data = db.execute(_text(
+        "SELECT l.fixture_id, l.description, l.win_prob, l.negbin_edge_pp, "
+        "       l.ats_cover_wp, l.negbin_wp, l.negbin_mu_home, l.negbin_mu_away, "
+        "       l.negbin_cell, l.ats_dist_wp, l.ridge_composite, l.bayes_team_wp "
+        "FROM mock_bet_legs l "
+        "JOIN mock_bets b ON l.mock_bet_id = b.id "
+        "WHERE b.source='shadow_negbin' AND b.game_date=:gd AND b.cohort='clean'"
+    ), {"gd": today_str}).fetchall()
+
+    if not leg_data:
+        print("[neg15_epp] No Shadow A legs found for today")
+        return []
+
+    # ── De-duplicate by fixture: one entry per game-side, max dist_wp ──
+    fixture_legs = {}
+    for row in leg_data:
+        (fix_id, desc, wp, edge, ats, nb_wp, mu_h, mu_a,
+         cell, dist_wp, ridge, bayes) = row
+        if dist_wp is None or fix_id is None:
+            continue
+        if fix_id not in fixture_legs or dist_wp > fixture_legs[fix_id]["ats_dist_wp"]:
+            fixture_legs[fix_id] = {
+                "fixture_id": fix_id, "description": desc, "win_prob": wp,
+                "negbin_edge_pp": edge, "ats_cover_wp": ats, "negbin_wp": nb_wp,
+                "negbin_mu_home": mu_h, "negbin_mu_away": mu_a,
+                "negbin_cell": cell, "ats_dist_wp": dist_wp,
+                "ridge_composite": ridge, "bayes_team_wp": bayes,
+            }
+
+    # ── Gate 1: dist_wp in [0.85, 0.90) ──
+    qualifying = {}
+    for fix_id, leg in fixture_legs.items():
+        dwp = leg["ats_dist_wp"]
+        if _NEG15_DISTWP_LO <= dwp < _NEG15_DISTWP_HI:
+            qualifying[fix_id] = leg
+
+    # ── Gate 2: edge_pp < threshold ──
+    n_epp_rejected = 0
+    epp_qualifying = {}
+    for fix_id, leg in qualifying.items():
+        epp = leg["negbin_edge_pp"]
+        if epp is not None and epp >= _NEG15_EPP_THRESHOLD:
+            n_epp_rejected += 1
+            continue
+        epp_qualifying[fix_id] = leg
+
+    print(f"[neg15_epp] {len(fixture_legs)} fixtures → "
+          f"{len(qualifying)} pass dist_wp gate → "
+          f"{len(epp_qualifying)} pass edge_pp<{_NEG15_EPP_THRESHOLD} "
+          f"({n_epp_rejected} rejected by edge_pp)")
+
+    if not epp_qualifying:
+        print("[neg15_epp] No qualifying fixtures")
+        return []
+
+    # ── Build straight -1.5 bets ──
+    run_id = str(uuid.uuid4())
+    stored = 0
+    n_real_odds = 0
+    n_fallback = 0
+
+    for fix_id, leg in epp_qualifying.items():
+        desc = leg["description"]
+        m = re.match(r"^(.+?)\s+\+(\d+\.?\d*)$", desc)
+        if not m:
+            print(f"[neg15_epp] Skipping unparseable: {desc}")
+            continue
+        pick_team = m.group(1).strip()
+
+        home_team, away_team = _get_fixture_teams(fix_id, db)
+        if home_team is None or away_team is None:
+            continue
+
+        neg15_odds = _get_spread_odds(
+            pick_team, home_team, away_team, today_str,
+            _NEG15_RUNG, _NEG15_FALLBACK_ODDS)
+        if abs(neg15_odds - _NEG15_FALLBACK_ODDS) < 0.01:
+            n_fallback += 1
+        else:
+            n_real_odds += 1
+
+        if neg15_odds >= _NEG15_MAX_ODDS:
+            print(f"[neg15_epp] Skipping {pick_team}: odds {neg15_odds:.3f} >= ceiling {_NEG15_MAX_ODDS}")
+            continue
+
+        neg15_desc = f"{pick_team} -1.5"
+        model_wp = 1.0 / neg15_odds
+
+        mock_id = str(uuid.uuid4())
+        mock = MockBet(
+            id=mock_id,
+            generation_run_id=run_id,
+            game_date=today_str,
+            sport="MLB",
+            bet_type="straight",
+            odds=neg15_odds,
+            amount=_NEG15_STAKE,
+            legs=1,
+            bet_info=json.dumps({
+                "type": "straight_neg15_epp",
+                "team": pick_team,
+                "rung": -1.5,
+                "dist_wp_at_best_rung": round(leg["ats_dist_wp"], 4),
+                "negbin_cell": leg["negbin_cell"],
+                "neg15_odds": round(neg15_odds, 3),
+                "edge_pp_filter": _NEG15_EPP_THRESHOLD,
+                "edge_pp_value": round(leg["negbin_edge_pp"], 2) if leg["negbin_edge_pp"] is not None else None,
+            }),
+            predicted_win_prob=model_wp,
+            model_used="negbin_v1+neg15_epp_filtered",
+            status="PENDING",
+            source=_NEG15_EPP_SOURCE,
+            cohort="clean",
+            weight=1.0,
+        )
+        db.add(mock)
+        db.flush()
+
+        try:
+            db.execute(_text(
+                "UPDATE mock_bets SET mean_leg_dist_wp=:mdw, min_leg_dist_wp=:mindw "
+                "WHERE id=:mid"
+            ), {"mdw": round(leg["ats_dist_wp"], 4),
+                "mindw": round(leg["ats_dist_wp"], 4), "mid": mock_id})
+        except Exception:
+            pass
+
+        leg_obj = MockBetLeg(
+            mock_bet_id=mock_id,
+            leg_index=0,
+            description=neg15_desc,
+            market_type="alternate_spreads",
+            sport="MLB",
+            win_prob=model_wp,
+            fixture_id=fix_id,
+            is_alt_line=True,
+        )
+        db.add(leg_obj)
+        db.flush()
+
+        try:
+            db.execute(_text(
+                "UPDATE mock_bet_legs SET spread_value=:sv WHERE id=:lid"
+            ), {"sv": -1.5, "lid": leg_obj.id})
+        except Exception:
+            pass
+
+        # Copy signal columns
+        updates = {}
+        for col in ("negbin_wp", "negbin_edge_pp", "negbin_mu_home", "negbin_mu_away",
+                     "negbin_cell", "ats_cover_wp", "ats_dist_wp", "bayes_team_wp",
+                     "ridge_composite"):
+            if leg[col] is not None:
+                updates[col] = leg[col]
+        if updates:
+            set_clause = ", ".join(f"{k}=:{k}" for k in updates)
+            updates["lid"] = leg_obj.id
+            try:
+                db.execute(_text(
+                    f"UPDATE mock_bet_legs SET {set_clause} WHERE id=:lid"
+                ), updates)
+            except Exception:
+                pass
+
+        stored += 1
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[neg15_epp] DB commit failed: {e}")
+        return []
+
+    print(f"[neg15_epp] Stored {stored} edge_pp-filtered -1.5 bets "
+          f"({n_real_odds} real odds, {n_fallback} fallback) "
+          f"(source={_NEG15_EPP_SOURCE})")
+
+    return list(epp_qualifying.values())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EV-AWARE RUNG SELECTION — variant parlay arm: pick the +EV rung per fixture
+# ═══════════════════════════════════════════════════════════════════════════
+_EVAWARE_SOURCE = "shadow_negbin_evaware"
+
+# EV-optimal rung from cell×rung grid (2026-08-02, N=4852):
+#   +1.5 is the ONLY +EV rung at aggregate (+2.9pp, EV=$+0.35)
+#   +2.5 breakeven, +3.5/-EV, +4.5 deeply -EV (-8.7pp)
+#   max-dist_wp funnels to +4.5 (worst): 84% of selections are +4.5
+# Fix: for each fixture-team, pick the LOWEST rung Shadow A generated
+# dist_wp floor 0.70 — first +EV point in backtest (edge=+3.9pp, EV=$+0.37,
+# split-half stable H1=+$0.34/H2=+$0.39 on N=244). Without floor, low-dist_wp
+# +1.5 legs dilute edge (correct side but terrible odds → EV=-$0.35).
+# dist_wp varies by rung (+1.5 dist_wp ~0.65, +4.5 dist_wp ~0.88 for same team)
+_EVAWARE_DISTWP_FLOOR = 0.70
+
+
+def generate_evaware_parlay(db=None, today_str=None):
+    """EV-aware rung selection: for each leg, prefer shortest rung (+1.5/+2.5).
+
+    Reads Shadow A's legs, re-selects per fixture-team: pick the LOWEST
+    available rung instead of max-dist_wp (which funnels to -EV +4.5).
+
+    dist_wp floor 0.70 applied after min-rung selection — first +EV point in
+    historical backtest (N=244, edge=+3.9pp, split-half stable). Without floor,
+    low-dist_wp +1.5 legs are correct-side but terrible-odds → EV negative.
+
+    Variant arm to compare against max-dist_wp (current) selection.
+    Source tag: shadow_negbin_evaware
+    """
+    from database import MockBet, MockBetLeg
+    from sqlalchemy import text as _text
+    import re
+
+    if today_str is None:
+        today_str = datetime.now(_CT).strftime("%Y-%m-%d")
+
+    print(f"\n[evaware] Generating EV-aware rung selection parlays for {today_str}")
+
+    # ── Dedup ──
+    existing = db.execute(_text(
+        "SELECT COUNT(*) FROM mock_bets "
+        "WHERE source=:src AND game_date=:gd"
+    ), {"src": _EVAWARE_SOURCE, "gd": today_str}).scalar()
+    if existing > 0:
+        print(f"[evaware] Already {existing} parlays for {today_str} — skipping")
+        return []
+
+    # ── Read ALL Shadow A legs ──
+    leg_data = db.execute(_text(
+        "SELECT l.mock_bet_id, l.fixture_id, l.description, l.win_prob, "
+        "       l.negbin_edge_pp, l.ats_cover_wp, l.negbin_wp, "
+        "       l.negbin_mu_home, l.negbin_mu_away, l.negbin_cell, l.ats_dist_wp, "
+        "       l.ridge_composite, l.bayes_team_wp, l.scout_grade "
+        "FROM mock_bet_legs l "
+        "JOIN mock_bets b ON l.mock_bet_id = b.id "
+        "WHERE b.source='shadow_negbin' AND b.game_date=:gd AND b.cohort='clean'"
+    ), {"gd": today_str}).fetchall()
+
+    if not leg_data:
+        print("[evaware] No Shadow A legs found for today")
+        return []
+
+    # ── Group by fixture-team, pick LOWEST rung per fixture-team ──
+    fixture_team_legs = defaultdict(list)
+    for row in leg_data:
+        (mid, fix_id, desc, wp, edge, ats, nb_wp, mu_h, mu_a,
+         cell, dist_wp, ridge, bayes, scout) = row
+        if not desc:
+            continue
+        m = re.match(r"^(.+?)\s+\+(\d+\.?\d*)$", desc)
+        if not m:
+            continue
+        team = m.group(1).strip()
+        rung = float(m.group(2))
+        key = f"{fix_id}_{team}"
+        fixture_team_legs[key].append({
+            "mock_bet_id": mid, "fixture_id": fix_id, "description": desc,
+            "win_prob": wp, "negbin_edge_pp": edge, "ats_cover_wp": ats,
+            "negbin_wp": nb_wp, "negbin_mu_home": mu_h, "negbin_mu_away": mu_a,
+            "negbin_cell": cell, "ats_dist_wp": dist_wp or 0.5,
+            "ridge_composite": ridge, "bayes_team_wp": bayes,
+            "scout_grade": scout, "team": team, "rung": rung,
+        })
+
+    # For each fixture-team, pick the LOWEST available rung
+    selected_legs = []
+    for key, legs in fixture_team_legs.items():
+        legs.sort(key=lambda x: x["rung"])
+        selected_legs.append(legs[0])
+
+    pre_floor = len(selected_legs)
+
+    # Apply dist_wp floor — removes marginal low-dist_wp legs
+    # (low-rung legs at dist_wp < 0.70 are correct-side but terrible-odds → -EV)
+    selected_legs = [l for l in selected_legs
+                     if l["ats_dist_wp"] >= _EVAWARE_DISTWP_FLOOR]
+
+    # epp >= 12 toxicity filter
+    pre_epp = len(selected_legs)
+    selected_legs = [l for l in selected_legs
+                     if l.get("negbin_edge_pp") is None
+                     or l["negbin_edge_pp"] < _EDGE_GATE_THRESHOLD_PP]
+
+    print(f"[evaware] {len(fixture_team_legs)} fixture-teams → "
+          f"{pre_floor} min-rung → {pre_epp} pass dist_wp≥{_EVAWARE_DISTWP_FLOOR} "
+          f"→ {len(selected_legs)} pass epp<{_EDGE_GATE_THRESHOLD_PP}")
+
+    rung_dist = defaultdict(int)
+    for leg in selected_legs:
+        rung_dist[leg["rung"]] += 1
+    rung_str = ', '.join(f"+{r:.1f}:{c}" for r, c in sorted(rung_dist.items()))
+    print(f"[evaware] Rung distribution: {rung_str}")
+
+    if len(selected_legs) < 2:
+        print("[evaware] Not enough legs for parlays")
+        return []
+
+    # ── Look up actual odds for each selected leg ──
+    import itertools
+
+    pool = list(selected_legs)
+    pool.sort(key=lambda x: -(x["win_prob"] or 0.5))
+    pool_cap = min(len(pool), 50)
+
+    for c in pool:
+        c["leg_id"] = f"{c['fixture_id']}:{c['team']}:{c['rung']}"
+
+    for leg in pool[:pool_cap]:
+        fix_id = leg["fixture_id"]
+        team = leg["team"]
+        rung = leg["rung"]
+        home_team, away_team = _get_fixture_teams(fix_id, db)
+        if home_team and away_team:
+            fallback = {1.5: 1.885, 2.5: 1.667, 3.5: 1.400, 4.5: 1.250}.get(rung, 1.500)
+            odds = _get_spread_odds(team, home_team, away_team, today_str, rung, fallback)
+            leg["decimal_odds"] = odds
+        else:
+            leg["decimal_odds"] = None
+
+    pool = [c for c in pool[:pool_cap] if c.get("decimal_odds") and c["decimal_odds"] > 1.0]
+    print(f"[evaware] {len(pool)} legs with valid odds")
+
+    # ── Assemble parlays: 2-3 leg combos ──
+    _MAX_LEG_APP = 2
+
+    all_scored = []
+    for size in [2, 3]:
+        if len(pool) < size:
+            continue
+        combos = list(itertools.combinations(pool[:pool_cap], size))
+        for combo in combos:
+            fixtures_used = set(c["fixture_id"] for c in combo)
+            if len(fixtures_used) < len(combo):
+                continue
+            combined_odds = 1.0
+            for c in combo:
+                combined_odds *= c["decimal_odds"]
+            avg_wp = np.mean([c.get("ats_dist_wp") or 0.5 for c in combo])
+            combined_wp = 1.0
+            for c in combo:
+                combined_wp *= (c.get("ats_dist_wp") or 0.5)
+            norm_ev = max(0, combined_wp * (combined_odds - 1) - (1 - combined_wp))
+            composite = avg_wp * 0.40 + 0.10 + 0.15 + min(norm_ev, 1.0) * 0.10
+            band = "other"
+            for band_label, lo, hi in ODDS_BANDS:
+                if lo <= combined_odds < hi:
+                    band = band_label
+                    break
+            all_scored.append({
+                "legs": list(combo),
+                "combined_odds": combined_odds,
+                "composite": composite,
+                "combined_wp": combined_wp,
+                "odds_band": band,
+                "leg_count": len(combo),
+            })
+
+    # Top-N selection with leg reuse caps (no per-band bucketing)
+    all_scored.sort(key=lambda x: -x["composite"])
+    parlays = []
+    seen = set()
+    leg_use = defaultdict(int)
+    _MAX_PARLAYS = 15
+
+    for combo in all_scored:
+        if len(parlays) >= _MAX_PARLAYS:
+            break
+        leg_ids = tuple(sorted(c["leg_id"] for c in combo["legs"]))
+        if leg_ids in seen:
+            continue
+        if any(leg_use[c["leg_id"]] >= _MAX_LEG_APP for c in combo["legs"]):
+            continue
+        seen.add(leg_ids)
+        for c in combo["legs"]:
+            leg_use[c["leg_id"]] += 1
+        parlays.append(combo)
+
+    print(f"[evaware] Assembled {len(parlays)} parlays from {len(all_scored)} scored combos")
+
+    if not parlays:
+        return []
+
+    # ── Store ──
+    run_id = str(uuid.uuid4())
+    stored = 0
+    for parlay in parlays:
+        legs = parlay["legs"]
+        combined_odds = parlay["combined_odds"]
+
+        bet_info = json.dumps({
+            "type": "evaware_parlay",
+            "rung_selection": "min_rung",
+            "dist_wp_floor": _EVAWARE_DISTWP_FLOOR,
+            "legs": [{"team": l["team"], "rung": l["rung"],
+                      "dist_wp": round(l["ats_dist_wp"], 4)} for l in legs],
+        })
+
+        mock_id = str(uuid.uuid4())
+        mock = MockBet(
+            id=mock_id,
+            generation_run_id=run_id,
+            game_date=today_str,
+            sport="MLB",
+            bet_type="parlay" if len(legs) > 1 else "straight",
+            odds=round(combined_odds, 3),
+            amount=10.0,
+            legs=len(legs),
+            bet_info=bet_info,
+            predicted_win_prob=round(parlay["combined_wp"], 6),
+            model_used="negbin_v1+evaware_rung",
+            status="PENDING",
+            source=_EVAWARE_SOURCE,
+            cohort="clean",
+            weight=1.0,
+        )
+        db.add(mock)
+        db.flush()
+
+        # Set mean/min dist_wp
+        leg_dps = [l["ats_dist_wp"] for l in legs if l["ats_dist_wp"]]
+        if leg_dps:
+            try:
+                db.execute(_text(
+                    "UPDATE mock_bets SET mean_leg_dist_wp=:mdw, min_leg_dist_wp=:mindw "
+                    "WHERE id=:mid"
+                ), {"mdw": round(np.mean(leg_dps), 4),
+                    "mindw": round(min(leg_dps), 4), "mid": mock_id})
+            except Exception:
+                pass
+
+        for i, leg in enumerate(legs):
+            leg_obj = MockBetLeg(
+                mock_bet_id=mock_id,
+                leg_index=i,
+                description=leg["description"],
+                market_type="alternate_spreads",
+                sport="MLB",
+                win_prob=leg.get("win_prob") or (1.0 / leg["decimal_odds"]),
+                fixture_id=leg["fixture_id"],
+                is_alt_line=True,
+            )
+            db.add(leg_obj)
+            db.flush()
+
+            try:
+                db.execute(_text(
+                    "UPDATE mock_bet_legs SET spread_value=:sv WHERE id=:lid"
+                ), {"sv": leg["rung"], "lid": leg_obj.id})
+            except Exception:
+                pass
+
+            # Copy signal columns
+            updates = {}
+            for col in ("negbin_wp", "negbin_edge_pp", "negbin_mu_home", "negbin_mu_away",
+                         "negbin_cell", "ats_cover_wp", "ats_dist_wp", "bayes_team_wp",
+                         "ridge_composite"):
+                if leg.get(col) is not None:
+                    updates[col] = leg[col]
+            if leg.get("scout_grade") is not None:
+                updates["scout_grade"] = leg["scout_grade"]
+            if updates:
+                set_clause = ", ".join(f"{k}=:{k}" for k in updates)
+                updates["lid"] = leg_obj.id
+                try:
+                    db.execute(_text(
+                        f"UPDATE mock_bet_legs SET {set_clause} WHERE id=:lid"
+                    ), updates)
+                except Exception:
+                    pass
+
+        stored += 1
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[evaware] DB commit failed: {e}")
+        return []
+
+    print(f"[evaware] Stored {stored} EV-aware parlays (source={_EVAWARE_SOURCE})")
+    return parlays
 
 
 def _report_fullstack_tracker(db):
@@ -3887,6 +5237,374 @@ def report_forward_tracking(days_back: int = 30):
         "nb_total": nb_total_n,
         "fixture_reuse": {"total_reused": total_reused_fixtures, "max_reuse": max_reuse},
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STRAIGHT-BET STACK — Two-stage model (NegBin select → discriminator rank)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Architecture:
+#   STAGE 1 (NegBin): game selection — which games are in play
+#     NegBin is a good SELECTOR but bad DISCRIMINATOR (overconfident
+#     within-pool, drifts/reverses at +4.5). Keep it ONLY for game selection.
+#
+#   STAGE 2 (discriminator stack): within NegBin's pool, rank quality:
+#     1. epp < 12 — hard filter (+15-30pp all rungs, universal)
+#     2. ridge_composite — continuous rank (+10-15pp all rungs, equal-N)
+#     3. ats_dist_wp — continuous rank (monotonic +1.5 to +3.5)
+#     4. fav cell preference (+7-15pp all rungs)
+#
+#   BET STRAIGHT at the rung where EDGE-vs-BREAKEVEN is highest.
+#
+# Independence check (on existing pool):
+#   epp vs ridge:   r = -0.265 (weakly anti-correlated — orthogonal enough)
+#   epp vs dist_wp: r = -0.391
+#   ridge vs dist:  r = +0.532 (moderate — partially redundant)
+#   Stacking does NOT increase edge-vs-breakeven: WR gains = odds shortening.
+#   Ridge and dist_wp are partially redundant but ridge adds +3pp over
+#   dist_wp alone after epp filter. Keep both for ranking; edge validation
+#   must come FORWARD, not from this in-sample pool.
+#
+# Source tag: shadow_straight_stack
+# ═══════════════════════════════════════════════════════════════════════════
+
+_STRAIGHT_STACK_SOURCE = "shadow_straight_stack"
+_STRAIGHT_STACK_STAKE = 10.0
+_STRAIGHT_STACK_MAX_BETS = 8  # cap daily volume (manageable straight bets)
+
+# Rung-specific fallback odds (from historical medians)
+_RUNG_FALLBACK_ODDS = {
+    1.5: 1.885,
+    2.5: 1.667,
+    3.5: 1.400,
+    4.5: 1.250,
+}
+
+# Rung-specific base rates (from game-deduped synthesis)
+# Used to compute edge-vs-breakeven per rung
+_RUNG_BASE_WR = {
+    1.5: 0.665,
+    2.5: 0.742,
+    3.5: 0.799,
+    4.5: 0.855,
+}
+
+
+def generate_straight_stack(db=None, today_str=None):
+    """Two-stage straight-bet model: NegBin select → discriminator rank.
+
+    Reads Shadow A's legs, applies the validated discriminator stack,
+    and bets STRAIGHT at the rung with highest edge-vs-breakeven per game.
+
+    Stage 1 (already done by Shadow A): NegBin selected games into pool.
+    Stage 2 (this function):
+      1. Hard filter: epp < 12
+      2. Group by fixture-team
+      3. For each fixture-team: find available rungs, look up odds,
+         compute edge-vs-breakeven per rung, pick the best rung
+      4. Rank all fixture-teams by discriminator score:
+         score = 0.5 * ridge_composite + 0.3 * ats_dist_wp + 0.2 * cell_boost
+      5. Bet the top N straight
+
+    Source tag: shadow_straight_stack
+    """
+    from database import MockBet, MockBetLeg
+    from sqlalchemy import text as _text
+    import re
+
+    if today_str is None:
+        today_str = datetime.now(_CT).strftime("%Y-%m-%d")
+
+    print(f"\n[straight-stack] Generating straight-bet stack for {today_str}")
+
+    # ── Dedup check ──
+    existing = db.execute(_text(
+        "SELECT COUNT(*) FROM mock_bets "
+        "WHERE source=:src AND game_date=:gd"
+    ), {"src": _STRAIGHT_STACK_SOURCE, "gd": today_str}).scalar()
+    if existing > 0:
+        print(f"[straight-stack] Already {existing} bets for {today_str} — skipping")
+        return []
+
+    # ── Read Shadow A's legs for today ──
+    leg_data = db.execute(_text(
+        "SELECT l.fixture_id, l.description, l.win_prob, l.negbin_edge_pp, "
+        "       l.ats_cover_wp, l.negbin_wp, l.negbin_mu_home, l.negbin_mu_away, "
+        "       l.negbin_cell, l.ats_dist_wp, l.ridge_composite, l.bayes_team_wp "
+        "FROM mock_bet_legs l "
+        "JOIN mock_bets b ON l.mock_bet_id = b.id "
+        "WHERE b.source='shadow_negbin' AND b.game_date=:gd AND b.cohort='clean'"
+    ), {"gd": today_str}).fetchall()
+
+    if not leg_data:
+        print("[straight-stack] No Shadow A legs found for today")
+        return []
+
+    print(f"[straight-stack] {len(leg_data)} Shadow A legs loaded")
+
+    # ── Parse and filter ──
+    all_candidates = []
+    n_epp_toxic = 0
+    for row in leg_data:
+        (fix_id, desc, wp, edge_pp, ats, nb_wp, mu_h, mu_a,
+         cell, dist_wp, ridge, bayes) = row
+
+        if fix_id is None or desc is None:
+            continue
+
+        # Hard filter: epp < 12
+        if edge_pp is not None and edge_pp >= _EDGE_GATE_THRESHOLD_PP:
+            n_epp_toxic += 1
+            continue
+
+        # Parse team and rung from description
+        m = re.match(r"^(.+?)\s+\+(\d+\.?\d*)$", desc)
+        if not m:
+            continue
+        team = m.group(1).strip()
+        rung = float(m.group(2))
+
+        if rung not in _RUNG_FALLBACK_ODDS:
+            continue
+
+        all_candidates.append({
+            "fixture_id": fix_id,
+            "description": desc,
+            "team": team,
+            "rung": rung,
+            "win_prob": wp,
+            "negbin_edge_pp": edge_pp,
+            "negbin_wp": nb_wp,
+            "negbin_mu_home": mu_h,
+            "negbin_mu_away": mu_a,
+            "negbin_cell": cell,
+            "ats_dist_wp": dist_wp or 0.5,
+            "ats_cover_wp": ats,
+            "ridge_composite": ridge or 0.5,
+            "bayes_team_wp": bayes,
+        })
+
+    print(f"[straight-stack] {len(all_candidates)} candidates after epp<12 "
+          f"({n_epp_toxic} epp toxic)")
+
+    if not all_candidates:
+        print("[straight-stack] No candidates after epp filter")
+        return []
+
+    # ── Group by fixture-team, find best rung per game ──
+    fixture_team = defaultdict(list)
+    for c in all_candidates:
+        key = f"{c['fixture_id']}_{c['team']}"
+        fixture_team[key].append(c)
+
+    print(f"[straight-stack] {len(fixture_team)} unique fixture-teams")
+
+    # For each fixture-team: look up odds at each available rung,
+    # compute edge-vs-breakeven, pick the best rung
+    best_per_game = []
+    rung_chosen = defaultdict(int)
+
+    for ft_key, candidates in fixture_team.items():
+        fix_id = candidates[0]["fixture_id"]
+        team = candidates[0]["team"]
+
+        home_team, away_team = _get_fixture_teams(fix_id, db)
+        if home_team is None or away_team is None:
+            continue
+
+        # Evaluate each available rung
+        rung_options = []
+        for c in candidates:
+            rung = c["rung"]
+            fallback = _RUNG_FALLBACK_ODDS.get(rung, 1.500)
+            odds = _get_spread_odds(team, home_team, away_team,
+                                    today_str, rung, fallback)
+
+            if odds <= 1.0:
+                continue
+
+            # Edge-vs-breakeven: model WR at this rung minus breakeven
+            # Use negbin_wp as the model's estimate for this specific rung
+            model_wp = c["negbin_wp"] or _RUNG_BASE_WR.get(rung, 0.7)
+            breakeven = 1.0 / odds
+            edge_vs_be = model_wp - breakeven
+
+            # Also compute expected ROI for ranking
+            expected_roi = model_wp * odds - 1.0
+
+            rung_options.append({
+                **c,
+                "actual_odds": odds,
+                "breakeven": breakeven,
+                "edge_vs_be": edge_vs_be,
+                "expected_roi": expected_roi,
+                "home_team": home_team,
+                "away_team": away_team,
+            })
+
+        if not rung_options:
+            continue
+
+        # Pick the rung with highest edge-vs-breakeven
+        rung_options.sort(key=lambda x: x["edge_vs_be"], reverse=True)
+        best = rung_options[0]
+
+        # Skip if edge-vs-breakeven is negative (model thinks this is -EV)
+        if best["edge_vs_be"] <= 0:
+            continue
+
+        # Compute discriminator score for ranking across games
+        cell = best.get("negbin_cell") or ""
+        cell_boost = 1.0
+        if "fav" in cell:
+            cell_boost = 1.15
+        elif "dog" in cell:
+            cell_boost = 0.85
+
+        disc_score = (0.50 * best["ridge_composite"]
+                      + 0.30 * best["ats_dist_wp"]
+                      + 0.20 * cell_boost)
+
+        best["disc_score"] = disc_score
+        best_per_game.append(best)
+        rung_chosen[best["rung"]] += 1
+
+    print(f"[straight-stack] {len(best_per_game)} fixture-teams with positive edge-vs-BE")
+    rung_str = ", ".join(f"+{r:.1f}:{c}" for r, c in sorted(rung_chosen.items()))
+    print(f"[straight-stack] Rung distribution (by edge-vs-BE): {rung_str}")
+
+    if not best_per_game:
+        print("[straight-stack] No positive-edge fixture-teams")
+        return []
+
+    # ── Rank by discriminator score, take top N ──
+    best_per_game.sort(key=lambda x: x["disc_score"], reverse=True)
+    selected = best_per_game[:_STRAIGHT_STACK_MAX_BETS]
+
+    print(f"[straight-stack] Selected top {len(selected)} by discriminator score")
+
+    # ── Store straight bets ──
+    run_id = str(uuid.uuid4())
+    stored = 0
+
+    for pick in selected:
+        team = pick["team"]
+        rung = pick["rung"]
+        odds = pick["actual_odds"]
+        fix_id = pick["fixture_id"]
+
+        bet_desc = f"{team} +{rung:.1f}"
+        model_wp = pick["negbin_wp"] or (1.0 / odds)
+
+        mock_id = str(uuid.uuid4())
+        mock = MockBet(
+            id=mock_id,
+            generation_run_id=run_id,
+            game_date=today_str,
+            sport="MLB",
+            bet_type="straight",
+            odds=odds,
+            amount=_STRAIGHT_STACK_STAKE,
+            legs=1,
+            bet_info=json.dumps({
+                "type": "straight_stack",
+                "team": team,
+                "rung": rung,
+                "edge_vs_be": round(pick["edge_vs_be"], 4),
+                "disc_score": round(pick["disc_score"], 4),
+                "ridge_composite": round(pick["ridge_composite"], 4),
+                "ats_dist_wp": round(pick["ats_dist_wp"], 4),
+                "negbin_cell": pick.get("negbin_cell"),
+                "negbin_edge_pp": round(pick["negbin_edge_pp"], 2) if pick.get("negbin_edge_pp") else None,
+                "actual_odds": round(odds, 3),
+                "breakeven": round(pick["breakeven"], 4),
+            }),
+            predicted_win_prob=model_wp,
+            model_used="negbin_select+disc_stack_v1",
+            status="PENDING",
+            source=_STRAIGHT_STACK_SOURCE,
+            cohort="clean",
+            weight=1.0,
+        )
+        db.add(mock)
+        db.flush()
+
+        # Set mean/min dist_wp
+        try:
+            db.execute(_text(
+                "UPDATE mock_bets SET mean_leg_dist_wp=:mdw, min_leg_dist_wp=:mindw "
+                "WHERE id=:mid"
+            ), {"mdw": round(pick["ats_dist_wp"], 4),
+                "mindw": round(pick["ats_dist_wp"], 4), "mid": mock_id})
+        except Exception:
+            pass
+
+        # Create the single leg
+        leg_obj = MockBetLeg(
+            mock_bet_id=mock_id,
+            leg_index=0,
+            description=bet_desc,
+            market_type="alternate_spreads",
+            sport="MLB",
+            win_prob=model_wp,
+            fixture_id=fix_id,
+            is_alt_line=True,
+        )
+        db.add(leg_obj)
+        db.flush()
+
+        # Set spread_value
+        try:
+            db.execute(_text(
+                "UPDATE mock_bet_legs SET spread_value=:sv WHERE id=:lid"
+            ), {"sv": rung, "lid": leg_obj.id})
+        except Exception:
+            pass
+
+        # Copy signal columns
+        updates = {}
+        for col, val in [
+            ("negbin_wp", pick.get("negbin_wp")),
+            ("negbin_edge_pp", pick.get("negbin_edge_pp")),
+            ("negbin_mu_home", pick.get("negbin_mu_home")),
+            ("negbin_mu_away", pick.get("negbin_mu_away")),
+            ("negbin_cell", pick.get("negbin_cell")),
+            ("ats_cover_wp", pick.get("ats_cover_wp")),
+            ("ats_dist_wp", pick.get("ats_dist_wp")),
+            ("bayes_team_wp", pick.get("bayes_team_wp")),
+            ("ridge_composite", pick.get("ridge_composite")),
+        ]:
+            if val is not None:
+                updates[col] = val
+        if updates:
+            set_clause = ", ".join(f"{k}=:{k}" for k in updates)
+            updates["lid"] = leg_obj.id
+            try:
+                db.execute(_text(
+                    f"UPDATE mock_bet_legs SET {set_clause} WHERE id=:lid"
+                ), updates)
+            except Exception:
+                pass
+
+        stored += 1
+        print(f"  [{stored}] {bet_desc} odds={odds:.3f} "
+              f"edge_vs_be={pick['edge_vs_be']:.3f} "
+              f"disc={pick['disc_score']:.3f} "
+              f"ridge={pick['ridge_composite']:.3f} "
+              f"dist_wp={pick['ats_dist_wp']:.3f} "
+              f"cell={pick.get('negbin_cell', '?')}")
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[straight-stack] DB commit failed: {e}")
+        return []
+
+    print(f"[straight-stack] Stored {stored} straight bets "
+          f"(source={_STRAIGHT_STACK_SOURCE})")
+
+    return selected
 
 
 if __name__ == "__main__":

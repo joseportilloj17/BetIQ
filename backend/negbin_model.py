@@ -83,8 +83,7 @@ MU_FEATURE_COLS = [
     "h_bb_pct", "a_bb_pct",
     # Park + environment
     "h_park_factor",
-    "temperature_f", "wind_speed_mph", "wind_direction_deg",
-    "is_dome", "neutral_site",
+    "neutral_site",
     # Injury
     "h_star_out", "a_star_out", "star_out_diff",
     "h_stars_missing", "a_stars_missing",

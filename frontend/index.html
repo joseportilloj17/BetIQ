@@ -334,9 +334,11 @@
   <div class="nav-item" onclick="showPage('simulation')">🧪 Simulation</div>
   <div class="nav-item" onclick="showPage('negbin')" style="color:var(--purple,#a855f7)">🔬 NegBin Shadow</div>
   <div class="nav-item" onclick="showPage('atsungated')" style="color:var(--purple,#a855f7)">🎯 ATS Ungated</div>
+  <div class="nav-item" onclick="showPage('shadowaltline')" style="color:var(--purple,#a855f7);font-weight:600">📐 Alt-Line Shadow</div>
   <div class="nav-item" onclick="showPage('armscompare')" style="color:var(--purple,#a855f7);font-weight:600">⚖️ Arms Compare</div>
   <div class="nav-item" onclick="showPage('bankroll')">💰 Bankroll</div>
   <div class="nav-item" id="nav-recommend" onclick="showPage('recommend')" style="color:var(--amber);font-weight:600">⭐ Today's Picks</div>
+  <div class="nav-item" onclick="showPage('researcher')" style="color:var(--cyan,#06b6d4)">📰 Researcher</div>
   <div class="nav-item active" onclick="showPage('dashboard')">📊 Dashboard</div>
   <div class="nav-item" onclick="showPage('history')">📋 Bet History</div>
   <div class="nav-section">Tools</div>
@@ -2296,6 +2298,11 @@ Rockets +4.5  Alt Spread  -950"
         <button onclick="setNbSource('shadow_negbin_atscap')" id="nb-src-shadow_negbin_atscap" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">ATS Cap</button>
         <button onclick="setNbSource('shadow_negbin_distwp_gate')" id="nb-src-shadow_negbin_distwp_gate" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">dist_wp</button>
         <button onclick="setNbSource('shadow_negbin_bothgates')" id="nb-src-shadow_negbin_bothgates" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Both Gates</button>
+        <button onclick="setNbSource('shadow_negbin_highconv')" id="nb-src-shadow_negbin_highconv" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">High Conv</button>
+        <button onclick="setNbSource('shadow_negbin_neg15')" id="nb-src-shadow_negbin_neg15" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Neg 1.5</button>
+        <button onclick="setNbSource('shadow_negbin_plus35')" id="nb-src-shadow_negbin_plus35" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Plus 3.5</button>
+        <button onclick="setNbSource('shadow_negbin_neg15_epp')" id="nb-src-shadow_negbin_neg15_epp" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Neg1.5+EPP</button>
+        <button onclick="setNbSource('shadow_negbin_evaware')" id="nb-src-shadow_negbin_evaware" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">EV-Aware</button>
         <button onclick="setNbSource('all')" id="nb-src-all" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">All A/B</button>
       </div>
       <!-- View toggle: Measurement vs Live-realistic -->
@@ -2455,6 +2462,146 @@ Rockets +4.5  Alt Spread  -950"
   </div>
 </div>
 
+<!-- ── Shadow Alt-Line Edge Tracker ── -->
+<div class="page" id="page-shadowaltline">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Alt-Line Edge Shadow</div>
+      <div class="page-sub">mlb_ats_v1 alt-spread forward validation &middot; Rung &times; liquidity &middot; Three-lever read &middot; Bettable prices only</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <select id="sal-days" onchange="loadShadowAltline()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+        <option value="30">30 days</option>
+        <option value="90" selected>90 days</option>
+        <option value="180">180 days</option>
+        <option value="365">All time</option>
+      </select>
+      <button class="btn btn-ghost btn-sm" onclick="loadShadowAltline()">Refresh</button>
+    </div>
+  </div>
+
+  <!-- Status strip -->
+  <div id="sal-status" style="margin-bottom:16px;padding:9px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)">
+    <span>Loading...</span>
+  </div>
+
+  <!-- N Progress toward decision gate -->
+  <div id="sal-progress" style="margin-bottom:16px;padding:9px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;font-size:12px;color:var(--muted)">
+    <span>Loading...</span>
+  </div>
+
+  <!-- Three-Lever Verdict -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:4px">Three-Lever Verdict</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">L1 = realized PnL (ground truth) &middot; L2 = entry vs Pinnacle sharp benchmark &middot; L3 = alt-close CLV (expected to understate on soft markets)</div>
+    <div id="sal-three-levers"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- By Rung table -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:12px">Performance by Rung</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Flat $10 stake &middot; WR vs breakeven &middot; Liquidity tier per rung &middot; Devig = no-vig entry probability</div>
+    <div id="sal-rung-table"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- By Liquidity tier -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:12px">Performance by Liquidity</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Liquid = 3+ bettable books (capturable) &middot; Thin = 1 book (phantom risk) &middot; Deployable edge lives in liquid tier</div>
+    <div id="sal-liquidity-table"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- Rung x Liquidity cross-tab -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:12px">Rung &times; Liquidity Cross-Tab</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">The key segmentation &middot; Is the edge in liquid rungs (real money) or thin ones (phantom)?</div>
+    <div id="sal-cross-table"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- By Book -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:12px">Performance by Entry Book</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Which book provides entry price &middot; Pinnacle never used as entry (sharp benchmark only)</div>
+    <div id="sal-book-table"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- Cumulative PnL chart -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:12px">Cumulative PnL</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">Flat $10 &middot; Bettable-book entry prices &middot; Consistently positive = real edge, not one hot streak</div>
+    <div id="sal-pnl-chart" style="height:220px;position:relative"><div class="loading">Loading...</div></div>
+  </div>
+
+  <!-- Leg log -->
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div>
+        <div class="card-title" style="margin:0">Leg Log</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">Individual scored legs &middot; source=shadow_altline &middot; Bettable book prices</div>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select id="sal-log-rung" onchange="renderSalLog()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:6px;font-size:11px">
+          <option value="">All Rungs</option>
+        </select>
+        <select id="sal-log-liq" onchange="renderSalLog()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:6px;font-size:11px">
+          <option value="">All Liquidity</option>
+          <option value="liquid">Liquid</option>
+          <option value="moderate">Moderate</option>
+          <option value="thin">Thin</option>
+        </select>
+        <select id="sal-log-status" onchange="renderSalLog()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:6px;font-size:11px">
+          <option value="">All Status</option>
+          <option value="PENDING">Pending</option>
+          <option value="WON">Won</option>
+          <option value="LOST">Lost</option>
+        </select>
+      </div>
+    </div>
+    <div id="sal-leg-log" class="table-wrap"><div class="loading">Loading...</div></div>
+  </div>
+</div>
+
+<!-- ── Researcher: Daily MLB Intelligence Brief ── -->
+<div class="page" id="page-researcher">
+  <div class="page-header">
+    <div>
+      <div class="page-title">MLB Researcher</div>
+      <div class="page-sub">Daily news intelligence &middot; Injury watch &middot; Matchup analysis</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input type="date" id="res-date" onchange="loadResearcher()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px"/>
+      <button onclick="runResearcher()" style="padding:5px 12px;background:var(--cyan,#06b6d4);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px">Refresh</button>
+    </div>
+  </div>
+
+  <!-- Source status -->
+  <div id="res-sources" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px"></div>
+
+  <!-- Brief content -->
+  <div class="card" style="margin-bottom:12px">
+    <div class="card-title">Daily Brief</div>
+    <div id="res-brief" style="font-size:13px;line-height:1.7;white-space:pre-wrap">
+      <div class="loading">No brief yet — click Refresh to generate</div>
+    </div>
+  </div>
+
+  <!-- Player narratives -->
+  <div class="card" style="margin-bottom:12px">
+    <div class="card-title">Player Narratives</div>
+    <div id="res-players" style="font-size:13px;line-height:1.7;white-space:pre-wrap">
+      <div class="loading">—</div>
+    </div>
+  </div>
+
+  <!-- Raw items -->
+  <div class="card">
+    <div class="card-title">Raw News Items <span id="res-item-count" style="color:var(--muted);font-weight:normal"></span></div>
+    <div id="res-items" class="table-wrap">
+      <div class="loading">—</div>
+    </div>
+  </div>
+</div>
+
 <!-- ── Arms Comparison (Graduation Decision View) ── -->
 <div class="page" id="page-armscompare">
   <div class="page-header">
@@ -2487,6 +2634,46 @@ Rockets +4.5  Alt Spread  -950"
     <div style="font-size:11px;color:var(--muted);margin-bottom:10px">All arms on same axes &middot; diverging trajectories = real signal</div>
     <canvas id="ac-chart" style="width:100%;max-height:280px"></canvas>
     <div id="ac-chart-legend" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:12px;font-size:11px"></div>
+  </div>
+
+  <!-- Calibration-by-Sizing Diagnostic -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title" style="margin-bottom:4px">Calibration-by-Sizing Diagnostic</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:12px">Confidence bucket &rarr; realized edge &middot; Calibrated = size tracks reality &middot; Anti-calibrated = model lies to itself</div>
+    <div id="ac-calibration"><div class="loading">Loading calibration data...</div></div>
+  </div>
+
+  <!-- Per-Arm Legs Table -->
+  <div class="card" style="margin-bottom:20px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <div>
+        <div class="card-title" style="margin:0">Arm Legs Detail</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px">Individual bets per arm &middot; Selection, price, rung, outcome, PnL</div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="ac-legs-source" onchange="loadArmLegs()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:6px;font-size:11px">
+          <option value="">Select arm...</option>
+          <option value="shadow_lineup">Lineup Resid</option>
+          <option value="shadow_f5">F5 (1st 5 Inn)</option>
+          <option value="shadow_prop">Batter Props</option>
+          <option value="shadow_altline">Alt-Line Edge</option>
+          <option value="shadow_underdog_lag">Underdog Lag</option>
+          <option value="shadow_straight_stack">Straight Stack</option>
+          <option value="shadow_negbin">A (control)</option>
+          <option value="shadow_negbin_fullstack">Full-Stack</option>
+          <option value="shadow_negbin_edgegate">Edge Gate</option>
+          <option value="shadow_negbin_bothgates">Both Gates</option>
+          <option value="shadow_negbin_composite">Composite</option>
+        </select>
+        <select id="ac-legs-status" onchange="renderArmLegs()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:6px;font-size:11px">
+          <option value="">All</option>
+          <option value="WIN">Won</option>
+          <option value="LOSS">Lost</option>
+          <option value="PENDING">Pending</option>
+        </select>
+      </div>
+    </div>
+    <div id="ac-legs-table" class="table-wrap"><div style="color:var(--muted);font-size:12px;padding:20px;text-align:center">Select an arm above to view its individual bets</div></div>
   </div>
 </div>
 
@@ -3396,7 +3583,9 @@ function showPage(name, skipHash) {
     abtest:      loadAbTest,
     negbin:      loadNegbin,
     atsungated:  loadAtsUngated,
+    shadowaltline: loadShadowAltline,
     armscompare: loadArmsComparison,
+    researcher:  loadResearcher,
   };
   loaders[name]?.();
 }
@@ -14196,6 +14385,351 @@ function showNbDrill(id) {
   modal.style.display = 'flex';
 }
 
+// ── Shadow Alt-Line Edge Tracker ─────────────────────────────────────────────
+var _salData = null;
+
+async function loadShadowAltline() {
+  const days = document.getElementById('sal-days')?.value || '90';
+  try {
+    _salData = await apiFetch(`/api/shadow-altline/tracker?days=${days}&cohort=clean`);
+    if (!_salData) throw new Error('No data returned');
+    renderSalStatus(_salData.summary || {});
+    renderSalProgress(_salData.summary || {});
+    renderSalThreeLevers(_salData.three_levers, _salData.summary || {});
+    renderSalRungTable(_salData.by_rung || []);
+    renderSalLiquidityTable(_salData.by_liquidity || []);
+    renderSalCrossTable(_salData.by_rung_liquidity || []);
+    renderSalBookTable(_salData.by_book || []);
+    renderSalPnlChart(_salData.daily_series || []);
+    populateSalFilters(_salData.legs || []);
+    renderSalLog();
+  } catch(e) {
+    document.getElementById('sal-status').innerHTML = `<span style="color:var(--red)">Error: ${e.message}</span>`;
+  }
+}
+
+function renderSalStatus(s) {
+  const el = document.getElementById('sal-status');
+  if (!el) return;
+  if (!s || !s.total) { el.innerHTML = '<span style="color:var(--muted)">Accumulating — no data yet</span>'; return; }
+  const pnlColor = (s.pnl||0) >= 0 ? 'var(--green)' : 'var(--red)';
+  const wrStr = s.wr != null ? s.wr.toFixed(1)+'%' : '—';
+  const roiStr = s.roi != null ? (s.roi >= 0 ? '+' : '') + s.roi.toFixed(1)+'%' : '—';
+  el.innerHTML = `
+    <span><b>${s.total||0}</b> legs &middot; <b>${s.settled||0}</b> settled &middot; <b>${s.pending||0}</b> pending</span>
+    <span>WR <b>${wrStr}</b> &middot; ROI <b style="color:${pnlColor}">${roiStr}</b> &middot; PnL <b style="color:${pnlColor}">$${s.pnl != null ? s.pnl.toFixed(2) : '0.00'}</b></span>
+    <span>Since ${s.first_date||'—'} &middot; ${s.days_active||0}d active</span>`;
+}
+
+function renderSalProgress(s) {
+  const el = document.getElementById('sal-progress');
+  if (!el || !s) return;
+  const n = s.n_deduped || 0;
+  const target = s.dedup_target || 500;
+  const pct = Math.min(100, Math.round(n / target * 100));
+  const barColor = pct >= 100 ? 'var(--green,#22c55e)' : pct >= 60 ? 'var(--yellow,#eab308)' : 'var(--muted)';
+  el.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+      <span>Decision Gate Progress: <b>${n}</b> / ${target} deduped game-teams</span>
+      <span style="font-weight:600;color:${barColor}">${pct}%</span>
+    </div>
+    <div style="background:var(--surface2);border-radius:4px;height:8px;overflow:hidden">
+      <div style="width:${pct}%;height:100%;background:${barColor};border-radius:4px;transition:width 0.3s"></div>
+    </div>
+    <div style="margin-top:4px;font-size:10px;color:var(--muted)">Target: 300-500 settled deduped legs (~mid-Nov 2026) &middot; ${pct >= 100 ? 'READY for verdict' : pct >= 60 ? 'On track' : 'Accumulating'}</div>`;
+}
+
+function renderSalThreeLevers(tl, summary) {
+  const el = document.getElementById('sal-three-levers');
+  if (!el || !tl) { if (el) el.innerHTML = '<div style="color:var(--muted);padding:12px;font-size:12px">Accumulating — three-lever data populates after settlement (restart server if just deployed)</div>'; return; }
+
+  const l1 = tl.l1_realized || {};
+  const l2 = tl.l2_pinnacle || {};
+  const l3 = tl.l3_clv || {};
+
+  function fmtPp(v) { if (v == null) return '—'; const c = v >= 0 ? 'var(--green)' : 'var(--red)'; return `<span style="color:${c};font-weight:700">${v > 0 ? '+' : ''}${v.toFixed(2)} pp</span>`; }
+  function fmtPct(v) { if (v == null) return '—'; const c = v >= 0 ? 'var(--green)' : 'var(--red)'; return `<span style="color:${c};font-weight:700">${v > 0 ? '+' : ''}${v.toFixed(1)}%</span>`; }
+
+  // Edge = WR - BE
+  const edgePp = (l1.wr != null && l1.avg_breakeven != null) ? (l1.wr - l1.avg_breakeven) : null;
+
+  let html = `<table style="width:100%;border-collapse:collapse;font-size:13px">
+    <thead><tr style="border-bottom:2px solid var(--border)">
+      <th style="text-align:left;padding:6px 10px">Lever</th>
+      <th style="text-align:left;padding:6px 10px">What it measures</th>
+      <th style="text-align:right;padding:6px 10px">Value</th>
+      <th style="text-align:right;padding:6px 10px">N</th>
+      <th style="text-align:left;padding:6px 10px">Read</th>
+    </tr></thead><tbody>`;
+
+  // L1: Realized PnL
+  const l1Signal = edgePp != null ? (edgePp > 2 ? 'EDGE' : edgePp > 0 ? 'Marginal' : 'No edge') : '—';
+  const l1SignalC = edgePp != null ? (edgePp > 2 ? 'var(--green)' : edgePp > 0 ? 'var(--yellow,orange)' : 'var(--red)') : 'var(--muted)';
+  html += `<tr style="border-bottom:1px solid var(--border);background:var(--surface)">
+    <td style="padding:8px 10px;font-weight:700">L1: Realized PnL</td>
+    <td style="padding:8px 10px;color:var(--muted)">WR vs breakeven (ground truth)</td>
+    <td style="text-align:right;padding:8px 10px">WR ${l1.wr != null ? l1.wr.toFixed(1)+'%' : '—'} vs BE ${l1.avg_breakeven != null ? l1.avg_breakeven.toFixed(1)+'%' : '—'} = ${fmtPp(edgePp)} &middot; ROI ${fmtPct(l1.roi)}</td>
+    <td style="text-align:right;padding:8px 10px">${l1.n || 0}</td>
+    <td style="padding:8px 10px;font-weight:600;color:${l1SignalC}">${l1Signal}</td>
+  </tr>`;
+
+  // L2: vs Pinnacle
+  const l2Signal = l2.avg_edge_pp != null ? (l2.avg_edge_pp > 1 ? 'Better than sharp' : l2.avg_edge_pp > 0 ? 'Slight edge' : 'Sharp wins') : '—';
+  const l2SignalC = l2.avg_edge_pp != null ? (l2.avg_edge_pp > 0 ? 'var(--green)' : 'var(--red)') : 'var(--muted)';
+  html += `<tr style="border-bottom:1px solid var(--border)">
+    <td style="padding:8px 10px;font-weight:700">L2: vs Sharp (Pinnacle)</td>
+    <td style="padding:8px 10px;color:var(--muted)">Entry odds vs Pinnacle benchmark</td>
+    <td style="text-align:right;padding:8px 10px">${fmtPp(l2.avg_edge_pp)}</td>
+    <td style="text-align:right;padding:8px 10px">${l2.n || 0}</td>
+    <td style="padding:8px 10px;font-weight:600;color:${l2SignalC}">${l2Signal}</td>
+  </tr>`;
+
+  // L3: Alt-Close CLV
+  const l3Note = l3.avg_clv_pp != null && l3.avg_clv_pp < 0 ? '(expected on soft mkts)' : '';
+  const l3Signal = l3.avg_clv_pp != null ? (l3.avg_clv_pp > 0 ? 'Beat close' : 'Close overshoots') : '—';
+  const l3SignalC = l3.avg_clv_pp != null ? (l3.avg_clv_pp > 0 ? 'var(--green)' : 'var(--yellow,orange)') : 'var(--muted)';
+  html += `<tr style="border-bottom:1px solid var(--border)">
+    <td style="padding:8px 10px;font-weight:700">L3: Alt-Close CLV</td>
+    <td style="padding:8px 10px;color:var(--muted)">Entry vs closing line ${l3Note}</td>
+    <td style="text-align:right;padding:8px 10px">${fmtPp(l3.avg_clv_pp)}</td>
+    <td style="text-align:right;padding:8px 10px">${l3.n || 0}</td>
+    <td style="padding:8px 10px;font-weight:600;color:${l3SignalC}">${l3Signal}</td>
+  </tr>`;
+
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function _salStatsRow(s, label, extraCols) {
+  const wr = s.wr != null ? s.wr.toFixed(1)+'%' : '—';
+  const be = s.avg_breakeven != null ? s.avg_breakeven.toFixed(1)+'%' : '—';
+  const roi = s.roi != null ? (s.roi >= 0 ? '+' : '') + s.roi.toFixed(1)+'%' : '—';
+  const roiC = (s.roi||0) >= 0 ? 'var(--green)' : 'var(--red)';
+  const pnlC = (s.pnl||0) >= 0 ? 'var(--green)' : 'var(--red)';
+  const devig = s.avg_devig != null ? s.avg_devig.toFixed(1)+'%' : '—';
+  // L2: Pinnacle edge
+  const pinnEdge = s.avg_pinnacle_edge_pp != null ? (s.avg_pinnacle_edge_pp > 0 ? '+' : '') + s.avg_pinnacle_edge_pp.toFixed(1) : '—';
+  const pinnC = (s.avg_pinnacle_edge_pp||0) >= 0 ? 'var(--green)' : 'var(--red)';
+  // L3: CLV
+  const clv = s.avg_clv_pp != null ? (s.avg_clv_pp > 0 ? '+' : '') + s.avg_clv_pp.toFixed(1) : '—';
+  const clvC = (s.avg_clv_pp||0) >= 0 ? 'var(--green)' : 'var(--yellow,orange)';
+  return `<tr style="border-bottom:1px solid var(--border)">
+    <td style="padding:4px 8px;font-weight:600">${label}</td>
+    ${extraCols||''}
+    <td style="text-align:right;padding:4px 6px">${s.n}</td>
+    <td style="text-align:right;padding:4px 6px">${s.settled}</td>
+    <td style="text-align:right;padding:4px 6px">${wr}</td>
+    <td style="text-align:right;padding:4px 6px">${be}</td>
+    <td style="text-align:right;padding:4px 6px">${devig}</td>
+    <td style="text-align:right;padding:4px 6px;color:${pinnC}">${pinnEdge}</td>
+    <td style="text-align:right;padding:4px 6px;color:${clvC}">${clv}</td>
+    <td style="text-align:right;padding:4px 6px;color:${roiC}">${roi}</td>
+    <td style="text-align:right;padding:4px 6px;color:${pnlC}">$${(s.pnl||0).toFixed(2)}</td>
+  </tr>`;
+}
+
+function renderSalRungTable(byRung) {
+  const el = document.getElementById('sal-rung-table');
+  if (!el) return;
+  if (!byRung || !byRung.length) { el.innerHTML = '<div style="color:var(--muted);padding:12px;font-size:12px">Accumulating — no rung data yet</div>'; return; }
+  let html = `<table style="width:100%;border-collapse:collapse;font-size:12px">
+    <thead><tr style="border-bottom:2px solid var(--border)">
+      <th style="text-align:left;padding:4px 8px">Rung</th>
+      <th style="text-align:left;padding:4px 6px">Liquidity</th>
+      <th style="text-align:right;padding:4px 6px">N</th>
+      <th style="text-align:right;padding:4px 6px">Settled</th>
+      <th style="text-align:right;padding:4px 6px">WR</th>
+      <th style="text-align:right;padding:4px 6px">BE</th>
+      <th style="text-align:right;padding:4px 6px">Devig</th>
+      <th style="text-align:right;padding:4px 6px" title="L2: Entry vs Pinnacle">Pinn pp</th>
+      <th style="text-align:right;padding:4px 6px" title="L3: Alt-Close CLV">CLV pp</th>
+      <th style="text-align:right;padding:4px 6px">ROI</th>
+      <th style="text-align:right;padding:4px 6px">PnL</th>
+    </tr></thead><tbody>`;
+  for (const r of byRung) {
+    const lb = r.liquidity_breakdown || {};
+    const liqStr = Object.entries(lb).map(([k,v]) => `${k}:${v}`).join(' ');
+    html += _salStatsRow(r, r.rung, `<td style="padding:4px 6px;font-size:10px;color:var(--muted)">${liqStr}</td>`);
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function renderSalLiquidityTable(byLiq) {
+  const el = document.getElementById('sal-liquidity-table');
+  if (!el) return;
+  if (!byLiq || !byLiq.length) { el.innerHTML = '<div style="color:var(--muted);padding:12px;font-size:12px">Accumulating — no liquidity data yet</div>'; return; }
+  let html = `<table style="width:100%;border-collapse:collapse;font-size:12px">
+    <thead><tr style="border-bottom:2px solid var(--border)">
+      <th style="text-align:left;padding:4px 8px">Tier</th>
+      <th style="text-align:right;padding:4px 6px">N</th>
+      <th style="text-align:right;padding:4px 6px">Settled</th>
+      <th style="text-align:right;padding:4px 6px">WR</th>
+      <th style="text-align:right;padding:4px 6px">BE</th>
+      <th style="text-align:right;padding:4px 6px">Devig</th>
+      <th style="text-align:right;padding:4px 6px" title="L2: Entry vs Pinnacle">Pinn pp</th>
+      <th style="text-align:right;padding:4px 6px" title="L3: Alt-Close CLV">CLV pp</th>
+      <th style="text-align:right;padding:4px 6px">ROI</th>
+      <th style="text-align:right;padding:4px 6px">PnL</th>
+    </tr></thead><tbody>`;
+  for (const r of byLiq) {
+    const tierLabel = r.liquidity === 'liquid' ? 'Liquid (3+ books)' :
+                      r.liquidity === 'moderate' ? 'Moderate (2 books)' :
+                      r.liquidity === 'thin' ? 'Thin (1 book)' : r.liquidity;
+    html += _salStatsRow(r, tierLabel, '');
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function renderSalCrossTable(cross) {
+  const el = document.getElementById('sal-cross-table');
+  if (!el) return;
+  if (!cross || !cross.length) { el.innerHTML = '<div style="color:var(--muted);padding:12px;font-size:12px">Accumulating — no cross-tab data yet</div>'; return; }
+  let html = `<table style="width:100%;border-collapse:collapse;font-size:12px">
+    <thead><tr style="border-bottom:2px solid var(--border)">
+      <th style="text-align:left;padding:4px 8px">Rung</th>
+      <th style="text-align:left;padding:4px 6px">Liquidity</th>
+      <th style="text-align:right;padding:4px 6px">N</th>
+      <th style="text-align:right;padding:4px 6px">Settled</th>
+      <th style="text-align:right;padding:4px 6px">WR</th>
+      <th style="text-align:right;padding:4px 6px">BE</th>
+      <th style="text-align:right;padding:4px 6px">Devig</th>
+      <th style="text-align:right;padding:4px 6px" title="L2: Entry vs Pinnacle">Pinn pp</th>
+      <th style="text-align:right;padding:4px 6px" title="L3: Alt-Close CLV">CLV pp</th>
+      <th style="text-align:right;padding:4px 6px">ROI</th>
+      <th style="text-align:right;padding:4px 6px">PnL</th>
+    </tr></thead><tbody>`;
+  for (const r of cross) {
+    html += _salStatsRow(r, r.rung, `<td style="padding:4px 6px">${r.liquidity}</td>`);
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function renderSalBookTable(byBook) {
+  const el = document.getElementById('sal-book-table');
+  if (!el) return;
+  if (!byBook || !byBook.length) { el.innerHTML = '<div style="color:var(--muted);padding:12px;font-size:12px">Accumulating — no book data yet</div>'; return; }
+  let html = `<table style="width:100%;border-collapse:collapse;font-size:12px">
+    <thead><tr style="border-bottom:2px solid var(--border)">
+      <th style="text-align:left;padding:4px 8px">Book</th>
+      <th style="text-align:right;padding:4px 6px">N</th>
+      <th style="text-align:right;padding:4px 6px">Settled</th>
+      <th style="text-align:right;padding:4px 6px">WR</th>
+      <th style="text-align:right;padding:4px 6px">BE</th>
+      <th style="text-align:right;padding:4px 6px">Devig</th>
+      <th style="text-align:right;padding:4px 6px" title="L2: Entry vs Pinnacle">Pinn pp</th>
+      <th style="text-align:right;padding:4px 6px" title="L3: Alt-Close CLV">CLV pp</th>
+      <th style="text-align:right;padding:4px 6px">ROI</th>
+      <th style="text-align:right;padding:4px 6px">PnL</th>
+    </tr></thead><tbody>`;
+  for (const r of byBook) {
+    html += _salStatsRow(r, r.book, '');
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function renderSalPnlChart(series) {
+  const el = document.getElementById('sal-pnl-chart');
+  if (!el) return;
+  if (!series || !series.length) { el.innerHTML = '<div style="color:var(--muted);padding:20px;text-align:center;font-size:12px">Accumulating — PnL chart populates after first settlement</div>'; return; }
+  const maxPnl = Math.max(...series.map(d => Math.abs(d.cum_pnl)), 10);
+  const w = el.clientWidth || 600;
+  const h = 200;
+  const pad = {t:10, r:10, b:30, l:50};
+  const pw = w - pad.l - pad.r;
+  const ph = h - pad.t - pad.b;
+  const yMax = maxPnl * 1.2;
+  const yMin = -yMax;
+
+  let pts = series.map((d, i) => {
+    const x = pad.l + (i / Math.max(series.length - 1, 1)) * pw;
+    const y = pad.t + ph - ((d.cum_pnl - yMin) / (yMax - yMin)) * ph;
+    return `${x},${y}`;
+  }).join(' ');
+
+  const zeroY = pad.t + ph - ((0 - yMin) / (yMax - yMin)) * ph;
+  const lastPnl = series[series.length - 1].cum_pnl;
+  const color = lastPnl >= 0 ? 'var(--green,#22c55e)' : 'var(--red,#ef4444)';
+
+  el.innerHTML = `<svg width="${w}" height="${h}" style="display:block">
+    <line x1="${pad.l}" y1="${zeroY}" x2="${w-pad.r}" y2="${zeroY}" stroke="var(--border)" stroke-dasharray="4"/>
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2"/>
+    <text x="${pad.l-4}" y="${pad.t+8}" text-anchor="end" fill="var(--muted)" style="font-size:10px">$${yMax.toFixed(0)}</text>
+    <text x="${pad.l-4}" y="${h-pad.b}" text-anchor="end" fill="var(--muted)" style="font-size:10px">$${yMin.toFixed(0)}</text>
+    <text x="${pad.l-4}" y="${zeroY+4}" text-anchor="end" fill="var(--muted)" style="font-size:10px">$0</text>
+    <text x="${pad.l}" y="${h-6}" fill="var(--muted)" style="font-size:10px">${series[0].date}</text>
+    <text x="${w-pad.r}" y="${h-6}" text-anchor="end" fill="var(--muted)" style="font-size:10px">${series[series.length-1].date}</text>
+  </svg>`;
+}
+
+function populateSalFilters(legs) {
+  const rungSel = document.getElementById('sal-log-rung');
+  if (!rungSel || !legs || !legs.length) return;
+  const rungs = [...new Set(legs.map(l => l.rung))].sort((a,b) => parseFloat(a) - parseFloat(b));
+  rungSel.innerHTML = '<option value="">All Rungs</option>' + rungs.map(r => `<option value="${r}">${r}</option>`).join('');
+}
+
+function renderSalLog() {
+  if (!_salData || !_salData.legs || !_salData.legs.length) {
+    const el = document.getElementById('sal-leg-log');
+    if (el) el.innerHTML = '<div style="color:var(--muted);padding:12px;font-size:12px">Accumulating — no legs yet</div>';
+    return;
+  }
+  const rungFilter = document.getElementById('sal-log-rung')?.value || '';
+  const liqFilter = document.getElementById('sal-log-liq')?.value || '';
+  const statusFilter = document.getElementById('sal-log-status')?.value || '';
+
+  let filtered = _salData.legs;
+  if (rungFilter) filtered = filtered.filter(l => l.rung === rungFilter);
+  if (liqFilter) filtered = filtered.filter(l => l.liquidity === liqFilter);
+  if (statusFilter) filtered = filtered.filter(l => l.status === statusFilter);
+
+  let html = `<table style="width:100%;border-collapse:collapse;font-size:11px">
+    <thead><tr style="border-bottom:2px solid var(--border)">
+      <th style="text-align:left;padding:4px 6px">Date</th>
+      <th style="text-align:left;padding:4px 6px">Description</th>
+      <th style="text-align:center;padding:4px 4px">Rung</th>
+      <th style="text-align:center;padding:4px 4px">Liq</th>
+      <th style="text-align:left;padding:4px 4px">Book</th>
+      <th style="text-align:right;padding:4px 4px">Odds</th>
+      <th style="text-align:right;padding:4px 4px">WP</th>
+      <th style="text-align:right;padding:4px 4px">BE</th>
+      <th style="text-align:center;padding:4px 4px">Status</th>
+    </tr></thead><tbody>`;
+
+  const shown = filtered.slice(0, 200);
+  for (const lg of shown) {
+    const wp = lg.wp != null ? lg.wp.toFixed(1)+'%' : '—';
+    const be = lg.breakeven != null ? (lg.breakeven*100).toFixed(1)+'%' : '—';
+    const odds = lg.odds != null ? lg.odds.toFixed(3) : '—';
+    const statusBadge = lg.status === 'WON' ? '<span style="color:var(--green)">W</span>' :
+                        lg.status === 'LOST' ? '<span style="color:var(--red)">L</span>' :
+                        '<span style="color:var(--muted)">...</span>';
+    const liqBadge = lg.liquidity === 'liquid' ? '<span style="color:var(--green)">LIQ</span>' :
+                     lg.liquidity === 'moderate' ? '<span style="color:var(--yellow,orange)">MOD</span>' :
+                     '<span style="color:var(--red)">THN</span>';
+    html += `<tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:3px 6px">${lg.date}</td>
+      <td style="padding:3px 6px">${lg.description}</td>
+      <td style="text-align:center;padding:3px 4px">${lg.rung}</td>
+      <td style="text-align:center;padding:3px 4px">${liqBadge}</td>
+      <td style="padding:3px 4px">${lg.best_book}</td>
+      <td style="text-align:right;padding:3px 4px">${odds}</td>
+      <td style="text-align:right;padding:3px 4px">${wp}</td>
+      <td style="text-align:right;padding:3px 4px">${be}</td>
+      <td style="text-align:center;padding:3px 4px">${statusBadge}</td>
+    </tr>`;
+  }
+  if (filtered.length > 200) {
+    html += `<tr><td colspan="9" style="padding:8px;text-align:center;color:var(--muted)">Showing 200 of ${filtered.length}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  document.getElementById('sal-leg-log').innerHTML = html;
+}
+
 // ── ATS Ungated Shadow Tracker ───────────────────────────────────────────────
 var _auData = null;
 
@@ -14415,6 +14949,126 @@ function renderAuLog() {
   el.innerHTML = h;
 }
 
+// ── Researcher: Daily MLB Intelligence Brief ────────────────────────────────
+
+function _resToday() {
+  return new Date().toISOString().slice(0,10);
+}
+
+async function loadResearcher() {
+  const dateEl = document.getElementById('res-date');
+  if (!dateEl.value) dateEl.value = _resToday();
+  const d = dateEl.value;
+
+  // Load brief — prefer synthesized (daily), fall back to raw
+  try {
+    let data;
+    const synthResp = await fetch(`/api/researcher/brief?game_date=${d}&brief_type=daily`);
+    const synthData = await synthResp.json();
+    if (synthData.brief && synthData.brief.content) {
+      data = synthData;
+    } else {
+      const rawResp = await fetch(`/api/researcher/brief?game_date=${d}&brief_type=raw`);
+      data = await rawResp.json();
+    }
+    const briefEl = document.getElementById('res-brief');
+    if (data.brief && data.brief.content) {
+      const label = data.brief_type === 'daily'
+        ? '<div style="margin-bottom:8px;font-size:11px;color:var(--green,#22c55e);font-weight:600">SYNTHESIZED BRIEF</div>'
+        : '<div style="margin-bottom:8px;font-size:11px;color:var(--muted)">RAW BRIEF (synthesis pending)</div>';
+      briefEl.innerHTML = label + _renderMarkdown(data.brief.content);
+    } else {
+      briefEl.innerHTML = '<span style="color:var(--muted)">No brief yet for this date. Click Refresh to generate.</span>';
+    }
+
+    // Source counts
+    const srcEl = document.getElementById('res-sources');
+    const counts = data.source_counts || {};
+    const srcNames = {espn_injuries:'ESPN Injuries', mlb_api:'MLB Probables', espn_rss:'ESPN RSS',
+                      fangraphs:'FanGraphs', espn_transactions:'Transactions', mlb_com:'MLB.com'};
+    srcEl.innerHTML = Object.entries(srcNames).map(([k,v]) => {
+      const n = counts[k] || 0;
+      const color = n > 0 ? 'var(--green,#22c55e)' : 'var(--muted)';
+      return `<span style="font-size:11px;padding:3px 8px;background:var(--surface2);border-radius:4px;border:1px solid ${color};color:${color}">${v}: ${n}</span>`;
+    }).join('');
+  } catch(e) {
+    document.getElementById('res-brief').innerHTML = `<span style="color:var(--red)">Error loading brief: ${e.message}</span>`;
+  }
+
+  // Load player narratives
+  try {
+    const resp = await fetch(`/api/researcher/brief?game_date=${d}&brief_type=player`);
+    const data = await resp.json();
+    const el = document.getElementById('res-players');
+    if (data.brief && data.brief.content) {
+      el.innerHTML = _renderMarkdown(data.brief.content);
+    } else {
+      el.innerHTML = '<span style="color:var(--muted)">No player narratives yet.</span>';
+    }
+  } catch(e) {
+    document.getElementById('res-players').innerHTML = `<span style="color:var(--muted)">—</span>`;
+  }
+
+  // Load raw items
+  try {
+    const resp = await fetch(`/api/researcher/items?game_date=${d}`);
+    const data = await resp.json();
+    document.getElementById('res-item-count').textContent = `(${data.count} items)`;
+    const el = document.getElementById('res-items');
+    if (!data.items || data.items.length === 0) {
+      el.innerHTML = '<span style="color:var(--muted)">No items ingested for this date.</span>';
+      return;
+    }
+    const catColors = {injury:'var(--red,#ef4444)', lineup:'var(--blue,#3b82f6)',
+                       roster:'var(--amber,#f59e0b)', analysis:'var(--purple,#a855f7)',
+                       news:'var(--cyan,#06b6d4)'};
+    let h = '<table style="width:100%;font-size:12px"><thead><tr><th>Cat</th><th>Source</th><th>Headline</th><th>Players</th></tr></thead><tbody>';
+    for (const item of data.items.slice(0, 100)) {
+      const c = catColors[item.category] || 'var(--muted)';
+      const players = (item.players || []).slice(0,3).join(', ');
+      const link = item.url ? `<a href="${item.url}" target="_blank" style="color:var(--text);text-decoration:none">${item.headline}</a>` : item.headline;
+      h += `<tr>
+        <td><span style="color:${c};font-size:10px;font-weight:600">${item.category.toUpperCase()}</span></td>
+        <td style="color:var(--muted)">${item.source}</td>
+        <td>${link}</td>
+        <td style="color:var(--muted);font-size:11px">${players}</td>
+      </tr>`;
+    }
+    h += '</tbody></table>';
+    if (data.items.length > 100) h += `<div style="margin-top:4px;font-size:11px;color:var(--muted)">Showing 100 of ${data.items.length}</div>`;
+    el.innerHTML = h;
+  } catch(e) {
+    document.getElementById('res-items').innerHTML = `<span style="color:var(--red)">Error: ${e.message}</span>`;
+  }
+}
+
+async function runResearcher() {
+  const dateEl = document.getElementById('res-date');
+  if (!dateEl.value) dateEl.value = _resToday();
+  const d = dateEl.value;
+
+  document.getElementById('res-brief').innerHTML = '<div class="loading">Running researcher... (fetching sources + Claude synthesis)</div>';
+  try {
+    const resp = await fetch(`/api/researcher/run?game_date=${d}`, {method:'POST'});
+    const data = await resp.json();
+    // Reload after run
+    await loadResearcher();
+  } catch(e) {
+    document.getElementById('res-brief').innerHTML = `<span style="color:var(--red)">Error: ${e.message}</span>`;
+  }
+}
+
+// Simple markdown renderer (headers, bold, bullets, links)
+function _renderMarkdown(text) {
+  if (!text) return '';
+  return text
+    .replace(/^### (.+)$/gm, '<h4 style="margin:12px 0 4px;color:var(--text)">$1</h4>')
+    .replace(/^## (.+)$/gm, '<h3 style="margin:16px 0 6px;color:var(--text)">$1</h3>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/^- (.+)$/gm, '<div style="padding-left:16px;margin:2px 0">&bull; $1</div>')
+    .replace(/\n/g, '<br>');
+}
+
 // ── Arms Comparison (Graduation Decision View) ─────────────────────────────
 let _acData = null;
 let _acSort = { col: 'roi', dir: 'desc' };
@@ -14427,6 +15081,7 @@ async function loadArmsComparison() {
     _acData = await apiFetch(`/api/negbin/arms_comparison?days=${days}`);
     renderAcTable();
     renderAcChart();
+    loadCalibration();
   } catch(e) {
     document.getElementById('ac-table').innerHTML = `<div style="color:var(--red);font-size:12px">Error: ${e.message}</div>`;
   }
@@ -14452,11 +15107,12 @@ function renderAcTable() {
 
   const cols = [
     { key: 'label', label: 'Arm', sortable: false },
-    { key: 'n_parlays', label: 'Parlays', sortable: true },
+    { key: 'n_parlays', label: 'N', sortable: true },
     { key: 'n_settled', label: 'Settled', sortable: true },
     { key: 'settled_days', label: 'Days', sortable: true },
-    { key: 'n_legs', label: 'Legs', sortable: true },
-    { key: 'cover_rate', label: 'Cover %', sortable: true },
+    { key: 'cover_rate', label: 'WR %', sortable: true },
+    { key: 'avg_breakeven', label: 'BE %', sortable: true },
+    { key: 'edge_pp', label: 'Edge pp', sortable: true },
     { key: 'roi', label: 'ROI %', sortable: true },
     { key: 'cum_pnl', label: 'Cum PnL', sortable: true },
   ];
@@ -14494,13 +15150,18 @@ function renderAcTable() {
     }
 
     const srcParam = isControl ? 'shadow_a' : arm.source === 'shadow_negbin_recal' ? 'shadow_b' : arm.source;
+    const beStr = arm.avg_breakeven != null ? arm.avg_breakeven.toFixed(1) + '%' : '—';
+    const edgeColor = (arm.edge_pp ?? 0) > 0 ? 'var(--green)' : (arm.edge_pp ?? 0) < 0 ? 'var(--red)' : 'var(--muted)';
+    const edgeStr = arm.edge_pp != null ? (arm.edge_pp > 0 ? '+' : '') + arm.edge_pp.toFixed(1) : '—';
+
     h += `<tr style="${rowStyle};cursor:pointer" onclick="acDrillArm('${srcParam}')" title="Click for detail view">
       <td><strong>${arm.label}</strong></td>
       <td>${arm.n_parlays}</td>
       <td>${arm.n_settled}</td>
       <td>${arm.settled_days}</td>
-      <td>${arm.n_legs}</td>
       <td>${arm.cover_rate != null ? arm.cover_rate.toFixed(1) + '%' : '—'}</td>
+      <td>${beStr}</td>
+      <td style="color:${edgeColor};font-weight:600">${edgeStr}</td>
       <td style="color:${roiColor};font-weight:600">${arm.roi != null ? (arm.roi > 0 ? '+' : '') + arm.roi.toFixed(1) + '%' : '—'}</td>
       <td style="color:${cumColor};font-weight:600">${arm.cum_pnl != null ? '$' + arm.cum_pnl.toFixed(0) : '—'}</td>
       <td>${lift}</td>
@@ -14538,7 +15199,7 @@ function renderAcChart() {
 
   const colors = [
     '#6366f1', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6',
-    '#06b6d4', '#f97316', '#ec4899'
+    '#06b6d4', '#f97316', '#ec4899', '#14b8a6', '#a855f7', '#f43f5e'
   ];
 
   const armLabels = {
@@ -14550,6 +15211,11 @@ function renderAcChart() {
     'shadow_negbin_atscap': 'ATS Cap',
     'shadow_negbin_distwp_gate': 'dist_wp Gate',
     'shadow_negbin_bothgates': 'Both Gates',
+    'shadow_negbin_highconv': 'High-Conv',
+    'shadow_negbin_neg15': 'Neg 1.5',
+    'shadow_negbin_plus35': 'Plus 3.5',
+    'shadow_negbin_neg15_epp': 'Neg 1.5 + EPP',
+    'shadow_negbin_evaware': 'EV-Aware Rung',
   };
 
   // Gather all dates across all arms
@@ -14630,6 +15296,141 @@ function renderAcChart() {
       ${ds.label}</span>`;
   }
   legendEl.innerHTML = legendHtml;
+}
+
+// ── Calibration-by-Sizing Diagnostic ──────────────────────────────────────
+let _calData = null;
+
+async function loadCalibration() {
+  const el = document.getElementById('ac-calibration');
+  if (!el) return;
+  try {
+    _calData = await apiFetch('/api/negbin/calibration?days=365');
+    renderCalibration();
+  } catch(e) {
+    el.innerHTML = `<div style="color:var(--red);font-size:12px">Error: ${e.message}</div>`;
+  }
+}
+
+function renderCalibration() {
+  const el = document.getElementById('ac-calibration');
+  if (!el || !_calData || !_calData.arms) return;
+
+  let h = '';
+  for (const arm of _calData.arms) {
+    if (!arm.buckets || arm.buckets.length === 0) continue;
+    if (arm.n === 0) continue;
+
+    // Context splits
+    let ctxHtml = '';
+    if (arm.context_splits && arm.context_splits.length > 0) {
+      ctxHtml = '<div style="margin-top:6px;font-size:10px;color:var(--muted)">';
+      for (const cs of arm.context_splits) {
+        const eColor = (cs.edge_pp ?? 0) > 2 ? 'var(--green)' : (cs.edge_pp ?? 0) < -2 ? 'var(--red)' : 'var(--muted)';
+        ctxHtml += `<span style="margin-right:10px">${cs.context}: ${cs.realized_wr}% WR, <span style="color:${eColor}">${cs.edge_pp != null ? (cs.edge_pp > 0 ? '+' : '') + cs.edge_pp + 'pp' : '—'}</span> (n=${cs.n})</span>`;
+      }
+      ctxHtml += '</div>';
+    }
+
+    h += `<div style="margin-bottom:16px;padding:12px;background:var(--surface);border:1px solid var(--border);border-radius:8px">`;
+    h += `<div style="font-weight:600;font-size:12px;margin-bottom:6px">${arm.label} <span style="color:var(--muted);font-weight:normal">(n=${arm.n}, signal=${arm.wp_column})</span></div>`;
+    h += `<table class="data-table" style="font-size:11px;width:100%"><thead><tr>`;
+    h += '<th>Confidence Bucket</th><th>N</th><th>Claimed WP</th><th>Realized WR</th><th>Avg BE</th><th>Edge pp</th><th>Kelly f</th><th>Signal</th>';
+    h += '</tr></thead><tbody>';
+
+    for (const bkt of arm.buckets) {
+      const edgeColor = (bkt.edge_pp ?? 0) > 2 ? 'var(--green)' : (bkt.edge_pp ?? 0) < -2 ? 'var(--red)' : 'var(--muted)';
+      const sigColor = bkt.signal === 'calibrated' ? 'var(--green)' : bkt.signal === 'anti-calibrated' ? 'var(--red)' : 'var(--yellow,#eab308)';
+      const sigLabel = bkt.signal === 'calibrated' ? 'CALIBRATED' : bkt.signal === 'anti-calibrated' ? 'ANTI-CAL' : 'NOISE';
+      const kellyStr = bkt.kelly_fraction != null ? (bkt.kelly_fraction * 100).toFixed(1) + '%' : '—';
+      const kellyColor = (bkt.kelly_fraction ?? 0) > 0 ? 'var(--green)' : (bkt.kelly_fraction ?? 0) < 0 ? 'var(--red)' : 'var(--muted)';
+
+      h += `<tr>`;
+      h += `<td>${bkt.bucket}</td>`;
+      h += `<td>${bkt.n}</td>`;
+      h += `<td>${bkt.avg_claimed_wp != null ? bkt.avg_claimed_wp + '%' : '—'}</td>`;
+      h += `<td style="font-weight:600">${bkt.realized_wr != null ? bkt.realized_wr + '%' : '—'}</td>`;
+      h += `<td>${bkt.avg_breakeven != null ? bkt.avg_breakeven + '%' : '—'}</td>`;
+      h += `<td style="color:${edgeColor};font-weight:600">${bkt.edge_pp != null ? (bkt.edge_pp > 0 ? '+' : '') + bkt.edge_pp + 'pp' : '—'}</td>`;
+      h += `<td style="color:${kellyColor}">${kellyStr}</td>`;
+      h += `<td><span style="color:${sigColor};font-weight:600;font-size:10px">${bkt.signal ? sigLabel : '—'}</span></td>`;
+      h += `</tr>`;
+    }
+    h += '</tbody></table>';
+    h += ctxHtml;
+    h += '</div>';
+  }
+
+  if (!h) h = '<div style="color:var(--muted);font-size:12px;padding:16px;text-align:center">No calibration data available</div>';
+  el.innerHTML = h;
+}
+
+// ── Per-Arm Legs Table ──────────────────────────────────────────────────
+let _armLegsData = null;
+
+async function loadArmLegs() {
+  const src = document.getElementById('ac-legs-source')?.value;
+  const el = document.getElementById('ac-legs-table');
+  if (!src || !el) {
+    if (el) el.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:20px;text-align:center">Select an arm above to view its individual bets</div>';
+    return;
+  }
+  el.innerHTML = '<div class="loading">Loading legs...</div>';
+  try {
+    _armLegsData = await apiFetch(`/api/negbin/arm_legs?source=${src}&days=90`);
+    renderArmLegs();
+  } catch(e) {
+    el.innerHTML = `<div style="color:var(--red);font-size:12px">Error: ${e.message}</div>`;
+  }
+}
+
+function renderArmLegs() {
+  const el = document.getElementById('ac-legs-table');
+  if (!el || !_armLegsData || !_armLegsData.legs) return;
+
+  const statusFilter = document.getElementById('ac-legs-status')?.value || '';
+  let legs = _armLegsData.legs;
+  if (statusFilter) legs = legs.filter(l => l.result === statusFilter);
+
+  if (legs.length === 0) {
+    el.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:16px;text-align:center">No legs found</div>';
+    return;
+  }
+
+  // Summary
+  const settled = legs.filter(l => l.result === 'WIN' || l.result === 'LOSS');
+  const wins = settled.filter(l => l.result === 'WIN').length;
+  const wr = settled.length > 0 ? (100 * wins / settled.length).toFixed(1) : '—';
+  const totalPnl = settled.reduce((s, l) => s + (l.pnl_ref || 0), 0).toFixed(0);
+
+  let h = `<div style="font-size:11px;color:var(--muted);margin-bottom:8px">${_armLegsData.count} total legs, ${settled.length} settled, WR ${wr}%, ref PnL $${totalPnl} (showing ${legs.length})</div>`;
+
+  h += `<table class="data-table" style="font-size:11px;width:100%"><thead><tr>`;
+  h += '<th>Date</th><th>Description</th><th>Rung</th><th>Result</th><th>WP</th><th>Odds</th><th>PnL</th><th>Cell</th>';
+  h += '</tr></thead><tbody>';
+
+  for (const leg of legs.slice(0, 200)) {
+    const resColor = leg.result === 'WIN' ? 'var(--green)' : leg.result === 'LOSS' ? 'var(--red)' : 'var(--muted)';
+    const pnlColor = (leg.pnl_ref ?? 0) > 0 ? 'var(--green)' : (leg.pnl_ref ?? 0) < 0 ? 'var(--red)' : 'var(--muted)';
+    const wpVal = leg.dist_wp != null ? (leg.dist_wp * 100).toFixed(0) + '%' :
+                  leg.negbin_wp != null ? (leg.negbin_wp * 100).toFixed(0) + '%' :
+                  leg.wp != null ? (leg.wp * 100).toFixed(0) + '%' : '—';
+    const oddsStr = leg.odds_dec != null ? leg.odds_dec.toFixed(2) : (leg.odds_am != null ? leg.odds_am : '—');
+
+    h += `<tr>`;
+    h += `<td style="white-space:nowrap">${leg.date || '—'}</td>`;
+    h += `<td>${leg.description || '—'}</td>`;
+    h += `<td>${leg.rung != null ? (leg.rung > 0 ? '+' : '') + leg.rung : '—'}</td>`;
+    h += `<td style="color:${resColor};font-weight:600">${leg.result}</td>`;
+    h += `<td>${wpVal}</td>`;
+    h += `<td>${oddsStr}</td>`;
+    h += `<td style="color:${pnlColor};font-weight:600">${leg.pnl_ref != null ? '$' + leg.pnl_ref.toFixed(0) : '—'}</td>`;
+    h += `<td style="font-size:10px">${leg.cell || '—'}</td>`;
+    h += `</tr>`;
+  }
+  h += '</tbody></table>';
+  if (legs.length > 200) h += `<div style="font-size:11px;color:var(--muted);margin-top:8px">Showing first 200 of ${legs.length} legs</div>`;
+  el.innerHTML = h;
 }
 
 </script>

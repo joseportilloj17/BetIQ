@@ -93,7 +93,12 @@ def kelly_parlay(
     combined_prob = 1.0
     for leg in legs:
         combined_odds *= leg.get("odds", 1.0)
-        combined_prob *= leg.get("win_prob", 0.5) / 100  # API returns 0-100
+        # Prefer dist_wp (calibrated) over win_prob (overconfident by ~7pp)
+        dwp = leg.get("dist_wp")
+        if dwp is not None and dwp > 0:
+            combined_prob *= dwp
+        else:
+            combined_prob *= leg.get("win_prob", 0.5) / 100
 
     main = kelly_stake(combined_prob, combined_odds, bankroll, fraction)
 

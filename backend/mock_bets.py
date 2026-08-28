@@ -1833,7 +1833,9 @@ def _build_forced_picks(
             continue
         used_sigs.add(sig)
 
-        combined_win = (legs[0]["win_prob"] / 100) * (legs[1]["win_prob"] / 100)
+        _p0 = legs[0].get("dist_wp") or (legs[0]["win_prob"] / 100)
+        _p1 = legs[1].get("dist_wp") or (legs[1]["win_prob"] / 100)
+        combined_win = _p0 * _p1
         avg_lqs      = round(min(100.0, sum(l.get("lqs", 0) for l in legs) / 2), 1)
 
         picks.append({
@@ -5520,6 +5522,7 @@ def _fetch_mlb_all_batters(game_date: str) -> dict:
                     "full_name":    full_name,
                     "hits":         int(stats.get("hits") or 0),
                     "total_bases":  int(stats.get("totalBases") or 0),
+                    "home_runs":    int(stats.get("homeRuns") or 0),
                 }
 
     _PROP_STAT_CACHE[cache_key] = result
@@ -5607,7 +5610,8 @@ def _fetch_nhl_boxscore_stats(home_team: str, away_team: str, game_date: str) ->
 
 
 _PLAYER_PROP_MARKETS = frozenset({
-    "player_hits", "player_total_bases", "player_shots_on_goal",
+    "player_hits", "player_total_bases", "player_home_runs",
+    "player_shots_on_goal",
 })
 
 
@@ -5646,7 +5650,12 @@ def _settle_player_prop_leg(leg, game_date: str) -> dict:
     # which fixture_id was stored on the leg, since props are often mis-assigned).
     if sport == "MLB":
         stats    = _fetch_mlb_all_batters(game_date)
-        stat_key = "hits" if market == "player_hits" else "total_bases"
+        if market == "player_hits":
+            stat_key = "hits"
+        elif market == "player_home_runs":
+            stat_key = "home_runs"
+        else:
+            stat_key = "total_bases"
     elif sport == "NHL":
         stats    = _fetch_nhl_all_skaters(game_date)
         stat_key = "sog"
@@ -5746,6 +5755,10 @@ def _settle_mock_leg(
     desc_lower = desc.lower()
     market     = (leg.market_type or "").lower()
     is_soccer  = (leg.sport or "") in _SOCCER_SPORTS
+
+    # ── F5 (First-5-Innings) legs — settled by dedicated F5 pipeline ──────────
+    if market.startswith("f5_"):
+        return {**EMPTY, "skip_reason": "F5_MARKET: settled by f5_shadow.settle_f5_bets()"}
 
     # ── Market category — standard ────────────────────────────────────────────
     is_spread = any(kw in market for kw in ("spread", "run_line", "puck_line")) or \
@@ -6131,7 +6144,11 @@ def generate_retroactive_bets(
         combined_win  = 1.0
         for l in forced_legs:
             combined_odds *= l.get("odds", 1.0)
-            combined_win  *= (l.get("win_prob", 50.0) / 100)
+            dwp = l.get("dist_wp")
+            if dwp is not None and dwp > 0:
+                combined_win *= dwp
+            else:
+                combined_win *= (l.get("win_prob", 50.0) / 100)
         payout         = (combined_odds - 1) * stake
         expected_profit = combined_win * payout - (1 - combined_win) * stake
 
@@ -6161,7 +6178,9 @@ def generate_retroactive_bets(
             combined_odds = leg_a["odds"] * leg_b["odds"]
             if combined_odds < 2.0:
                 continue
-            combined_win  = (leg_a["win_prob"] / 100) * (leg_b["win_prob"] / 100)
+            _pa = leg_a.get("dist_wp") or (leg_a["win_prob"] / 100)
+            _pb = leg_b.get("dist_wp") or (leg_b["win_prob"] / 100)
+            combined_win  = _pa * _pb
             payout        = (combined_odds - 1) * stake
             expected_profit = combined_win * payout - (1 - combined_win) * stake
             if expected_profit <= 0:

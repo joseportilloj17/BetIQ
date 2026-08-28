@@ -99,6 +99,24 @@ _scheduler_state = {
     # ATS ungated shadow — scores ALL MLB spread legs (no gates) for discrimination analysis
     "last_ats_ungated_shadow":                None,
     "last_ats_ungated_shadow_result":         None,
+    # Lineup shadow — ATS + lineup_gap_resid (orthogonal lineup composition feature)
+    "last_lineup_shadow":                     None,
+    "last_lineup_shadow_result":              None,
+    # F5 shadow — First-5-Innings spread predictions (pitcher-dominated market)
+    "last_f5_shadow":                         None,
+    "last_f5_shadow_result":                  None,
+    # Underdog lag shadow — forward paper test for cross-book lag edge (runs after PM alt_lines)
+    "last_underdog_lag_shadow":               None,
+    "last_underdog_lag_shadow_result":        None,
+    # Prop shadow — batter HR + TB forward paper test (Statcast-augmented model)
+    "last_prop_shadow":                       None,
+    "last_prop_shadow_result":               None,
+    # Alt-line shadow — forward validation of mlb_ats_v1 alt-spread edge (real book prices)
+    "last_altline_shadow":                    None,
+    "last_altline_shadow_result":            None,
+    # Researcher — daily news ingestion + Claude synthesis
+    "last_researcher":                        None,
+    "last_researcher_result":                None,
     # Weekly personal edge profile refresh (Sunday 9 AM CT)
     "last_personal_edge_refresh":        None,
     "last_personal_edge_refresh_result": None,
@@ -128,6 +146,7 @@ _scheduler_state = {
     "watchdog_picks_verified":   False,   # picks cache populated for today
     "watchdog_mocks_verified":       False,   # >= 10 mock bets generated today
     "watchdog_midmorning_verified":  False,   # pick count adequate at 11 AM CT
+    "watchdog_db_write_verified":    False,   # bets.db can accept writes (corruption detector)
     "watchdog_last_reset_date":  None,    # CT date string of last midnight reset
     # Settlement CT timestamp (separate from cooldown key — used by watchdog + health check)
     "settle_last_ran_ct":        None,    # datetime in CT, updated after every settle run
@@ -138,6 +157,9 @@ _scheduler_state = {
     # Cashout live-odds polling (every 15 min during game windows when open LIVE bets exist)
     "last_cashout_poll":             None,   # ISO timestamp of last poll
     "last_cashout_poll_result":      None,
+    # Monthly NegBin mu model retrain (1st of month, 4 AM CT)
+    "last_negbin_retrain":           None,   # YYYY-MM month string
+    "last_negbin_retrain_result":    None,
 }
 _stop_event  = threading.Event()
 _thread: threading.Thread | None = None
@@ -594,6 +616,141 @@ def _should_run_weekly_retrain(now: datetime) -> bool:
     except Exception:
         pass
     return True
+
+
+# ── Monthly NegBin mu model retrain (1st of month, 4 AM CT) ────────────────
+_NEGBIN_RETRAIN_DAY_CT  = 1   # 1st of month
+_NEGBIN_RETRAIN_HOUR_CT = 4   # 4 AM CT — after nightly scores settle, before morning chain
+
+def _should_run_monthly_negbin_retrain() -> bool:
+    """True on the 1st of the month after 4 AM CT if not yet run this month."""
+    ct = _now_ct()
+    if ct.day != _NEGBIN_RETRAIN_DAY_CT:
+        return False
+    if ct.hour < _NEGBIN_RETRAIN_HOUR_CT:
+        return False
+    month_str = ct.strftime("%Y-%m")
+    # _dispatch stores today_ct ("YYYY-MM-DD"), so compare prefix
+    last = _scheduler_state.get("last_negbin_retrain") or ""
+    if last.startswith(month_str):
+        return False
+    # Persisted check: retrain log in historical.db survives restarts
+    try:
+        import sqlite3 as _sq
+        _db = os.path.join(os.path.dirname(__file__), "..", "data", "historical.db")
+        _con = _sq.connect(_db)
+        try:
+            row = _con.execute(
+                "SELECT 1 FROM negbin_retrain_log WHERE month = ?", (month_str,)
+            ).fetchone()
+            if row:
+                _scheduler_state["last_negbin_retrain"] = ct.strftime("%Y-%m-%d")
+                print(f"[Scheduler] Restart detected — negbin_retrain already ran for {month_str}")
+                _con.close()
+                return False
+        except Exception:
+            pass  # table may not exist yet
+        _con.close()
+    except Exception:
+        pass
+    return True
+
+
+def _run_monthly_negbin_retrain() -> dict:
+    """Retrain NegBin mu model, validate, deploy if safe, alert loudly on failure.
+
+    Post-retrain validation gates:
+      1. Global bias |mean_resid| < 0.3
+      2. MAE not worse than previous + 0.05
+      3. NegBin LL not dropped > 10
+      4. Discrimination ρ > 0.15
+    Logs result to negbin_retrain_log table and emits macOS notification on failure.
+    """
+    import threading as _threading
+
+    def _bg():
+        import sqlite3 as _sq
+
+        ct = _now_ct()
+        month_str = ct.strftime("%Y-%m")
+        retrain_date = ct.strftime("%Y-%m-%d")
+        _HIST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "data", "historical.db")
+
+        try:
+            import negbin_retrain as _nr
+            result = _nr.retrain()
+
+            # ── Log to persistent table ──
+            try:
+                con = _sq.connect(_HIST_DB)
+                con.execute("""
+                    CREATE TABLE IF NOT EXISTS negbin_retrain_log (
+                        month TEXT PRIMARY KEY,
+                        retrain_date TEXT,
+                        saved INTEGER,
+                        bias_new REAL,
+                        rho_new REAL,
+                        mae_home REAL,
+                        mae_away REAL,
+                        ll_new REAL,
+                        ll_old REAL
+                    )
+                """)
+                con.execute("""
+                    INSERT OR REPLACE INTO negbin_retrain_log
+                        (month, retrain_date, saved, bias_new, rho_new,
+                         mae_home, mae_away, ll_new, ll_old)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (month_str, retrain_date,
+                      1 if result.get("saved") else 0,
+                      result.get("bias_new"),
+                      result.get("rho_new"),
+                      result.get("mae_home_new"),
+                      result.get("mae_away_new"),
+                      result.get("ll_new"),
+                      result.get("ll_old")))
+                con.commit()
+                con.close()
+            except Exception as log_exc:
+                print(f"[NegBinRetrain] Failed to persist log: {log_exc}")
+
+            saved = result.get("saved", False)
+            bias = result.get("bias_new", 999)
+            rho = result.get("rho_new", 0)
+
+            if saved:
+                print(f"[Scheduler] NegBin retrain — deployed: "
+                      f"bias={bias:+.4f} ρ={rho:.4f}")
+            else:
+                # ── LOUD FAILURE ALERT ──
+                _alert_msg = (f"[NEGBIN RETRAIN ALERT] {retrain_date}: "
+                              f"REJECTED — bias={bias:+.4f} ρ={rho:.4f}")
+                print(f"[Scheduler] ERROR {_alert_msg}")
+                try:
+                    os.system(
+                        f'osascript -e \'display notification "{_alert_msg}" '
+                        f'with title "BetIQ NegBin Retrain FAIL" sound name "Basso"\''
+                    )
+                except Exception:
+                    pass
+
+            _scheduler_state["last_negbin_retrain_result"] = result
+
+        except Exception as exc:
+            _alert_msg = f"[NEGBIN RETRAIN ALERT] {retrain_date}: EXCEPTION — {exc}"
+            print(f"[Scheduler] ERROR {_alert_msg}")
+            try:
+                os.system(
+                    f'osascript -e \'display notification "{_alert_msg}" '
+                    f'with title "BetIQ NegBin Retrain FAIL" sound name "Basso"\''
+                )
+            except Exception:
+                pass
+            _scheduler_state["last_negbin_retrain_result"] = {"error": str(exc)}
+
+    _threading.Thread(target=_bg, daemon=True, name="negbin-retrain-bg").start()
+    return {"status": "started", "note": "running in background thread"}
 
 
 # ── Weekly signal analysis (Sunday 10 AM CT) ─────────────────────────────────
@@ -1189,6 +1346,18 @@ def _run_daily_mock_settle() -> dict:
             _run_shadow_settle()
         except Exception as _se:
             print(f"[Scheduler] Shadow settle error (non-fatal): {_se}")
+        # Settle Wong teaser shadow legs (NFL — uses nfl.db scores, not generic settle)
+        try:
+            from shadow_teaser import settle_teaser_legs
+            db_t = SessionLocal()
+            try:
+                t_settled = settle_teaser_legs(db_t)
+                if t_settled and t_settled > 0:
+                    print(f"[Scheduler] Teaser settle: {t_settled} legs settled")
+            finally:
+                db_t.close()
+        except Exception as _te:
+            print(f"[Scheduler] Teaser settle error (non-fatal): {_te}")
         # Backfill devig on newly-settled legs (Group F — measure-only, best-effort)
         try:
             from devig import backfill_devig
@@ -2163,6 +2332,12 @@ def _run_negbin_shadow_am() -> dict:
             generate_composite_counterfactual,
             generate_distwp_gated_counterfactual,
             generate_bothgates_counterfactual,
+            generate_highconv_counterfactual,
+            generate_neg15_straight,
+            generate_plus35_straight,
+            generate_neg15_epp_filtered,
+            generate_evaware_parlay,
+            generate_straight_stack,
             _get_todays_fixtures,
         )
         from datetime import datetime as _dt
@@ -2225,10 +2400,81 @@ def _run_negbin_shadow_am() -> dict:
             print(f"[Scheduler] NegBin both-gates counterfactual: {count_bg} parlays "
                   f"(dist_wp>=mkt_implied + edge<12pp)")
 
+            # High-conviction: dist_wp >= 0.85 absolute threshold
+            count_hc = 0
+            _arm_errors = []
+            try:
+                result_hc = generate_highconv_counterfactual(db, today_str=today_str)
+                count_hc = len(result_hc) if result_hc else 0
+                print(f"[Scheduler] NegBin high-conviction counterfactual: {count_hc} parlays "
+                      f"(dist_wp>={0.85} absolute)")
+            except Exception as _hc_err:
+                import traceback as _tb
+                print(f"[Scheduler] *** HIGHCONV ARM FAILED: {_hc_err}")
+                _tb.print_exc()
+                _arm_errors.append(f"highconv: {_hc_err}")
+
+            # Straight -1.5: PAUSED 2026-08-04
+            # Rung -1.5 recent rpb=0.011 (pure noise), edge=-53.7%.
+            # mu_away never discriminative (broken from start, not fixable by retrain).
+            # Ex-hot-window backtest is breakeven. Gate uses wrong rung's dist_wp.
+            count_n15 = 0
+            print("[Scheduler] NegBin straight -1.5: PAUSED (zero discrimination on -1.5 recently)")
+
+            # Straight +3.5: one bet per fixture where dist_wp >= 0.90
+            count_p35 = 0
+            try:
+                result_p35 = generate_plus35_straight(db, today_str=today_str)
+                count_p35 = len(result_p35) if result_p35 else 0
+                print(f"[Scheduler] NegBin straight +3.5: {count_p35} bets "
+                      f"(dist_wp >= 0.90, $10 flat)")
+            except Exception as _p35_err:
+                import traceback as _tb
+                print(f"[Scheduler] *** PLUS35 ARM FAILED: {_p35_err}")
+                _tb.print_exc()
+                _arm_errors.append(f"plus35: {_p35_err}")
+
+            # Neg15 + edge_pp filter: PAUSED 2026-08-04 (same as neg15 — -1.5 is dead)
+            count_n15_epp = 0
+            print("[Scheduler] NegBin neg15+epp: PAUSED (parent arm paused)")
+
+            # EV-aware rung selection variant
+            count_eva = 0
+            try:
+                result_eva = generate_evaware_parlay(db, today_str=today_str)
+                count_eva = len(result_eva) if result_eva else 0
+                print(f"[Scheduler] NegBin EV-aware rung: {count_eva} parlays "
+                      f"(min-rung selection, dist_wp>=0.70)")
+            except Exception as _eva_err:
+                import traceback as _tb
+                print(f"[Scheduler] *** EVAWARE ARM FAILED: {_eva_err}")
+                _tb.print_exc()
+                _arm_errors.append(f"evaware: {_eva_err}")
+
+            # Straight-bet stack: NegBin select → discriminator rank → straight
+            count_stack = 0
+            try:
+                result_stack = generate_straight_stack(db, today_str=today_str)
+                count_stack = len(result_stack) if result_stack else 0
+                print(f"[Scheduler] Straight-bet stack: {count_stack} bets "
+                      f"(NegBin select → epp<12 → ridge+dist_wp rank → best-edge rung)")
+            except Exception as _stack_err:
+                import traceback as _tb
+                print(f"[Scheduler] *** STRAIGHT-STACK ARM FAILED: {_stack_err}")
+                _tb.print_exc()
+                _arm_errors.append(f"straight_stack: {_stack_err}")
+
+            if _arm_errors:
+                print(f"[Scheduler] *** ARM ERRORS TODAY: {'; '.join(_arm_errors)}")
+
             return {"shadow_a": count_a, "shadow_b": count_b,
                     "atscap": count_cap, "edgegate": count_edge,
                     "fullstack": count_fs, "composite": count_comp,
-                    "distwp_gate": count_dwg, "bothgates": count_bg}
+                    "distwp_gate": count_dwg, "bothgates": count_bg,
+                    "highconv": count_hc, "neg15": count_n15,
+                    "plus35": count_p35,
+                    "neg15_epp": count_n15_epp, "evaware": count_eva,
+                    "straight_stack": count_stack}
         finally:
             db.close()
     except Exception as exc:
@@ -2265,6 +2511,272 @@ def _run_ats_ungated_shadow() -> dict:
             db.close()
     except Exception as exc:
         print(f"[Scheduler] ATS ungated shadow error: {exc}")
+        return {"error": str(exc)}
+
+
+# ── Lineup shadow — ATS + lineup_gap_resid (orthogonal lineup composition) ──
+
+def _should_run_lineup_shadow() -> bool:
+    """True if alt_lines_morning completed today, lineups are available (~2 PM CT), and hasn't run."""
+    ct = _now_ct()
+    today_str = ct.strftime("%Y-%m-%d")
+    if _scheduler_state.get("last_lineup_shadow") == today_str:
+        return False
+    if _scheduler_state.get("last_alt_lines_fetch_morning") != today_str:
+        return False
+    # MLB confirmed lineups are typically posted 2-3 hours before game time.
+    # Most games start 6-7 PM CT, so lineups are available ~3-4 PM.
+    # Running at 7:30 AM (when alt_lines_morning fires) gets 0 lineups.
+    if ct.hour < 14:
+        return False
+    return True
+
+
+def _run_lineup_shadow() -> dict:
+    """Score today's MLB spread legs with the lineup-augmented ATS model."""
+    try:
+        from database import SessionLocal, init_db
+        from shadow_lineup import generate_lineup_shadow
+        init_db()
+        db = SessionLocal()
+        try:
+            legs = generate_lineup_shadow(db)
+            count = len(legs) if legs else 0
+            print(f"[Scheduler] Lineup shadow: {count} legs scored")
+            return {"legs_scored": count}
+        finally:
+            db.close()
+    except Exception as exc:
+        print(f"[Scheduler] Lineup shadow error: {exc}")
+        return {"error": str(exc)}
+
+
+# ── Alt-line shadow — forward validation of mlb_ats_v1 alt-spread edge ────────
+
+def _should_run_altline_shadow() -> bool:
+    """True if alt_lines_morning completed today and altline shadow hasn't run."""
+    ct = _now_ct()
+    today_str = ct.strftime("%Y-%m-%d")
+    if _scheduler_state.get("last_altline_shadow") == today_str:
+        return False
+    if _scheduler_state.get("last_alt_lines_fetch_morning") != today_str:
+        return False
+    return True
+
+
+def _run_altline_shadow() -> dict:
+    """Score MLB alt-spread legs with ATS model and log real book prices."""
+    try:
+        from database import SessionLocal, init_db
+        from shadow_altline import generate_altline_shadow
+        init_db()
+        db = SessionLocal()
+        try:
+            legs = generate_altline_shadow(db)
+            count = len(legs) if legs else 0
+            print(f"[Scheduler] Alt-line shadow: {count} legs stored")
+            if count == 0:
+                print("[Scheduler] Alt-line shadow: 0 legs — check alt_lines table and fixtures for today's alt-spread data")
+            return {"legs_stored": count}
+        finally:
+            db.close()
+    except Exception as exc:
+        import traceback
+        print(f"[Scheduler] Alt-line shadow error: {exc}")
+        traceback.print_exc()
+        return {"error": str(exc)}
+
+
+# ── F5 shadow — First-5-Innings spread predictions (pitcher-dominated market) ──
+
+def _should_run_f5_shadow() -> bool:
+    """True if alt_lines_morning completed today and F5 shadow hasn't run."""
+    ct = _now_ct()
+    today_str = ct.strftime("%Y-%m-%d")
+    if _scheduler_state.get("last_f5_shadow") == today_str:
+        return False
+    if _scheduler_state.get("last_alt_lines_fetch_morning") != today_str:
+        return False
+    return True
+
+
+def _run_f5_shadow() -> dict:
+    """Fetch F5 odds, score with ATS model, store as shadow_f5 bets."""
+    try:
+        from database import SessionLocal, init_db
+        from f5_shadow import generate_f5_shadow, settle_f5_bets
+        init_db()
+        db = SessionLocal()
+        try:
+            legs = generate_f5_shadow(db)
+            count = len(legs) if legs else 0
+            print(f"[Scheduler] F5 shadow: {count} legs scored")
+            # Also settle any pending F5 bets
+            settle_result = settle_f5_bets()
+            return {"legs_scored": count, "settlement": settle_result}
+        finally:
+            db.close()
+    except Exception as exc:
+        print(f"[Scheduler] F5 shadow error: {exc}")
+        return {"error": str(exc)}
+
+
+# ── Underdog lag shadow — forward paper test for cross-book lag edge ──
+
+def _should_run_underdog_lag_shadow() -> bool:
+    """True if alt_lines_afternoon completed today and underdog lag hasn't run.
+
+    Needs AM + PM snapshots to detect intra-day staleness. Runs after
+    the afternoon alt_lines fetch (2 PM CT chain).
+    """
+    ct = _now_ct()
+    today_str = ct.strftime("%Y-%m-%d")
+    if _scheduler_state.get("last_underdog_lag_shadow") == today_str:
+        return False
+    # Must have BOTH morning AND afternoon alt_lines for stale detection
+    if _scheduler_state.get("last_alt_lines_fetch_morning") != today_str:
+        return False
+    if _scheduler_state.get("last_alt_lines_fetch_afternoon") != today_str:
+        # DB evidence: recover afternoon stamp after restart (same pattern as morning)
+        try:
+            import sqlite3 as _sq
+            _db = os.path.join(os.path.dirname(__file__), "..", "data", "historical.db")
+            _con = _sq.connect(_db)
+            # Afternoon rows: fetched after noon CT (17:00 UTC)
+            _n = _con.execute(
+                "SELECT COUNT(*) FROM alt_lines WHERE date(fetched_at, '-5 hours') = ? "
+                "AND CAST(strftime('%%H', fetched_at) AS INTEGER) >= 17",
+                (today_str,)
+            ).fetchone()[0]
+            _con.close()
+            if _n > 0:
+                _scheduler_state["last_alt_lines_fetch_afternoon"] = today_str
+                print(f"[Scheduler] Restart detected — alt_lines_afternoon already ran today ({_n} PM rows)")
+            else:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _run_underdog_lag_shadow() -> dict:
+    """Detect stale underdog lines and log paper bets."""
+    try:
+        from database import SessionLocal, init_db
+        from shadow_underdog_lag import generate_underdog_lag_shadow
+        init_db()
+        db = SessionLocal()
+        try:
+            opps = generate_underdog_lag_shadow(db)
+            count = len(opps) if opps else 0
+            print(f"[Scheduler] Underdog lag shadow: {count} opportunities logged")
+            return {"opportunities": count}
+        finally:
+            db.close()
+    except Exception as exc:
+        print(f"[Scheduler] Underdog lag shadow error: {exc}")
+        return {"error": str(exc)}
+
+
+# ── Prop shadow — batter HR + TB forward paper test (Statcast model) ──
+
+def _should_run_prop_shadow() -> bool:
+    """True if 4 PM props have been fetched today and prop shadow hasn't run."""
+    ct = _now_ct()
+    today_str = ct.strftime("%Y-%m-%d")
+    if _scheduler_state.get("last_prop_shadow") == today_str:
+        return False
+    # Gate: need props fetched today (4 PM slot preferred, 11 AM as fallback)
+    if _scheduler_state.get("last_props_4pm") == today_str:
+        return True
+    if _scheduler_state.get("last_props_11am") == today_str:
+        return ct.hour >= 16  # Only run on 11am data if it's past 4pm
+    return False
+
+
+def _run_prop_shadow() -> dict:
+    """Generate shadow prop bets (HR + TB) using Statcast-augmented model."""
+    try:
+        from database import SessionLocal, init_db
+        from shadow_prop import generate_prop_shadow
+        init_db()
+        db = SessionLocal()
+        try:
+            bets = generate_prop_shadow(db)
+            count = len(bets) if bets else 0
+            print(f"[Scheduler] Prop shadow: {count} bets logged")
+            return {"bets": count}
+        finally:
+            db.close()
+    except Exception as exc:
+        print(f"[Scheduler] Prop shadow error: {exc}")
+        return {"error": str(exc)}
+
+
+# ── Wong teaser shadow — NFL structural edge forward validation ───────────────
+
+def _should_run_teaser_shadow() -> bool:
+    """True on NFL game days (Sun/Mon/Thu) after 10 AM CT, once per day.
+
+    During NFL season (Sep-Feb), identifies qualifying Wong teaser legs
+    from today's slate. The gate is simpler than MLB shadows: no upstream
+    alt_lines dependency, just NFL schedule awareness.
+    """
+    ct = _now_ct()
+    today_str = ct.strftime("%Y-%m-%d")
+    if _scheduler_state.get("last_teaser_shadow") == today_str:
+        return False
+    # Only run during NFL season months (Sep-Feb) and after 10 AM CT
+    if ct.month not in (1, 2, 9, 10, 11, 12):
+        return False
+    if ct.hour < 10:
+        return False
+    # NFL games are primarily Sun/Mon/Thu (weekday: Mon=0, Thu=3, Sun=6)
+    # But also Sat in late season. Run daily during season to catch all.
+    return True
+
+
+def _run_teaser_shadow() -> dict:
+    """Generate Wong teaser shadow legs for today's NFL games."""
+    try:
+        from database import SessionLocal, init_db
+        from shadow_teaser import generate_teaser_shadow
+        init_db()
+        db = SessionLocal()
+        try:
+            legs = generate_teaser_shadow(db)
+            count = len(legs) if legs else 0
+            print(f"[Scheduler] Teaser shadow: {count} Wong legs logged")
+            return {"legs": count}
+        finally:
+            db.close()
+    except Exception as exc:
+        print(f"[Scheduler] Teaser shadow error: {exc}")
+        return {"error": str(exc)}
+
+
+# ── Researcher: daily news ingestion + synthesis ──────────────────────────────
+
+def _should_run_researcher() -> bool:
+    """True once daily after 9 AM CT, before researcher has run today."""
+    ct = _now_ct()
+    today_str = ct.strftime("%Y-%m-%d")
+    if _scheduler_state.get("last_researcher") == today_str:
+        return False
+    return ct.hour >= 9
+
+
+def _run_researcher() -> dict:
+    """Run the daily researcher cycle: fetch → store → synthesize → brief."""
+    try:
+        from researcher.runner import run_daily_research
+        from database import init_db
+        init_db()
+        result = run_daily_research()
+        print(f"[Scheduler] Researcher: {result.get('fetched', 0)} items, brief={result.get('brief', False)}")
+        return result
+    except Exception as exc:
+        print(f"[Scheduler] Researcher error: {exc}")
         return {"error": str(exc)}
 
 
@@ -2569,6 +3081,42 @@ def _verify_settle_recent() -> tuple[bool, str]:
         return False, f"error:{e}"
 
 
+def _verify_db_write_health() -> tuple[bool, str]:
+    """Verify bets.db can accept writes — catches corruption before 23 silent-fail days.
+
+    Writes a sentinel row to a lightweight table, reads it back, deletes it.
+    If any step fails, the DB is likely corrupted (header destroyed, WAL issue, etc.).
+    This would have caught the Aug 6-28 corruption that silenced all shadow arms.
+    """
+    import sqlite3 as _sq
+    _db_path = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
+    try:
+        conn = _sq.connect(_db_path, timeout=5)
+        # Verify header is valid SQLite
+        conn.execute("PRAGMA integrity_check(1)")
+        # Attempt a write + read cycle
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS _health_check (
+                id INTEGER PRIMARY KEY, ts TEXT
+            )
+        """)
+        sentinel = datetime.now(timezone.utc).isoformat()
+        conn.execute("INSERT OR REPLACE INTO _health_check (id, ts) VALUES (1, ?)",
+                      (sentinel,))
+        conn.commit()
+        row = conn.execute("SELECT ts FROM _health_check WHERE id = 1").fetchone()
+        conn.execute("DELETE FROM _health_check WHERE id = 1")
+        conn.commit()
+        conn.close()
+        if row and row[0] == sentinel:
+            return True, "write+read OK"
+        return False, "read-back mismatch"
+    except _sq.DatabaseError as e:
+        return False, f"DatabaseError: {e}"
+    except Exception as e:
+        return False, f"error: {e}"
+
+
 def _run_db_maintenance() -> dict:
     """Nightly DB maintenance: prune old rows, checkpoint WAL.
 
@@ -2672,6 +3220,7 @@ def _run_watchdog() -> None:
         _scheduler_state["watchdog_picks_verified"]   = False
         _scheduler_state["watchdog_mocks_verified"]     = False
         _scheduler_state["watchdog_midmorning_verified"] = False
+        _scheduler_state["watchdog_db_write_verified"] = False
         _scheduler_state["watchdog_last_reset_date"]  = today_str
         # Reset second pitcher fetch so it re-runs each calendar day
         _scheduler_state["last_mlb_pitcher_fetch_2"]  = None
@@ -2781,7 +3330,19 @@ def _run_watchdog() -> None:
             except Exception as _e:
                 print(f"[Watchdog] Settlement re-run failed: {_e}")
 
-    # ── CHECK 6: Retrain subprocess status ─────────────────────────────────
+    # ── CHECK 7: DB write-health (detect corruption before 23 days of silent failure)
+    if not _scheduler_state.get("watchdog_db_write_verified"):
+        try:
+            _db_ok, _db_detail = _verify_db_write_health()
+            if _db_ok:
+                _scheduler_state["watchdog_db_write_verified"] = True
+            else:
+                print(f"[Watchdog] 🚨 DB WRITE HEALTH FAILED: {_db_detail}")
+                print(f"[Watchdog] bets.db may be corrupted — all shadow arms are non-functional!")
+        except Exception as _e:
+            print(f"[Watchdog] DB write-health check error: {_e}")
+
+    # ── CHECK 8: Retrain subprocess status ─────────────────────────────────
     try:
         check_retrain_status()
     except Exception as _e:
@@ -3274,6 +3835,10 @@ def _loop(interval_mins: int, auto_retrain: bool):
     import time as _time
     _time.sleep(40)
 
+    _HEARTBEAT_FILE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", ".betiq_heartbeat"
+    )
+
     while not _stop_event.is_set():
         now_utc = datetime.now(timezone.utc)
         now_ct  = _now_ct()
@@ -3281,6 +3846,14 @@ def _loop(interval_mins: int, auto_retrain: bool):
 
         _scheduler_state["last_run"]    = now_utc.isoformat()
         _scheduler_state["total_cycles"] += 1
+
+        # ── Heartbeat file — external watchdog reads this ──────────────────
+        try:
+            import time as _hb_time
+            with open(_HEARTBEAT_FILE, "w") as _hb:
+                _hb.write(f"{int(_hb_time.time())}\n")
+        except Exception:
+            pass
 
         print(f"[Scheduler] Running cycle #{_scheduler_state['total_cycles']} at {now_utc.isoformat()} "
               f"({now_ct.strftime('%H:%M')} CT)")
@@ -3357,6 +3930,7 @@ def _loop(interval_mins: int, auto_retrain: bool):
         _dispatch("personal_edge_refresh", _should_run_personal_edge_refresh, _run_personal_edge_refresh,      "last_personal_edge_refresh")
         _dispatch("signal_analysis",     _should_run_weekly_signal_analysis,_run_weekly_signal_analysis,    "last_signal_analysis")
         _dispatch("weekly_retrain",      _should_run_weekly_retrain,        _run_weekly_retrain,            "last_weekly_retrain")
+        _dispatch("negbin_retrain",      _should_run_monthly_negbin_retrain, _run_monthly_negbin_retrain,    "last_negbin_retrain", use_now_utc=False)
         _dispatch("soccer_fetch",        _should_run_daily_soccer_fetch,    _run_daily_soccer_fetch,        "last_soccer_fetch")
         _dispatch("wc_odds_refresh",    _should_run_wc_odds_refresh,       _run_wc_odds_refresh,           "last_wc_odds_refresh")
 
@@ -3394,17 +3968,24 @@ def _loop(interval_mins: int, auto_retrain: bool):
         # (fires at :00 and :30 CT) — do NOT dispatch here to avoid double-settlement.
         _dispatch("regime_classify",     _should_run_regime_classification, _run_regime_classification,     "last_regime_classify")
         _dispatch("alt_lines_morning",   _should_run_alt_lines_morning,     _run_alt_lines_fetch,           "last_alt_lines_fetch_morning")
-        # Weather refresh — MUST run after alt_lines_morning (needs fixture list), BEFORE NegBin.
-        # Fetches forecast wind for today's games into game_weather.wind_speed_forecast_mph.
-        # Alerts loudly on failure (prevents silent month-long dropout).
-        _dispatch("weather_refresh",     _should_run_weather_refresh,       _run_weather_refresh,           "last_weather_refresh", use_now_utc=False)
-        # NegBin shadow AM — MUST run after alt_lines_morning + weather_refresh complete.
-        # _dispatch is synchronous: previous jobs block until done, so this line
-        # only executes after weather has landed and state is stamped.
+        # Weather refresh — DISABLED 2026-07-23: all 4 weather features removed from
+        # NegBin MU_FEATURE_COLS (harmful/noise under fixed multi-seed harness).
+        # No model reads game_weather. Keep code + table for potential future use.
+        # To re-enable: uncomment the _dispatch line below.
+        # _dispatch("weather_refresh",     _should_run_weather_refresh,       _run_weather_refresh,           "last_weather_refresh", use_now_utc=False)
+        # NegBin shadow AM — MUST run after alt_lines_morning complete.
         _dispatch("negbin_shadow_am",    _should_run_negbin_shadow_am,      _run_negbin_shadow_am,          "last_negbin_shadow_am", use_now_utc=False)
         # Shadow B (recalibrated) stamped inside _run_negbin_shadow_am — same fixture snapshot
         # ATS ungated shadow — scores ALL MLB spread legs (no gates) for discrimination analysis
         _dispatch("ats_ungated_shadow", _should_run_ats_ungated_shadow, _run_ats_ungated_shadow, "last_ats_ungated_shadow", use_now_utc=False)
+        # Lineup shadow — ATS + lineup_gap_resid, parallel to baseline for forward comparison
+        _dispatch("lineup_shadow", _should_run_lineup_shadow, _run_lineup_shadow, "last_lineup_shadow", use_now_utc=False)
+        # Alt-line shadow — forward validation of mlb_ats_v1 alt-spread edge (real book prices)
+        _dispatch("altline_shadow", _should_run_altline_shadow, _run_altline_shadow, "last_altline_shadow", use_now_utc=False)
+        # F5 shadow — First-5-Innings spread predictions + settlement
+        _dispatch("f5_shadow", _should_run_f5_shadow, _run_f5_shadow, "last_f5_shadow", use_now_utc=False)
+        # Underdog lag shadow — cross-book lag edge forward test (needs AM + PM alt_lines)
+        _dispatch("underdog_lag_shadow", _should_run_underdog_lag_shadow, _run_underdog_lag_shadow, "last_underdog_lag_shadow", use_now_utc=False)
         # 10:45 AM CT near-close for day/getaway games (standalone — no downstream chain)
         _dispatch("alt_lines_getaway",   _should_run_alt_lines_getaway,     _run_alt_lines_fetch,           "last_alt_lines_fetch_getaway")
         # alt_lines_afternoon moved into AFTERNOON_CHAIN (runs before pm_mock_generate)
@@ -3463,6 +4044,20 @@ def _loop(interval_mins: int, auto_retrain: bool):
                 _scheduler_state["last_best_lines_result"] = bl_result
         except Exception as _exc:
             print(f"[Scheduler] ERROR in best_lines: {_exc}")
+
+        # Wong teaser shadow — NFL structural edge forward validation
+        _dispatch("teaser_shadow", _should_run_teaser_shadow, _run_teaser_shadow, "last_teaser_shadow", use_now_utc=False)
+        # Prop shadow — batter HR + TB (runs after 4 PM props fetch)
+        _dispatch("prop_shadow", _should_run_prop_shadow, _run_prop_shadow, "last_prop_shadow", use_now_utc=False)
+
+        # Researcher — daily news + synthesis (runs once after 9 AM CT)
+        try:
+            if _should_run_researcher():
+                res_result = _run_researcher()
+                _scheduler_state["last_researcher"]        = today_ct
+                _scheduler_state["last_researcher_result"] = res_result
+        except Exception as _exc:
+            print(f"[Scheduler] ERROR in researcher: {_exc}")
 
         # ── Cashout live-odds poll (every 15 min during game windows) ────────
         try:

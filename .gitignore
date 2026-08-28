@@ -23,6 +23,9 @@ backend/verify_keys.py
 *.db-wal
 data/
 
+# Reports (generated daily, machine-specific)
+backend/reports/
+
 # Logs
 logs/
 *.log
@@ -41,6 +44,10 @@ Thumbs.db
 # Process files
 .betiq.pid
 .caffeinate.pid
+.betiq_heartbeat
+
+# Checkpoints (database snapshots, machine-specific)
+checkpoints/
 
 # Jupyter
 .ipynb_checkpoints/

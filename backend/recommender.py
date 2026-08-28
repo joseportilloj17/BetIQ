@@ -369,8 +369,8 @@ def score_parlay(legs: list[dict], stake: float, db: Session) -> dict:
     parlay   = build_parlay(legs, stake=stake)
     warnings = parlay.get("warnings", [])
 
-    # Use 85.71% model accuracy as actual win rate per leg
-    MODEL_ACCURACY = 0.8571
+    # Per-leg spread cover rate (dist_wp calibrated: 77.0% realized on 4303 legs)
+    MODEL_ACCURACY = 0.770
     n = len(legs)
     actual_win_prob = MODEL_ACCURACY ** n * 100   # e.g. 73.5% for 2-leg
     quality = compute_quality(
@@ -1880,7 +1880,12 @@ def generate_todays_picks(
                 if _pwr is not None:
                     combined_win *= _pwr
                 else:
-                    combined_win *= (l["win_prob"] / 100)
+                    # Prefer dist_wp (calibrated) over win_prob (overconfident)
+                    dwp = l.get("dist_wp")
+                    if dwp is not None and dwp > 0:
+                        combined_win *= dwp
+                    else:
+                        combined_win *= (l["win_prob"] / 100)
 
             # Pre-construction combined WP floor for 3+ leg parlays.
             # Target: 40% bet WR on 4-leg parlays requires ~80% per-leg WP.
@@ -2524,7 +2529,11 @@ def generate_todays_picks(
 
                 _tg_combined_win = 1.0
                 for _tl in _tg_legs:
-                    _tg_combined_win *= (_tl.get("win_prob") or 50) / 100.0
+                    dwp = _tl.get("dist_wp")
+                    if dwp is not None and dwp > 0:
+                        _tg_combined_win *= dwp
+                    else:
+                        _tg_combined_win *= (_tl.get("win_prob") or 50) / 100.0
                 _tg_combined_wp = round(_tg_combined_win * 100, 2)
 
                 _tg_payout  = (_tg_combined_odds - 1) * stake
@@ -2888,7 +2897,9 @@ def _format_pick(cand: dict, stake: float, db=None) -> dict:
     # Kelly stake at $500 bankroll — fraction scales with sub-model AUC
     combined_odds   = cand.get("combined_odds", 1.91)
     kelly_fraction  = _SUBMODEL_KELLY_FRACTION.get(dom_sport, _DEFAULT_KELLY_FRACTION)
-    p               = model_conf / 100.0
+    # Use dist_wp avg if available on legs, else fall back to model_conf
+    _dwps = [l.get("dist_wp") for l in cand.get("legs", []) if l.get("dist_wp")]
+    p = sum(_dwps) / len(_dwps) if _dwps else model_conf / 100.0
     b               = combined_odds - 1.0
     kelly_f         = max(0.0, (p * b - (1 - p)) / b)
     kelly_suggestion = round(kelly_f * kelly_fraction * 500, 2)   # $500 bankroll
@@ -3023,7 +3034,11 @@ def _build_fallback_parlays(
         combined_win  = 1.0
         for l in legs:
             combined_odds *= l["odds"]
-            combined_win  *= (l.get("win_prob", 50) / 100)
+            dwp = l.get("dist_wp")
+            if dwp is not None and dwp > 0:
+                combined_win *= dwp
+            else:
+                combined_win *= (l.get("win_prob", 50) / 100)
 
         # Minimum win_prob floor by depth — filters out high-variance longshots
         _WIN_FLOOR = {2: 0.20, 3: 0.12, 4: 0.08}
