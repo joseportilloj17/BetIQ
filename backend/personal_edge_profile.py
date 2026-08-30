@@ -100,10 +100,17 @@ _FD_COMP_TO_SPORT: dict[str, str] = {
     "NBA":                                "Basketball",
     "College Basketball Matches":         "Basketball",
     "Womens College Basketball Matches":  "Basketball",
+    "NCAAB Men Matches":                  "Basketball",
     "Major League Baseball":              "Major League Baseball",
     "Spanish La Liga":                    "Soccer",
     "UEFA Champions League":              "Soccer",
+    "English Premier League":             "Soccer",
+    "Italian Serie A":                    "Soccer",
+    "French Ligue 1":                     "Soccer",
+    "German Bundesliga":                  "Soccer",
+    "Spanish Copa Del Rey":               "Soccer",
     "NHL Games":                          "Ice Hockey",
+    "NFL":                                "American Football",
 }
 
 # ── FanDuel market_type → profile market_type mapping ────────────────────────
@@ -263,6 +270,9 @@ CREATE TABLE IF NOT EXISTS personal_edge_profile (
 #
 # AVOID:   wr < 0.55 OR mean_delta < 0 → excluded entirely.
 
+_MIN_N_FOR_CUSHION = 100   # CUSHION requires N>=100 (or non-negative CLV) for confirmation
+
+
 def compute_margin_grade(
     personal_wr:     Optional[float],
     mean_delta:      Optional[float],
@@ -271,26 +281,36 @@ def compute_margin_grade(
     sample_size:     int = 0,
     roi_pct:         Optional[float] = None,
     sport_roi_pct:   Optional[float] = None,
+    clv_pp:          Optional[float] = None,
+    concentrated:    bool = False,
 ) -> str:
     """
     Assign a margin quality grade.
 
-    PRIMARY metric: ROI (accounts for price — high WR at short odds can lose money).
-    SECONDARY: WR + delta (fallback when no ROI data available).
+    Hierarchy (segment-level ROI > sport demotion > WR fallback):
 
-    ROI-based grading (when roi_pct or sport_roi_pct is available):
-      best_roi < -15%  → AVOID  (proven money loser)
-      best_roi < -5%   → max grade = MIXED  (leaking money)
-      best_roi >= 0%   → eligible for CUSHION/CLOSE  (profitable segment)
-      best_roi >= 10%  → fast-track CUSHION if WR >= 0.60  (proven profitable)
+    1. SEGMENT-LEVEL ROI (roi_pct, from FanDuel flat-bet, per sport×market):
+       Full authority for both promotion and demotion — this is earned evidence.
+       Sport ROI acts as conservative floor via min() (demotion only).
 
-    WR fallback (when no ROI data):
-      CUSHION: wr >= 0.70 AND mean_delta > 0 AND (edge_ratio < 3.0 OR n < 15)
-      MIXED:   wr 0.55-0.65, OR (wr >= 0.65 AND edge_ratio >= 3.0 AND n >= 15)
-      CLOSE:   wr >= 0.65 (remaining)
-      AVOID:   wr < 0.55, or mean_delta < 0
+    2. SPORT-LEVEL ROI (sport_roi_pct, from parlay PnL) — DEMOTION ONLY:
+       Negative sport ROI caps the grade (safe direction). Positive sport ROI
+       CANNOT promote segments — parlay variance ≠ per-market skill.
+       For thin segments (N < 30): Bayesian shrinkage toward 0.
 
-    Min-N guard: N < 30 cannot produce AVOID (insufficient evidence → NEUTRAL).
+    3. WR + DELTA FALLBACK (when no ROI signal available).
+
+    Confirmation gate (CUSHION requires confirmed edge):
+      CUSHION: +ROI AND confirmed (N>=100 OR CLV>=0) AND not concentrated.
+      CLOSE:   +ROI but unconfirmed (N<100, OR CLV<0, OR concentrated).
+      MIXED:   negative ROI between -5% and -15%.
+      AVOID:   ROI < -15%.
+
+    Concentrated = >50% of FD legs from one team/selection.
+    CLV < 0 on soft markets (soccer) is a caution flag, not a kill switch:
+      it caps CUSHION → CLOSE but does NOT kill a +ROI segment.
+
+    Min-N guard: N < 30 cannot produce AVOID → NEUTRAL.
     """
     if personal_wr is None:
         return "AVOID"
@@ -301,41 +321,70 @@ def compute_margin_grade(
             return "NEUTRAL"
         return grade
 
-    # ── ROI-primary path ─────────────────────────────────────────────────
-    # When both ROI signals exist, use the WORSE (more conservative) one.
-    # This ensures a segment where the user actually loses money gets capped
-    # even if flat-bet simulation shows marginal profit (or vice versa).
-    if roi_pct is not None and sport_roi_pct is not None:
-        best_roi = min(roi_pct, sport_roi_pct)
-    else:
-        best_roi = roi_pct if roi_pct is not None else sport_roi_pct
-
-    if best_roi is not None:
-        if best_roi < -0.15:
-            return _guard_avoid("AVOID")
-
-        if best_roi < -0.05:
-            # Leaking money — cap at MIXED regardless of WR
-            return "MIXED"
-
-        if best_roi >= 0.10 and personal_wr is not None and personal_wr >= 0.60:
-            # Proven profitable + decent WR → fast-track CUSHION
+    # ── Confirmation gate: CUSHION requires confirmed edge ───────────────
+    # +ROI with warning signs (small N, negative CLV, concentration) = CLOSE.
+    # +ROI with confirmation (large N, non-negative CLV, diverse) = CUSHION.
+    def _confirm_cushion(grade: str) -> str:
+        if grade != "CUSHION":
+            return grade
+        confirmed = (
+            sample_size >= _MIN_N_FOR_CUSHION
+            or (clv_pp is not None and clv_pp >= 0.0)
+        ) and not concentrated
+        if confirmed:
             return "CUSHION"
+        return "CLOSE"  # +ROI earns a look, but unconfirmed → modest depth
 
-        if best_roi >= 0.0:
-            # Profitable but not dominant — use WR to distinguish CUSHION vs CLOSE
+    # Helper: grade from a resolved ROI value
+    def _grade_from_roi(roi: float) -> str:
+        if roi < -0.15:
+            return _guard_avoid("AVOID")
+        if roi < -0.05:
+            return "MIXED"
+        if roi >= 0.10 and personal_wr is not None and personal_wr >= 0.60:
+            return _confirm_cushion("CUSHION")
+        if roi >= 0.0:
             if (personal_wr is not None and personal_wr >= 0.70
                     and mean_delta is not None and mean_delta > 0
                     and (edge_ratio is None or edge_ratio < 3.0 or sample_size < 15)):
-                return "CUSHION"
+                return _confirm_cushion("CUSHION")
             if personal_wr is not None and personal_wr >= 0.65:
                 return "CLOSE"
             return "MIXED"
-
-        # best_roi between -15% and -5%: already handled above as MIXED
         return "MIXED"
 
-    # ── WR fallback (no ROI data available) ──────────────────────────────
+    # ── 1. Segment-level ROI (FanDuel flat-bet, per sport×market) ────────
+    if roi_pct is not None:
+        grade_roi = roi_pct
+        # Sport ROI as conservative floor (only makes things worse, never better)
+        if sport_roi_pct is not None and sport_roi_pct < roi_pct:
+            grade_roi = sport_roi_pct
+        return _grade_from_roi(grade_roi)
+
+    # ── 2. Sport-level ROI: DEMOTION ONLY (parlay-contaminated) ──────────
+    #   Positive sport ROI CANNOT promote — parlay variance, not segment skill.
+    #   Negative sport ROI: apply as demotion cap.
+    #   For thin segments (N < 30): shrink toward 0 (less confidence in demotion).
+    if sport_roi_pct is not None and sport_roi_pct < 0:
+        if sample_size < _MIN_N_FOR_AVOID:
+            # Bayesian shrinkage: prior weight decreases with segment evidence
+            shrink = float(_MIN_N_FOR_AVOID) / (sample_size + _MIN_N_FOR_AVOID)
+            effective = sport_roi_pct * shrink
+        else:
+            # Segment has enough legs — apply sport demotion fully
+            effective = sport_roi_pct
+
+        if effective < -0.15:
+            return _guard_avoid("AVOID")
+        if effective < -0.05:
+            return "MIXED"
+        # Between -5% and 0% after shrinkage: marginal, fall through to WR
+
+    # ── 3. WR + delta fallback ───────────────────────────────────────────
+    # No ROI data for this segment — grade by WR/delta but CAP at CLOSE.
+    # CUSHION requires ROI proof (segment-level): WR alone can be an
+    # illusion (basketball 79% WR / -6.6% ROI). Segments earn CUSHION
+    # via the segment-ROI path above, not here.
     if personal_wr < 0.55:
         return _guard_avoid("AVOID")
     if mean_delta is not None and mean_delta < 0:
@@ -344,7 +393,7 @@ def compute_margin_grade(
     if (personal_wr >= 0.70
             and mean_delta is not None and mean_delta > 0
             and (edge_ratio is None or edge_ratio < 3.0 or sample_size < 15)):
-        return "CUSHION"
+        return "CLOSE"  # would be CUSHION but capped: no ROI proof
 
     if (edge_ratio is not None and edge_ratio >= 3.0
             and sample_size >= 15 and personal_wr >= 0.65):
@@ -465,6 +514,80 @@ def _sport_roi_map(conn: sqlite3.Connection) -> dict[str, float]:
     return result
 
 
+def _clv_map(conn: sqlite3.Connection) -> dict[tuple[str, str], float]:
+    """
+    Compute mean CLV (pp) per (sport, market_type) from fanduel_soccer_clv.
+
+    Returns {(canonical_sport, "Moneyline"): mean_clv_pp}.
+    Only includes groups with scored CLV data.
+    """
+    try:
+        rows = conn.execute("""
+            SELECT competition, AVG(clv_pp) as mean_clv, COUNT(*) as n
+            FROM fanduel_soccer_clv
+            WHERE clv_pp IS NOT NULL
+            GROUP BY competition
+        """).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+
+    # N-weighted accumulation across competitions mapping to the same sport
+    accum: dict[tuple[str, str], list] = {}  # key → [sum_clv*n, total_n]
+    for comp, mean_clv, n in rows:
+        sport = _FD_COMP_TO_SPORT.get(comp)
+        if sport and mean_clv is not None:
+            key = (sport, "Moneyline")
+            if key not in accum:
+                accum[key] = [0.0, 0]
+            accum[key][0] += mean_clv * n
+            accum[key][1] += n
+
+    result: dict[tuple[str, str], float] = {}
+    for key, (weighted_sum, total_n) in accum.items():
+        if total_n > 0:
+            result[key] = weighted_sum / total_n
+    return result
+
+
+def _fd_concentration_map(conn: sqlite3.Connection) -> dict[tuple[str, str], bool]:
+    """
+    Check if >50% of FD legs for a (sport, market) are from one team/selection.
+
+    Returns {(canonical_sport, canonical_market): True} for concentrated segments.
+    A segment is concentrated if any single selection accounts for >50% of legs.
+    """
+    try:
+        rows = conn.execute("""
+            SELECT competition, market_type,
+                   REPLACE(selection, ' And Draw', '') as team,
+                   COUNT(*) as n
+            FROM fanduel_bet_legs
+            WHERE result IN ('WON', 'LOST')
+              AND original_price IS NOT NULL
+            GROUP BY competition, market_type, team
+        """).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+
+    # Accumulate per (sport, market) → {team: count}
+    from collections import defaultdict
+    team_counts: dict[tuple[str, str], dict[str, int]] = defaultdict(
+        lambda: defaultdict(int))
+    for comp, mkt, team, n in rows:
+        sport = _FD_COMP_TO_SPORT.get(comp)
+        market = _FD_MARKET_NORM.get(mkt)
+        if sport and market:
+            team_counts[(sport, market)][team] += n
+
+    result: dict[tuple[str, str], bool] = {}
+    for key, teams in team_counts.items():
+        total = sum(teams.values())
+        if total >= 10:  # only flag concentration when N is meaningful
+            max_share = max(teams.values()) / total
+            result[key] = max_share > 0.50
+    return result
+
+
 def _fanduel_roi_map(conn: sqlite3.Connection) -> dict[tuple[str, str], float]:
     """
     Compute per-(sport, market_type) flat-bet ROI from fanduel_bet_legs.
@@ -485,7 +608,6 @@ def _fanduel_roi_map(conn: sqlite3.Connection) -> dict[tuple[str, str], float]:
         WHERE result IN ('WON', 'LOST')
           AND original_price IS NOT NULL
         GROUP BY competition, market_type
-        HAVING COUNT(*) >= 5
     """).fetchall()
 
     # Accumulate by (sport, market) — sum weighted by N when multiple FD
@@ -523,6 +645,8 @@ def _personal_rows(
     conn: sqlite3.Connection,
     sport_roi: dict[str, float] | None = None,
     fd_roi: dict[tuple[str, str], float] | None = None,
+    clv_data: dict[tuple[str, str], float] | None = None,
+    concentration: dict[tuple[str, str], bool] | None = None,
 ) -> list[dict]:
     """
     Build profile rows directly from bet_legs (real bets, is_mock=0).
@@ -542,11 +666,16 @@ def _personal_rows(
     ROI: sport-level from bets table, leg-level from fanduel_bet_legs.
       ROI is the PRIMARY grading metric (accounts for price/odds).
 
+    CLV + concentration: used for the confirmation gate.
+      CUSHION requires confirmed edge (N>=100 OR CLV>=0) and not concentrated.
+
     Groups by sport × market_type. Line bucket derived from market_type.
     Minimum: _MIN_N_FOR_PROFILE unbiased legs to include a profile row.
     """
     sport_roi = sport_roi or {}
     fd_roi = fd_roi or {}
+    clv_data = clv_data or {}
+    concentration = concentration or {}
 
     # Fetch raw leg-level data for recency-weighted WR computation
     legs = conn.execute("""
@@ -656,14 +785,30 @@ def _personal_rows(
         nlr_f = (n_nlr / n_loss_delta) if n_loss_delta > 0 else None
 
         # ── Look up ROI ──────────────────────────────────────────────────
-        leg_roi = fd_roi.get((sport_norm, mt_norm))      # leg-level from FanDuel
+        leg_roi = fd_roi.get((sport_norm, mt_norm))      # segment-level from FanDuel
         sp_roi  = sport_roi.get(sport_norm)              # sport-level from bets
+
+        # ── Look up CLV + concentration for confirmation gate ────────────
+        seg_clv = clv_data.get((sport_norm, mt_norm))    # mean CLV (pp)
+        seg_conc = concentration.get((sport_norm, mt_norm), False)
+
+        # Track which signal drove the grade
+        if leg_roi is not None:
+            roi_source = "segment"  # FanDuel flat-bet per sport×market
+        elif sp_roi is not None and sp_roi < 0:
+            roi_source = "sport_demotion"  # sport ROI only (demotion cap)
+        elif sp_roi is not None:
+            roi_source = "wr_fallback"  # positive sport ROI ignored → WR
+        else:
+            roi_source = "wr_fallback"  # no ROI data at all → WR
 
         grade    = compute_margin_grade(
             float(wr), mean_d_f, er, ccr_f,
             sample_size=int(n_unbiased),
             roi_pct=leg_roi,
             sport_roi_pct=sp_roi,
+            clv_pp=seg_clv,
+            concentrated=seg_conc,
         )
         max_legs = compute_max_parlay_legs(mt_norm, float(wr), grade,
                                            mean_delta=mean_d_f, edge_ratio=er)
@@ -689,7 +834,10 @@ def _personal_rows(
             "sport_roi_pct":    round(sp_roi, 6) if sp_roi is not None else None,
             "roi_available":    roi_avail,
             "data_sources":     json.dumps({"bet_legs": int(n_unbiased),
-                                            "n_delta": int(n_delta or 0)}),
+                                            "n_delta": int(n_delta or 0),
+                                            "roi_source": roi_source,
+                                            "clv_pp": round(seg_clv, 2) if seg_clv is not None else None,
+                                            "concentrated": seg_conc}),
         })
     return result
 
@@ -711,11 +859,14 @@ def refresh_personal_edge_profiles(db=None, db_path: str = None) -> dict:
     try:
         _ensure_table(conn)
 
-        # Compute ROI maps before building profiles
+        # Compute ROI + CLV + concentration maps before building profiles
         sport_roi = _sport_roi_map(conn)
         fd_roi = _fanduel_roi_map(conn)
+        clv_data = _clv_map(conn)
+        conc_data = _fd_concentration_map(conn)
 
-        profiles = _personal_rows(conn, sport_roi=sport_roi, fd_roi=fd_roi)
+        profiles = _personal_rows(conn, sport_roi=sport_roi, fd_roi=fd_roi,
+                                  clv_data=clv_data, concentration=conc_data)
 
         # Seed rows: direction-split profiles for spread markets that have no real data.
         # These prevent positive-spread (+1.5/+2.5/+3.5) legs from inheriting the
