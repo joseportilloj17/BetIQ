@@ -94,6 +94,37 @@ def normalize_sport(sport: str) -> str:
     return _SPORT_NORM.get((sport or "").strip(), (sport or "").strip())
 
 
+# ── FanDuel competition → profile sport mapping ─────────────────────────────
+# Maps fanduel_bet_legs.competition to canonical profile sport names.
+_FD_COMP_TO_SPORT: dict[str, str] = {
+    "NBA":                                "Basketball",
+    "College Basketball Matches":         "Basketball",
+    "Womens College Basketball Matches":  "Basketball",
+    "Major League Baseball":              "Major League Baseball",
+    "Spanish La Liga":                    "Soccer",
+    "UEFA Champions League":              "Soccer",
+    "NHL Games":                          "Ice Hockey",
+}
+
+# ── FanDuel market_type → profile market_type mapping ────────────────────────
+_FD_MARKET_NORM: dict[str, str] = {
+    "MONEY_LINE":                "Moneyline",
+    "WIN-DRAW-WIN":              "Moneyline",
+    "DOUBLE_CHANCE":             "Moneyline",
+    "ALTERNATE_HANDICAPS":       "Spread",
+    "ALTERNATE_HANDICAP_1":      "Spread",
+    "MATCH_HANDICAP_(2-WAY)":    "Spread",
+    "ALTERNATE_RUN_LINES":       "Spread",
+    "ALTERNATE_PUCK_LINE":       "Spread",
+    "ALTERNATE_TOTAL_POINTS":    "Total",
+    "ALTERNATE_TOTAL_RUNS":      "Total",
+    "OVER_UNDER_25":             "Total",
+    "OVER_UNDER_15":             "Total",
+    # TOTAL_CORNERS, MATCH_SHOTS_ON_TARGET, PLAYER_*_SHOTS_ON_TARGET are
+    # props/exotics, not match totals — do NOT map to "Total"
+}
+
+
 # ── Market-type normalization ─────────────────────────────────────────────────
 # Converts odds-API market_key values to canonical market_type labels.
 _MARKET_NORM: dict[str, str] = {
@@ -238,43 +269,93 @@ def compute_margin_grade(
     edge_ratio:      Optional[float],
     close_call_rate: Optional[float],
     sample_size:     int = 0,
+    roi_pct:         Optional[float] = None,
+    sport_roi_pct:   Optional[float] = None,
 ) -> str:
     """
-    Assign a margin quality grade. Priority: AVOID → CUSHION → MIXED → CLOSE.
+    Assign a margin quality grade.
 
-    CUSHION: wr >= 0.70 AND mean_delta > 0 AND (edge_ratio < 3.0 OR n < 15)
-    MIXED:   wr 0.55-0.65, OR (wr >= 0.65 AND edge_ratio >= 3.0 AND n >= 15)
-    CLOSE:   wr >= 0.65 (remaining — positive/no delta, not CUSHION/MIXED)
-    AVOID:   wr < 0.55, or mean_delta < 0
+    PRIMARY metric: ROI (accounts for price — high WR at short odds can lose money).
+    SECONDARY: WR + delta (fallback when no ROI data available).
+
+    ROI-based grading (when roi_pct or sport_roi_pct is available):
+      best_roi < -15%  → AVOID  (proven money loser)
+      best_roi < -5%   → max grade = MIXED  (leaking money)
+      best_roi >= 0%   → eligible for CUSHION/CLOSE  (profitable segment)
+      best_roi >= 10%  → fast-track CUSHION if WR >= 0.60  (proven profitable)
+
+    WR fallback (when no ROI data):
+      CUSHION: wr >= 0.70 AND mean_delta > 0 AND (edge_ratio < 3.0 OR n < 15)
+      MIXED:   wr 0.55-0.65, OR (wr >= 0.65 AND edge_ratio >= 3.0 AND n >= 15)
+      CLOSE:   wr >= 0.65 (remaining)
+      AVOID:   wr < 0.55, or mean_delta < 0
+
+    Min-N guard: N < 30 cannot produce AVOID (insufficient evidence → NEUTRAL).
     """
     if personal_wr is None:
         return "AVOID"
-    if personal_wr < 0.55:
-        return "AVOID"
-    if mean_delta is not None and mean_delta < 0:
-        return "AVOID"
 
-    # CUSHION: solid WR + positive margin + not excessively volatile
-    # Small-n profiles (< 15 legs) pass even with unknown edge_ratio since we
-    # don't have enough data to disqualify them — confidence weight handles it.
+    # ── Min-N guard: small samples can't condemn a segment ────────────────
+    def _guard_avoid(grade: str) -> str:
+        if grade == "AVOID" and sample_size < _MIN_N_FOR_AVOID:
+            return "NEUTRAL"
+        return grade
+
+    # ── ROI-primary path ─────────────────────────────────────────────────
+    # When both ROI signals exist, use the WORSE (more conservative) one.
+    # This ensures a segment where the user actually loses money gets capped
+    # even if flat-bet simulation shows marginal profit (or vice versa).
+    if roi_pct is not None and sport_roi_pct is not None:
+        best_roi = min(roi_pct, sport_roi_pct)
+    else:
+        best_roi = roi_pct if roi_pct is not None else sport_roi_pct
+
+    if best_roi is not None:
+        if best_roi < -0.15:
+            return _guard_avoid("AVOID")
+
+        if best_roi < -0.05:
+            # Leaking money — cap at MIXED regardless of WR
+            return "MIXED"
+
+        if best_roi >= 0.10 and personal_wr is not None and personal_wr >= 0.60:
+            # Proven profitable + decent WR → fast-track CUSHION
+            return "CUSHION"
+
+        if best_roi >= 0.0:
+            # Profitable but not dominant — use WR to distinguish CUSHION vs CLOSE
+            if (personal_wr is not None and personal_wr >= 0.70
+                    and mean_delta is not None and mean_delta > 0
+                    and (edge_ratio is None or edge_ratio < 3.0 or sample_size < 15)):
+                return "CUSHION"
+            if personal_wr is not None and personal_wr >= 0.65:
+                return "CLOSE"
+            return "MIXED"
+
+        # best_roi between -15% and -5%: already handled above as MIXED
+        return "MIXED"
+
+    # ── WR fallback (no ROI data available) ──────────────────────────────
+    if personal_wr < 0.55:
+        return _guard_avoid("AVOID")
+    if mean_delta is not None and mean_delta < 0:
+        return _guard_avoid("AVOID")
+
     if (personal_wr >= 0.70
             and mean_delta is not None and mean_delta > 0
             and (edge_ratio is None or edge_ratio < 3.0 or sample_size < 15)):
         return "CUSHION"
 
-    # MIXED: volatile (high edge_ratio with sufficient sample to be certain),
-    # or borderline WR in 55-65% range
     if (edge_ratio is not None and edge_ratio >= 3.0
             and sample_size >= 15 and personal_wr >= 0.65):
         return "MIXED"
     if 0.55 <= personal_wr <= 0.65:
         return "MIXED"
 
-    # CLOSE: decent WR but insufficient/missing delta data, or WR in 65-70% range
     if personal_wr >= 0.65:
         return "CLOSE"
 
-    return "AVOID"
+    return _guard_avoid("AVOID")
 
 
 def compute_max_parlay_legs(
@@ -335,6 +416,9 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
         ("narrow_loss_rate",  "REAL"),
         ("margin_grade",      "TEXT"),
         ("max_parlay_legs",   "INTEGER NOT NULL DEFAULT 2"),
+        ("roi_pct",           "REAL"),
+        ("sport_roi_pct",     "REAL"),
+        ("roi_available",     "INTEGER DEFAULT 0"),
     ]
     for col, col_type in migrations:
         if col not in existing:
@@ -342,13 +426,104 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# ── ROI helpers ──────────────────────────────────────────────────────────────
+
+def _sport_roi_map(conn: sqlite3.Connection) -> dict[str, float]:
+    """
+    Compute sport-level ROI from single-sport settled bets.
+
+    Returns {canonical_sport_name: roi_fraction} (e.g. -0.066 for -6.6%).
+    Only includes sports with >= 5 settled bets. Multi-sport bets excluded
+    (sports LIKE '%|%') since ROI can't be attributed to a single sport.
+
+    Sport names from bets.sports are normalized via _SPORT_NORM and then
+    consolidated: "Ice Hockey" + "NHL Games" merge to "Ice Hockey".
+    """
+    rows = conn.execute("""
+        SELECT sports, SUM(amount) as wagered, SUM(profit) as profit, COUNT(*) as n
+        FROM bets
+        WHERE is_mock = 0
+          AND status IN ('SETTLED_WIN', 'SETTLED_LOSS')
+          AND sports NOT LIKE '%|%'
+        GROUP BY sports
+        HAVING COUNT(*) >= 5
+    """).fetchall()
+
+    # Accumulate by canonical sport (handles Ice Hockey / NHL Games merge)
+    accum: dict[str, list[float]] = {}  # sport → [wagered, profit]
+    for sport_raw, wagered, profit, n in rows:
+        sport_norm = normalize_sport(sport_raw or "")
+        if sport_norm not in accum:
+            accum[sport_norm] = [0.0, 0.0]
+        accum[sport_norm][0] += float(wagered or 0)
+        accum[sport_norm][1] += float(profit or 0)
+
+    result = {}
+    for sport, (wagered, profit) in accum.items():
+        if wagered > 0:
+            result[sport] = profit / wagered
+    return result
+
+
+def _fanduel_roi_map(conn: sqlite3.Connection) -> dict[tuple[str, str], float]:
+    """
+    Compute per-(sport, market_type) flat-bet ROI from fanduel_bet_legs.
+
+    Flat-bet ROI: simulate $1 straight bet per leg.
+      WON  → profit = original_price - 1.0 (decimal odds payout minus stake)
+      LOST → profit = -1.0
+
+    Returns {(canonical_sport, canonical_market_type): roi_fraction}.
+    Only includes groups with >= 5 settled legs. Uses original_price (pre-SGP
+    adjustment) since that reflects the fair single-leg pricing.
+    """
+    rows = conn.execute("""
+        SELECT competition, market_type, COUNT(*) as n,
+               AVG(CASE WHEN result = 'WON' THEN original_price - 1.0
+                        WHEN result = 'LOST' THEN -1.0 END) as flat_roi
+        FROM fanduel_bet_legs
+        WHERE result IN ('WON', 'LOST')
+          AND original_price IS NOT NULL
+        GROUP BY competition, market_type
+        HAVING COUNT(*) >= 5
+    """).fetchall()
+
+    # Accumulate by (sport, market) — sum weighted by N when multiple FD
+    # market types map to the same canonical pair (e.g. NBA ALTERNATE_HANDICAPS
+    # + NBA MATCH_HANDICAP → (Basketball, Spread))
+    accum: dict[tuple[str, str], list[float]] = {}  # key → [sum_roi*n, total_n]
+    for comp, mkt, n, flat_roi in rows:
+        sport = _FD_COMP_TO_SPORT.get(comp)
+        market = _FD_MARKET_NORM.get(mkt)
+        if sport and market and flat_roi is not None:
+            key = (sport, market)
+            if key not in accum:
+                accum[key] = [0.0, 0]
+            accum[key][0] += float(flat_roi) * n
+            accum[key][1] += n
+
+    result = {}
+    for key, (weighted_sum, total_n) in accum.items():
+        # Only use FanDuel ROI when total N >= 30 for the (sport, market)
+        # pair — smaller samples are unreliable and would override more
+        # representative sport-level ROI
+        if total_n >= 30:
+            result[key] = weighted_sum / total_n
+    return result
+
+
 # ── Data builders ─────────────────────────────────────────────────────────────
 # Minimum sample sizes for profile inclusion
 _MIN_N_FOR_PROFILE = 5    # must have at least 5 unbiased legs to include
 _MIN_N_FOR_DELTA   = 3    # must have at least 3 legs with accuracy_delta
+_MIN_N_FOR_AVOID   = 30   # below this, AVOID grade → NEUTRAL (insufficient evidence)
 
 
-def _personal_rows(conn: sqlite3.Connection) -> list[dict]:
+def _personal_rows(
+    conn: sqlite3.Connection,
+    sport_roi: dict[str, float] | None = None,
+    fd_roi: dict[tuple[str, str], float] | None = None,
+) -> list[dict]:
     """
     Build profile rows directly from bet_legs (real bets, is_mock=0).
 
@@ -357,62 +532,104 @@ def _personal_rows(conn: sqlite3.Connection) -> list[dict]:
         Baseball Moneyline to 100% WR. Those legs have 0 accuracy_delta and were
         inferred as WIN because all other legs in the parlay won — not a real signal.
 
+    Recency weighting: WR is computed with exponential decay
+      weight = exp(-days_since / 365). Recent bets count more; half-life ≈253 days.
+
     Margin metrics: legs WHERE accuracy_delta IS NOT NULL
       — historical_db and soccer_api resolutions provide real game outcome margins.
       — accuracy_delta = actual_outcome_value - bet_line (positive = won by that margin)
 
+    ROI: sport-level from bets table, leg-level from fanduel_bet_legs.
+      ROI is the PRIMARY grading metric (accounts for price/odds).
+
     Groups by sport × market_type. Line bucket derived from market_type.
     Minimum: _MIN_N_FOR_PROFILE unbiased legs to include a profile row.
     """
-    rows = conn.execute("""
+    sport_roi = sport_roi or {}
+    fd_roi = fd_roi or {}
+
+    # Fetch raw leg-level data for recency-weighted WR computation
+    legs = conn.execute("""
         SELECT
-            -- Normalize "NHL Games" Moneyline → "Ice Hockey" so the 6 NHL ML legs
-            -- land in the same group as any "Ice Hockey" Moneyline legs.
-            -- NOTE: Only normalize Moneyline — NHL Games Total (3 legs, 33% WR) is
-            -- intentionally kept SEPARATE so it doesn't corrupt Ice Hockey Total
-            -- (9 legs, 77.8% WR). With n=3 it falls below min_n and gets excluded.
             CASE
                 WHEN bl.sport = 'NHL Games' AND bl.market_type = 'Moneyline'
                 THEN 'Ice Hockey'
                 ELSE bl.sport
             END as sport,
             bl.market_type,
-            COUNT(*) as n_unbiased,
-            AVG(CASE WHEN bl.leg_result='WIN' THEN 1.0 ELSE 0.0 END) as wr,
-            COUNT(CASE WHEN bl.accuracy_delta IS NOT NULL THEN 1 END) as n_delta,
-            AVG(CASE WHEN bl.accuracy_delta IS NOT NULL THEN bl.accuracy_delta END) as mean_d,
-            AVG(CASE WHEN bl.accuracy_delta IS NOT NULL
-                     THEN bl.accuracy_delta * bl.accuracy_delta END) as mean_sq,
-            -- close_call_rate: % of WINS with |delta| < 0.5 (narrow wins)
-            AVG(CASE WHEN bl.leg_result='WIN' AND bl.accuracy_delta IS NOT NULL
-                     AND ABS(bl.accuracy_delta) < 0.5 THEN 1.0 ELSE 0.0 END) as ccr,
-            -- narrow_loss_rate: % of LOSSES with |delta| < 0.5 (near-miss losses)
-            AVG(CASE WHEN bl.leg_result='LOSS' AND bl.accuracy_delta IS NOT NULL
-                     AND ABS(bl.accuracy_delta) < 0.5 THEN 1.0 ELSE 0.0 END) as nlr
+            bl.leg_result,
+            bl.accuracy_delta,
+            b.time_placed
         FROM bet_legs bl
         JOIN bets b ON bl.bet_id = b.id
         WHERE b.is_mock = 0
           AND bl.resolution_source != 'inferred_parlay_win'
           AND bl.leg_result IN ('WIN', 'LOSS')
-          AND COALESCE(bl.excluded_from_metrics, 0) = 0
-        GROUP BY
-            CASE
-                WHEN bl.sport = 'NHL Games' AND bl.market_type = 'Moneyline'
-                THEN 'Ice Hockey'
-                ELSE bl.sport
-            END,
-            bl.market_type
-        HAVING COUNT(*) >= :min_n
-    """, {"min_n": _MIN_N_FOR_PROFILE}).fetchall()
+    """).fetchall()
 
+    # Group by (sport, market_type)
+    from collections import defaultdict
+    groups: dict[tuple[str, str], list] = defaultdict(list)
+    for sport_raw, mt, leg_result, acc_delta, time_placed in legs:
+        groups[(sport_raw or "", mt or "")].append(
+            (leg_result, acc_delta, time_placed)
+        )
+
+    now = datetime.utcnow()
     result = []
-    for r in rows:
-        sport, mt, n_unbiased, wr, n_delta, mean_d, mean_sq, ccr, nlr = r
+    for (sport_raw, mt), leg_list in groups.items():
+        n_unbiased = len(leg_list)
+        if n_unbiased < _MIN_N_FOR_PROFILE:
+            continue
 
-        sport_norm = normalize_sport(sport or "")
-        mt_norm    = normalize_market(mt or "")
+        sport_norm = normalize_sport(sport_raw)
+        mt_norm    = normalize_market(mt)
 
-        # Line bucket from market_type alone (no line value in this aggregation)
+        # ── Recency-weighted WR ──────────────────────────────────────────
+        sum_w = 0.0
+        sum_w_win = 0.0
+        n_delta = 0
+        deltas = []
+        delta_sqs = []
+        n_ccr = 0  # close-call wins (delta < 0.5)
+        n_win_delta = 0
+        n_nlr = 0  # narrow losses (delta > -0.5)
+        n_loss_delta = 0
+
+        for leg_result, acc_delta, time_placed in leg_list:
+            # Compute recency weight
+            days_since = 365.0  # default if no timestamp
+            if time_placed:
+                try:
+                    placed = datetime.fromisoformat(
+                        str(time_placed).replace("Z", "+00:00").replace("+00:00", "")
+                    )
+                    days_since = max(0.0, (now - placed).total_seconds() / 86400.0)
+                except (ValueError, TypeError):
+                    pass
+            weight = math.exp(-days_since / 365.0)
+
+            is_win = 1.0 if leg_result == "WIN" else 0.0
+            sum_w += weight
+            sum_w_win += weight * is_win
+
+            # Delta stats (unweighted — delta is about margin magnitude, not recency)
+            if acc_delta is not None:
+                n_delta += 1
+                deltas.append(float(acc_delta))
+                delta_sqs.append(float(acc_delta) ** 2)
+                if leg_result == "WIN":
+                    n_win_delta += 1
+                    if abs(float(acc_delta)) < 0.5:
+                        n_ccr += 1
+                elif leg_result == "LOSS":
+                    n_loss_delta += 1
+                    if abs(float(acc_delta)) < 0.5:
+                        n_nlr += 1
+
+        wr = sum_w_win / sum_w if sum_w > 0 else 0.0
+
+        # Line bucket from market_type alone
         if mt_norm == "Moneyline":
             bucket = "ML"
         elif mt_norm in ("Spread", "Run Line", "Alt Spread"):
@@ -424,23 +641,34 @@ def _personal_rows(conn: sqlite3.Connection) -> list[dict]:
         else:
             bucket = mt_norm or "Other"
 
-        # Compute std_delta and edge_ratio from mean/mean_sq aggregates
-        mean_d_f = float(mean_d) if (mean_d is not None and n_delta >= _MIN_N_FOR_DELTA) else None
+        # Compute std_delta and edge_ratio
+        mean_d_f = (sum(deltas) / n_delta) if n_delta >= _MIN_N_FOR_DELTA else None
         std_d_f  = None
         er       = None
-        if mean_d_f is not None and mean_sq is not None and n_delta >= 2:
-            variance = float(mean_sq) - mean_d_f ** 2
+        if mean_d_f is not None and n_delta >= 2:
+            mean_sq = sum(delta_sqs) / n_delta
+            variance = mean_sq - mean_d_f ** 2
             std_d_f  = math.sqrt(max(0.0, variance))
             if abs(mean_d_f) > 0.01:
                 er = round(std_d_f / abs(mean_d_f), 3)
 
-        ccr_f = float(ccr) if ccr is not None else None
-        nlr_f = float(nlr) if nlr is not None else None
+        ccr_f = (n_ccr / n_win_delta) if n_win_delta > 0 else None
+        nlr_f = (n_nlr / n_loss_delta) if n_loss_delta > 0 else None
 
-        grade    = compute_margin_grade(float(wr), mean_d_f, er, ccr_f,
-                                      sample_size=int(n_unbiased))
+        # ── Look up ROI ──────────────────────────────────────────────────
+        leg_roi = fd_roi.get((sport_norm, mt_norm))      # leg-level from FanDuel
+        sp_roi  = sport_roi.get(sport_norm)              # sport-level from bets
+
+        grade    = compute_margin_grade(
+            float(wr), mean_d_f, er, ccr_f,
+            sample_size=int(n_unbiased),
+            roi_pct=leg_roi,
+            sport_roi_pct=sp_roi,
+        )
         max_legs = compute_max_parlay_legs(mt_norm, float(wr), grade,
                                            mean_delta=mean_d_f, edge_ratio=er)
+
+        roi_avail = 1 if (leg_roi is not None or sp_roi is not None) else 0
 
         result.append({
             "sport":            sport_norm,
@@ -457,6 +685,9 @@ def _personal_rows(conn: sqlite3.Connection) -> list[dict]:
             "max_parlay_legs":  max_legs,
             "avg_odds":         None,
             "avg_ev":           None,
+            "roi_pct":          round(leg_roi, 6) if leg_roi is not None else None,
+            "sport_roi_pct":    round(sp_roi, 6) if sp_roi is not None else None,
+            "roi_available":    roi_avail,
             "data_sources":     json.dumps({"bet_legs": int(n_unbiased),
                                             "n_delta": int(n_delta or 0)}),
         })
@@ -479,7 +710,12 @@ def refresh_personal_edge_profiles(db=None, db_path: str = None) -> dict:
     conn = sqlite3.connect(path)
     try:
         _ensure_table(conn)
-        profiles = _personal_rows(conn)
+
+        # Compute ROI maps before building profiles
+        sport_roi = _sport_roi_map(conn)
+        fd_roi = _fanduel_roi_map(conn)
+
+        profiles = _personal_rows(conn, sport_roi=sport_roi, fd_roi=fd_roi)
 
         # Seed rows: direction-split profiles for spread markets that have no real data.
         # These prevent positive-spread (+1.5/+2.5/+3.5) legs from inheriting the
@@ -538,6 +774,9 @@ def refresh_personal_edge_profiles(db=None, db_path: str = None) -> dict:
                 "max_parlay_legs":   row.get("max_parlay_legs", 2),
                 "avg_odds":          row.get("avg_odds"),
                 "avg_ev":            row.get("avg_ev"),
+                "roi_pct":           row.get("roi_pct"),
+                "sport_roi_pct":     row.get("sport_roi_pct"),
+                "roi_available":     row.get("roi_available", 0),
                 "data_sources":      row.get("data_sources"),
                 "last_updated":      now,
             }
@@ -546,11 +785,13 @@ def refresh_personal_edge_profiles(db=None, db_path: str = None) -> dict:
                     (sport, market_type, line_bucket, sample_size, personal_wr,
                      mean_delta, std_delta, edge_ratio, close_call_rate,
                      narrow_loss_rate, margin_grade, max_parlay_legs,
-                     avg_odds, avg_ev, data_sources, last_updated)
+                     avg_odds, avg_ev, roi_pct, sport_roi_pct, roi_available,
+                     data_sources, last_updated)
                 VALUES (:sport, :market_type, :line_bucket, :sample_size, :personal_wr,
                         :mean_delta, :std_delta, :edge_ratio, :close_call_rate,
                         :narrow_loss_rate, :margin_grade, :max_parlay_legs,
-                        :avg_odds, :avg_ev, :data_sources, :last_updated)
+                        :avg_odds, :avg_ev, :roi_pct, :sport_roi_pct, :roi_available,
+                        :data_sources, :last_updated)
                 ON CONFLICT(sport, market_type, line_bucket) DO UPDATE SET
                     sample_size       = excluded.sample_size,
                     personal_wr       = excluded.personal_wr,
@@ -563,6 +804,9 @@ def refresh_personal_edge_profiles(db=None, db_path: str = None) -> dict:
                     max_parlay_legs   = excluded.max_parlay_legs,
                     avg_odds          = excluded.avg_odds,
                     avg_ev            = excluded.avg_ev,
+                    roi_pct           = excluded.roi_pct,
+                    sport_roi_pct     = excluded.sport_roi_pct,
+                    roi_available     = excluded.roi_available,
                     data_sources      = excluded.data_sources,
                     last_updated      = excluded.last_updated
             """, params)
