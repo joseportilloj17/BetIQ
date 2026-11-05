@@ -216,6 +216,71 @@ else:
     print("\nFAIL: No forward preds found for this date")
     graded = None
 
+# ── 6. Model ↔ player_props join match rate ──────────────────────────────────
+print(f"\n6. Model ↔ Player Props (Odds API) Name Match Rate:")
+# Get distinct player names from forward preds (scout snapshot)
+fp_players = hcon.execute("""
+    SELECT DISTINCT player_name FROM nba_forward_preds
+    WHERE game_date = ? AND snapshot_type = 'scout'
+""", (target_date,)).fetchall()
+fp_names = {r['player_name'] for r in fp_players}
+
+# Get distinct player names from player_props for same date
+pp_players = hcon.execute("""
+    SELECT DISTINCT player_name FROM player_props
+    WHERE game_date = ? AND sport_key = 'basketball_nba'
+""", (target_date,)).fetchall()
+pp_names = {r['player_name'] for r in pp_players}
+
+if fp_names and pp_names:
+    matched = fp_names & pp_names
+    fp_only = fp_names - pp_names
+    pp_only = pp_names - fp_names
+    print(f"   Forward preds players: {len(fp_names)}")
+    print(f"   Player props players:  {len(pp_names)}")
+    print(f"   Exact match:           {len(matched)} ({100*len(matched)/len(fp_names):.0f}%)")
+    if fp_only:
+        print(f"   In model but NOT in props ({len(fp_only)}):")
+        for n in sorted(fp_only):
+            print(f"     - {n}")
+    if pp_only and len(pp_only) <= 20:
+        print(f"   In props but NOT in model ({len(pp_only)}):")
+        for n in sorted(pp_only):
+            print(f"     - {n}")
+    elif pp_only:
+        print(f"   In props but NOT in model: {len(pp_only)} players (too many to list)")
+else:
+    print("   SKIP: No forward pred or player prop names to compare")
+
+# ── 7. Alias table status ────────────────────────────────────────────────────
+print(f"\n7. Alias Table:")
+alias_tbl = hcon.execute(
+    "SELECT name FROM sqlite_master WHERE name='nba_player_alias'"
+).fetchone()
+if alias_tbl:
+    alias_rows = hcon.execute("SELECT * FROM nba_player_alias").fetchall()
+    print(f"   {len(alias_rows)} alias entries")
+    for a in alias_rows:
+        print(f"     {a['alias_name']:25s} → {a['canonical_name']:25s}  "
+              f"(bdl_id={a['bdl_player_id']}, src={a['source']})")
+else:
+    print("   WARNING: nba_player_alias table does not exist")
+
+# ── 8. bdl_player_id fill rate ───────────────────────────────────────────────
+print(f"\n8. bdl_player_id Fill Rate:")
+bdl_fill = hcon.execute("""
+    SELECT COUNT(*) total,
+           SUM(CASE WHEN bdl_player_id IS NOT NULL THEN 1 ELSE 0 END) filled
+    FROM nba_forward_preds WHERE game_date = ?
+""", (target_date,)).fetchone()
+if bdl_fill and bdl_fill['total'] > 0:
+    pct = 100 * (bdl_fill['filled'] or 0) / bdl_fill['total']
+    print(f"   {bdl_fill['filled']}/{bdl_fill['total']} rows have bdl_player_id ({pct:.0f}%)")
+    if pct < 50:
+        print("   NOTE: Low fill expected on day 1 (game_logs may not exist yet at scout time)")
+else:
+    print("   No rows to check")
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 print(f"\n=== Chain status for {target_date} ===")
 chain = []

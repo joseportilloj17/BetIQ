@@ -1,6 +1,6 @@
 # NBA Prop Model — Open Items
 
-Last updated: 2026-10-30
+Last updated: 2026-11-05
 
 ## B1: Minutes Model — ALL COMPLETE
 
@@ -935,7 +935,8 @@ Devig: Two-sided (over+under pair → proportional vig removal) when both sides 
 |---|------|--------|-------|
 | INFRA-1 | Archive pre-season/closed-season odds data | NOT STARTED | Move rows from player_props/alt_lines where sport is off-season into data/props_archive.db (same schema, indexed by sport/date). Trigger: 10 GB free-disk warning (~6 months at peak growth, ~250 MB/week). Runway at 17.8 GB free: ~14 months without archive. |
 | INFRA-2 | Persist nightly maintenance results | DONE | maintenance_log table in bets.db (run_date, result_json, has_errors). 30-day retention. Written at end of _run_db_maintenance(). |
-| INFRA-3 | Store NBA sim P(over) at scout time | DONE | nba_forward_preds table in historical.db. Written at scout (9 AM) and pre-tip (30-60 min before tip). Grading wired (runs after nightly_ats). Oct 30–Nov 5 reconstruction LOST: scouted_props stop at Oct 24, player_props missing Oct 30/Nov 2–4, fixtures gap Nov 1–4, and retroactive sim would use current model (contaminated). Forward capture starts Nov 6 (next scout run). |
+| INFRA-3 | Store NBA sim P(over) at scout time | DONE | nba_forward_preds table in historical.db. Written at scout (9 AM) and pre-tip (30-60 min before tip). Grading wired (runs after nightly_ats) with 3-tier resolution: bdl_player_id → alias table → normalized name. `nba_player_alias` table (7 seed aliases) resolves Odds API ↔ BDL name mismatches. `bdl_player_id` column populated at persist time. Smoke test (`s5_2_smoke_test.py`) reports: chain status, match rates (model ↔ player_props), unmatched names, alias table, bdl fill rate. Oct 30–Nov 5 reconstruction LOST (see S5-2). Forward capture starts Nov 6. |
+| INFRA-4 | Repo security: make private + rotate leaked keys | **CRITICAL** | Repo is PUBLIC (`gh repo view --json isPrivate` = false). Two hardcoded API keys in working tree + git history: TheOddsAPI (`a2b68e…018a22`) in 3 backfill scripts, BallDontLie (`81b9ac…57bd`) in data_fetcher.py. **Action needed**: (1) `gh repo edit --visibility private`, (2) rotate both keys on provider dashboards, (3) replace hardcoded values with `os.environ.get()`. Git history exposure means rotation is mandatory even after making repo private. |
 
 ## NFL Items (from existing plan)
 

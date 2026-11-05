@@ -24,7 +24,15 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
 # ── Config ──────────────────────────────────────────────────────────────────
-API_KEY = "REDACTED_ODDS_API_KEY"
+API_KEY = os.environ.get("ODDS_API_KEY", "")
+if not API_KEY:
+    try:
+        from config import ODDS_API_KEY as _cfg_key
+        API_KEY = _cfg_key
+    except Exception:
+        pass
+if not API_KEY:
+    raise RuntimeError("ODDS_API_KEY not set — export it or add to backend/.env")
 BASE_URL = "https://api.the-odds-api.com"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 HIST_DB = os.path.join(DATA_DIR, "historical.db")

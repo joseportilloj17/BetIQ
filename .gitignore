@@ -12,6 +12,8 @@ build/
 # Environment & secrets
 .env
 .env.*
+!.env.example
+!backend/.env.example
 config.py
 backend/config.py
 verify_keys.py
@@ -67,6 +69,8 @@ server_foreground.sh
 *_out.txt
 *_stderr.txt
 
-# One-off scratch scripts (root level)
+# One-off scratch / test scripts
 rfa.py
 stage4_*.py
+test_odds.py
+backend/test_odds.py.txt

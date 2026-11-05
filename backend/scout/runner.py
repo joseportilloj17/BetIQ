@@ -256,9 +256,31 @@ CREATE TABLE IF NOT EXISTS nba_forward_preds (
     actual_hit INTEGER,
     graded_at TEXT,
     is_reconstructed INTEGER DEFAULT 0,
-    player_name_norm TEXT
+    player_name_norm TEXT,
+    bdl_player_id INTEGER
 )
 """
+
+_NBA_ALIAS_DDL = """
+CREATE TABLE IF NOT EXISTS nba_player_alias (
+    alias_name TEXT NOT NULL,
+    canonical_name TEXT NOT NULL,
+    bdl_player_id INTEGER,
+    source TEXT DEFAULT 'manual',
+    PRIMARY KEY (alias_name)
+)
+"""
+
+# Seed aliases for known Odds API ↔ BDL mismatches
+_SEED_ALIASES = [
+    ("A.J. Green",         "AJ Green",           1631260),
+    ("C.J. McCollum",      "CJ McCollum",         203468),
+    ("Carlton Carrington", "Bub Carrington",     1642267),
+    ("G.G. Jackson",       "GG Jackson",         1641713),
+    ("Herb Jones",         "Herbert Jones",      1630529),
+    ("R.J. Barrett",       "RJ Barrett",         1629628),
+    ("Ron Holland",        "Ronald Holland II",  1641842),
+]
 
 
 def _normalize_player_name(name: str | None) -> str | None:
@@ -282,7 +304,7 @@ def _normalize_player_name(name: str | None) -> str | None:
 
 
 def _ensure_nba_forward_preds_table():
-    """Create nba_forward_preds + indexes in historical.db if not exists."""
+    """Create nba_forward_preds + alias table + indexes in historical.db."""
     import os, sqlite3
     hist_path = os.path.join(os.path.dirname(__file__), "..", "..", "data",
                              "historical.db")
@@ -296,8 +318,58 @@ def _ensure_nba_forward_preds_table():
                 "ON nba_forward_preds(game_id, player_name, stat_type)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_nfp_ungraded "
                 "ON nba_forward_preds(game_date) WHERE actual_hit IS NULL")
+    # Add bdl_player_id column if table existed before this column was added
+    try:
+        con.execute("ALTER TABLE nba_forward_preds ADD COLUMN bdl_player_id INTEGER")
+    except Exception:
+        pass  # column already exists
+    # Alias table for Odds API ↔ BDL name mismatches
+    con.execute(_NBA_ALIAS_DDL)
+    for alias, canonical, bdl_id in _SEED_ALIASES:
+        con.execute(
+            "INSERT OR IGNORE INTO nba_player_alias "
+            "(alias_name, canonical_name, bdl_player_id, source) "
+            "VALUES (?, ?, ?, 'seed')",
+            (alias, canonical, bdl_id),
+        )
     con.commit()
     con.close()
+
+
+def _resolve_bdl_player_id(con, player_name: str, game_date: str) -> int | None:
+    """Look up BDL player_id via alias table, then fall back to game_logs norm match.
+
+    Returns bdl_player_id (int) or None.
+    """
+    # 1. Check alias table (exact match on Odds API name)
+    row = con.execute(
+        "SELECT bdl_player_id FROM nba_player_alias WHERE alias_name = ?",
+        (player_name,),
+    ).fetchone()
+    if row and row[0]:
+        return row[0]
+
+    # 2. Fall back: match normalized name against game_logs for this date
+    norm = _normalize_player_name(player_name)
+    if not norm:
+        return None
+    row = con.execute(
+        "SELECT player_id FROM nba_player_game_logs "
+        "WHERE game_date = ? LIMIT 1",
+        (game_date,),
+    ).fetchone()
+    # If game_logs exist for the date, try matching by normalized name
+    if row:
+        # nba_player_game_logs has player_name; match on normalized
+        rows = con.execute(
+            "SELECT DISTINCT player_id, player_name FROM nba_player_game_logs "
+            "WHERE game_date = ?",
+            (game_date,),
+        ).fetchall()
+        for r in rows:
+            if _normalize_player_name(r[1]) == norm:
+                return r[0]
+    return None
 
 
 def _persist_nba_forward_preds(
@@ -354,6 +426,9 @@ def _persist_nba_forward_preds(
     except Exception:
         game_date = (game.commence_time or "")[:10]
 
+    # Pre-build alias lookup (Odds API name → bdl_player_id) for this batch
+    _alias_cache: dict[str, int | None] = {}
+
     count = 0
     for p in props:
         if p.sport != "NBA":
@@ -371,6 +446,12 @@ def _persist_nba_forward_preds(
         except (KeyError, Exception):
             continue
 
+        # Resolve bdl_player_id (cached per player within this batch)
+        pname = p.player_name
+        if pname not in _alias_cache:
+            _alias_cache[pname] = _resolve_bdl_player_id(con, pname, game_date)
+        bdl_pid = _alias_cache[pname]
+
         con.execute("""
             INSERT INTO nba_forward_preds (
                 game_date, game_id, home_team, away_team,
@@ -381,8 +462,8 @@ def _persist_nba_forward_preds(
                 model_version, config_hash, n_draws,
                 hours_to_tip, snapshot_type, created_at,
                 player_injury_status, injury_context_json,
-                is_reconstructed, player_name_norm
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                is_reconstructed, player_name_norm, bdl_player_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             game_date, p.game_id, p.home_team, p.away_team,
             market_total, market_spread,
@@ -397,6 +478,7 @@ def _persist_nba_forward_preds(
             inj_json,
             0,
             _normalize_player_name(p.player_name),
+            bdl_pid,
         ))
         count += 1
 
@@ -421,7 +503,11 @@ _STAT_COL_MAP = {
 def grade_nba_forward_preds() -> dict:
     """Grade ungraded rows in nba_forward_preds from nba_player_game_logs.
 
-    Matches on normalized player_name + game_date (ET dates in both tables).
+    Resolution order for matching:
+      1. bdl_player_id (if stored) → game_logs.player_id
+      2. Alias table: alias_name → canonical norm → game_logs norm
+      3. Normalized name direct match
+
     Sets actual_value, actual_hit, graded_at.  Returns summary dict.
     """
     import os
@@ -443,6 +529,20 @@ def grade_nba_forward_preds() -> dict:
         con.close()
         return {"graded": 0, "ungraded_remaining": 0, "note": "table not created yet"}
 
+    # Load alias table once (alias_name → canonical_name norm)
+    alias_map: dict[str, str] = {}  # normalized alias → normalized canonical
+    try:
+        aliases = con.execute(
+            "SELECT alias_name, canonical_name FROM nba_player_alias"
+        ).fetchall()
+        for a in aliases:
+            anorm = _normalize_player_name(a["alias_name"])
+            cnorm = _normalize_player_name(a["canonical_name"])
+            if anorm and cnorm:
+                alias_map[anorm] = cnorm
+    except Exception:
+        pass  # alias table may not exist yet on first run
+
     # Get distinct game_dates with ungraded preds
     dates = con.execute("""
         SELECT DISTINCT game_date FROM nba_forward_preds
@@ -459,7 +559,7 @@ def grade_nba_forward_preds() -> dict:
     for (gdate,) in dates:
         # Fetch all game logs for this date
         logs = con.execute("""
-            SELECT player_name, pts, reb, ast, fg3m, stl, blk
+            SELECT player_id, player_name, pts, reb, ast, fg3m, stl, blk
             FROM nba_player_game_logs
             WHERE game_date = ?
         """, (gdate,)).fetchall()
@@ -467,19 +567,24 @@ def grade_nba_forward_preds() -> dict:
         if not logs:
             continue
 
-        # Build lookup: normalized_name -> {col: value}
-        log_map: dict = {}
+        # Build lookups: norm_name → stats, bdl_player_id → stats
+        log_map_norm: dict = {}
+        log_map_id: dict = {}
         for row in logs:
+            stats = {
+                "pts": row["pts"], "reb": row["reb"], "ast": row["ast"],
+                "fg3m": row["fg3m"], "stl": row["stl"], "blk": row["blk"],
+            }
             norm = _normalize_player_name(row["player_name"])
             if norm:
-                log_map[norm] = {
-                    "pts": row["pts"], "reb": row["reb"], "ast": row["ast"],
-                    "fg3m": row["fg3m"], "stl": row["stl"], "blk": row["blk"],
-                }
+                log_map_norm[norm] = stats
+            if row["player_id"]:
+                log_map_id[row["player_id"]] = stats
 
         # Get ungraded preds for this date
         preds = con.execute("""
-            SELECT id, player_name, player_name_norm, stat_type, line, side
+            SELECT id, player_name, player_name_norm, stat_type, line, side,
+                   bdl_player_id
             FROM nba_forward_preds
             WHERE game_date = ? AND actual_hit IS NULL
         """, (gdate,)).fetchall()
@@ -487,13 +592,25 @@ def grade_nba_forward_preds() -> dict:
         now_str = datetime.now(timezone.utc).isoformat()
 
         for pred in preds:
-            # Use stored norm if available, else compute on the fly
-            norm = pred["player_name_norm"] or _normalize_player_name(pred["player_name"])
             stat_type = pred["stat_type"]
             line = pred["line"]
             side = pred["side"]
 
-            if norm not in log_map:
+            # Resolution: bdl_player_id → alias → normalized name
+            plog = None
+            bdl_pid = pred["bdl_player_id"]
+            if bdl_pid and bdl_pid in log_map_id:
+                plog = log_map_id[bdl_pid]
+            else:
+                norm = pred["player_name_norm"] or _normalize_player_name(pred["player_name"])
+                # Try alias resolution
+                resolved = alias_map.get(norm, norm)
+                if resolved in log_map_norm:
+                    plog = log_map_norm[resolved]
+                elif norm != resolved and norm in log_map_norm:
+                    plog = log_map_norm[norm]
+
+            if plog is None:
                 not_found += 1
                 continue
 
@@ -501,7 +618,6 @@ def grade_nba_forward_preds() -> dict:
             if cols is None:
                 continue
 
-            plog = log_map[norm]
             actual = sum(plog.get(c, 0) or 0 for c in cols)
 
             if side == "over":

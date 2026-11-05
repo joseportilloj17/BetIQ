@@ -206,7 +206,13 @@ def fetch_nba_spreads(
         bdl_id | game_date | home_abbr | away_abbr |
         home_full | away_full | home_score | away_score | season
     """
-    _BDL_API_KEY = "REDACTED_BALLDONTLIE_KEY"
+    _BDL_API_KEY = os.environ.get("BALLDONTLIE_API_KEY", "")
+    if not _BDL_API_KEY:
+        try:
+            from config import BALLDONTLIE_KEY as _bdl_cfg
+            _BDL_API_KEY = _bdl_cfg
+        except Exception:
+            raise RuntimeError("BALLDONTLIE_API_KEY not set — export it or add to backend/.env")
     _BDL_BASE    = "https://api.balldontlie.io/v1"
 
     if seasons is None:
