@@ -30,3 +30,10 @@
 ## Background Processes
 - **Stop background shells when their task finishes.**  Never leave a `run_in_background` command, monitor, or subagent running after its purpose is complete.
 - **List any still-running background tasks at the end of each session** so the user can kill stragglers.
+
+## Secrets & Credentials
+- **Never hardcode API keys, passwords, or tokens in source files.**  All secrets live in `backend/.env` (gitignored).  Code reads them via `os.environ.get()` or `from config import`.
+- **Never commit data files** (`*.db`, `*.sqlite`, `*.csv`, `*.json` data exports) to git.  The `data/` directory is gitignored.
+- **`backend/.env.example`** has variable names with placeholder values — keep it updated when adding new keys.
+- **Gitleaks pre-commit hook** blocks commits containing secrets.  If it fires, move the secret to `.env`.  False positives go in `.gitleaks.toml` allowlist.
+- **GitHub secret scanning + push protection** are enabled on the repo.

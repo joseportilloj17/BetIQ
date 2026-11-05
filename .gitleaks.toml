@@ -1,0 +1,14 @@
+# Gitleaks config — false positive allowlist
+[allowlist]
+  paths = [
+    '''\.venv/''',
+    '''venv/''',
+    '''node_modules/''',
+  ]
+
+  # False positives: SQL column names and Open-Meteo param names
+  regexTarget = "match"
+  regexes = [
+    '''wind_speed_10m_previous_day1''',
+    '''sport_key|market_key''',
+  ]
