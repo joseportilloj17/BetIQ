@@ -491,6 +491,145 @@ def check_credit_budget() -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Credit Tripwire — detect unexplained API usage
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Minimum absolute gap (credits) to fire alert — avoids noise from tiny deltas
+_TRIPWIRE_MIN_GAP = 50
+# Percentage threshold: unexplained > this % of provider-used → alert
+_TRIPWIRE_PCT = 5.0
+
+
+def check_credit_tripwire(date_str: str | None = None) -> dict:
+    """
+    Compare provider-side credit consumption against our logged calls for one day.
+
+    For a given day, computes:
+      provider_used = first_remaining_of_day - last_remaining_of_day
+      our_logged    = SUM(credits_used) for that day
+      gap           = provider_used - our_logged
+      gap_pct       = gap / provider_used * 100
+
+    Returns dict with all fields + an 'alert' bool (True if gap > 5% AND > 50).
+
+    NOTE: Backfill scripts (clv_backfill, props_clv_backfill, soccer_clv_backfill)
+    call TheOddsAPI directly and do NOT log to credits_log. On days those run,
+    the gap will be elevated without indicating external compromise. The alert
+    message includes this caveat so the operator can check whether a backfill ran.
+    """
+    _ensure_tables()
+    conn = _hist_conn()
+
+    now_utc = datetime.utcnow()
+    if date_str is None:
+        date_str = now_utc.strftime("%Y-%m-%d")
+
+    day_start = f"{date_str}T00:00:00Z"
+    day_end   = f"{date_str}T23:59:59Z"
+
+    # First and last credits_remaining for this day
+    first = conn.execute(
+        "SELECT credits_used, credits_remaining FROM credits_log "
+        "WHERE logged_at >= ? AND logged_at <= ? "
+        "AND credits_remaining IS NOT NULL "
+        "ORDER BY logged_at ASC LIMIT 1",
+        (day_start, day_end),
+    ).fetchone()
+
+    last = conn.execute(
+        "SELECT credits_used, credits_remaining FROM credits_log "
+        "WHERE logged_at >= ? AND logged_at <= ? "
+        "AND credits_remaining IS NOT NULL "
+        "ORDER BY logged_at DESC LIMIT 1",
+        (day_start, day_end),
+    ).fetchone()
+
+    our_logged = conn.execute(
+        "SELECT COALESCE(SUM(credits_used), 0) FROM credits_log "
+        "WHERE logged_at >= ? AND logged_at <= ? "
+        "AND credits_used IS NOT NULL",
+        (day_start, day_end),
+    ).fetchone()[0]
+
+    call_count = conn.execute(
+        "SELECT COUNT(*) FROM credits_log "
+        "WHERE logged_at >= ? AND logged_at <= ?",
+        (day_start, day_end),
+    ).fetchone()[0]
+
+    conn.close()
+
+    if not first or not last:
+        return {
+            "date": date_str,
+            "status": "no_data",
+            "alert": False,
+            "call_count": call_count,
+        }
+
+    # Provider delta: remaining before first call minus remaining after last call
+    # first[0] = credits_used of first call, first[1] = credits_remaining after first call
+    first_remaining_before = first[1] + (first[0] or 0)
+    last_remaining_after = last[1]
+
+    # Detect month-boundary reset (remaining jumped up)
+    if last_remaining_after > first_remaining_before:
+        return {
+            "date": date_str,
+            "status": "month_reset",
+            "alert": False,
+            "note": "credits_remaining increased — likely monthly budget reset",
+            "call_count": call_count,
+        }
+
+    provider_used = first_remaining_before - last_remaining_after
+    gap = provider_used - our_logged
+    gap_pct = (gap / provider_used * 100) if provider_used > 0 else 0.0
+
+    alert = gap > _TRIPWIRE_MIN_GAP and gap_pct > _TRIPWIRE_PCT
+
+    result = {
+        "date":           date_str,
+        "provider_used":  provider_used,
+        "our_logged":     int(our_logged),
+        "gap":            gap,
+        "gap_pct":        round(gap_pct, 1),
+        "alert":          alert,
+        "call_count":     call_count,
+        "status":         "alert" if alert else "ok",
+    }
+
+    if alert:
+        print(f"[CreditTripwire] ALERT: {date_str} — provider={provider_used} "
+              f"logged={our_logged} gap={gap} ({gap_pct:.1f}%)")
+    else:
+        print(f"[CreditTripwire] OK: {date_str} — provider={provider_used} "
+              f"logged={our_logged} gap={gap} ({gap_pct:.1f}%)")
+
+    return result
+
+
+def check_credit_tripwire_history(since: str = "2026-04-21") -> list[dict]:
+    """
+    Run the tripwire check for every day from *since* to yesterday.
+    Returns a list of per-day results (same format as check_credit_tripwire).
+    """
+    from datetime import timedelta
+    results = []
+    current = datetime.strptime(since, "%Y-%m-%d")
+    yesterday = datetime.utcnow() - timedelta(days=1)
+
+    while current <= yesterday:
+        ds = current.strftime("%Y-%m-%d")
+        r = check_credit_tripwire(ds)
+        if r.get("status") != "no_data":
+            results.append(r)
+        current += timedelta(days=1)
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Targeted imminent-game fetcher (replaces universal 30-min snapshot)
 # ══════════════════════════════════════════════════════════════════════════════
 

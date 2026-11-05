@@ -6801,6 +6801,15 @@ def credits_status():
     return ct.get_credit_status()
 
 
+@app.get("/api/credits/tripwire")
+def credits_tripwire(date: Optional[str] = None):
+    """
+    Credit tripwire: compare provider-side usage vs our logged calls for a day.
+    Returns gap analysis. ?date=YYYY-MM-DD for a specific day (default: yesterday).
+    """
+    return ct.check_credit_tripwire(date)
+
+
 @app.post("/api/odds/imminent-snapshot")
 def imminent_snapshot():
     """

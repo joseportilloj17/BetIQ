@@ -153,6 +153,9 @@ _scheduler_state = {
     # Nightly DB maintenance (3 AM CT — prune old rows, checkpoint WAL)
     "last_db_maintenance":        None,
     "last_db_maintenance_result": None,
+    # Credit tripwire (3 AM CT — detect unexplained API usage)
+    "last_credit_tripwire":        None,
+    "last_credit_tripwire_result": None,
     # ── Watchdog verification flags (reset daily at midnight CT) ────────────────
     # True once the watchdog confirms the job actually produced results, not just ran.
     "watchdog_fixture_verified": False,   # fixtures loaded for today
@@ -3940,6 +3943,98 @@ def _run_db_maintenance() -> dict:
     return result
 
 
+def _run_credit_tripwire() -> dict:
+    """Daily credit tripwire: compare provider-side usage vs our logged calls.
+
+    Checks yesterday's credits_log data.  If the gap between what TheOddsAPI
+    reports as consumed and what we logged exceeds 5% (and >50 credits),
+    fires a critical alert (macOS notification + email) advising key rotation.
+
+    Known caveat: backfill scripts (clv_backfill, props_clv_backfill,
+    soccer_clv_backfill) call TheOddsAPI directly without logging to
+    credits_log.  On days those run, the gap will be legitimately elevated.
+    The alert message includes this note so the operator can verify.
+    """
+    from datetime import timedelta
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    try:
+        from creator_tier import check_credit_tripwire
+        result = check_credit_tripwire(yesterday)
+    except Exception as exc:
+        return {"error": str(exc), "date": yesterday}
+
+    if result.get("alert"):
+        gap = result.get("gap", 0)
+        gap_pct = result.get("gap_pct", 0)
+        provider = result.get("provider_used", 0)
+        logged = result.get("our_logged", 0)
+
+        subject = f"BetIQ CRITICAL: {gap} unexplained API credits on {yesterday}"
+        body = (
+            f"Credit Tripwire Alert\n"
+            f"=====================\n\n"
+            f"Date: {yesterday}\n"
+            f"Provider-side usage:  {provider} credits\n"
+            f"Our logged usage:     {logged} credits\n"
+            f"Unexplained gap:      {gap} credits ({gap_pct}%)\n"
+            f"Threshold:            5% and >50 credits\n\n"
+            f"ACTION REQUIRED: Verify whether a backfill script ran yesterday.\n"
+            f"If no backfill ran, rotate the ODDS_API_KEY immediately:\n"
+            f"  1. Generate a new key at https://the-odds-api.com/account\n"
+            f"  2. Update backend/.env with the new key\n"
+            f"  3. Restart the server\n\n"
+            f"This alert fires when credits consumed on the provider side\n"
+            f"exceed what our scheduler logged, suggesting possible external\n"
+            f"use of the API key.\n"
+        )
+
+        # macOS notification (immediate, visible)
+        _notify("BetIQ CRITICAL", f"{gap} unexplained credits ({gap_pct}%) on {yesterday}",
+                sound="Basso")
+
+        # Email alert
+        try:
+            import json as _tw_json
+            _cfg_path = os.path.join(os.path.dirname(__file__), "..", "data",
+                                     "delivery_config.json")
+            with open(_cfg_path) as _cf:
+                _dcfg = _tw_json.load(_cf)
+            _email_cfg = _dcfg.get("email", {})
+            if _email_cfg.get("enabled") and _email_cfg.get("smtp_user"):
+                import smtplib
+                from email.mime.text import MIMEText
+                smtp_host = _email_cfg.get("smtp_host", "smtp.gmail.com")
+                smtp_port = _email_cfg.get("smtp_port", 587)
+                smtp_user = _email_cfg["smtp_user"]
+                smtp_pass = _email_cfg.get("smtp_pass") or os.environ.get("SMTP_PASS", "")
+                to_addr = _email_cfg.get("to", smtp_user)
+                if smtp_pass:
+                    msg = MIMEText(body, "plain", "utf-8")
+                    msg["Subject"] = subject
+                    msg["From"] = smtp_user
+                    msg["To"] = to_addr
+                    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+                        server.starttls()
+                        server.login(smtp_user, smtp_pass)
+                        server.send_message(msg)
+                    result["email_sent"] = True
+                    print(f"[CreditTripwire] Alert email sent to {to_addr}")
+                else:
+                    result["email_sent"] = False
+                    result["email_note"] = "SMTP_PASS not set"
+                    print("[CreditTripwire] SMTP_PASS not set — email skipped")
+        except Exception as _email_exc:
+            result["email_error"] = str(_email_exc)
+            print(f"[CreditTripwire] Email error: {_email_exc}")
+
+        result["alert_fired"] = True
+    else:
+        result["alert_fired"] = False
+
+    return result
+
+
 def _run_prop_health_check() -> dict:
     """Daily health check: verify captured prop rows match expectations.
 
@@ -5092,6 +5187,16 @@ def _loop(interval_mins: int, auto_retrain: bool):
                 print(f"[Scheduler] DB maintenance: {_db_maint_result}")
         except Exception as _maint_exc:
             print(f"[Scheduler] ERROR in db_maintenance: {_maint_exc}")
+
+        # ── Credit Tripwire (3 AM CT, after maintenance): detect unexplained usage ──
+        try:
+            if hour_ct == 3 and min_ct < 30 and _scheduler_state.get("last_credit_tripwire") != today_ct:
+                _scheduler_state["last_credit_tripwire"] = today_ct
+                _tw_result = _run_credit_tripwire()
+                _scheduler_state["last_credit_tripwire_result"] = _tw_result
+                print(f"[Scheduler] Credit tripwire: {_tw_result}")
+        except Exception as _tw_exc:
+            print(f"[Scheduler] ERROR in credit_tripwire: {_tw_exc}")
 
         # ── Watchdog: verify critical jobs completed; auto-recover if not ───────
         try:
