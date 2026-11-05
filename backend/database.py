@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     create_engine, Column, String, Float, Integer,
-    DateTime, Boolean, Text, JSON
+    DateTime, Boolean, Text, JSON, UniqueConstraint
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
@@ -73,6 +73,26 @@ def normalize_mock_status(raw: str | None) -> str:
     )
 
 
+# ── SQLite version gate ─────────────────────────────────────────────────
+# WAL-Reset bug (CVE-pending): affects 3.7.0 through 3.51.2 EXCEPT two
+# backport patches (3.44.6 and 3.50.7).  Versions 3.45.x–3.50.6 and
+# 3.51.0–3.51.2 are still vulnerable.  Require >= 3.51.3 to avoid
+# keeping a safe-version whitelist.
+import sqlite3 as _sqlite3_check
+_SQLITE_MIN = (3, 51, 3)
+_sqlite_ver = tuple(int(x) for x in _sqlite3_check.sqlite_version.split("."))
+if _sqlite_ver < _SQLITE_MIN:
+    _msg = (
+        f"SQLite {_sqlite3_check.sqlite_version} is below the minimum safe "
+        f"version 3.51.3 (WAL-Reset bug — affects 3.7.0 through 3.51.2). "
+        f"Use the betiq conda env: `conda activate betiq` (SQLite 3.54.1). "
+        f"Silent lost writes and page corruption are possible below 3.51.3."
+    )
+    import warnings
+    warnings.warn(_msg, RuntimeWarning, stacklevel=1)
+    print(f"[DB] FATAL: {_msg}")
+    raise RuntimeError(_msg)
+
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
 _DB_ABS = os.path.abspath(DB_PATH)
 DATABASE_URL = f"sqlite:///{_DB_ABS}"
@@ -112,6 +132,7 @@ def _set_sqlite_pragmas(dbapi_conn, _):
             _time.sleep(0.5 * (_attempt + 1))
     cursor.execute("PRAGMA synchronous=FULL")
     cursor.execute("PRAGMA busy_timeout=30000")   # 30s wait instead of immediate error
+    cursor.execute("PRAGMA journal_size_limit=67108864")  # 64 MB — cap WAL file growth
     cursor.close()
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -124,6 +145,13 @@ Base = declarative_base()
 # can fail with "disk I/O error" instead of a clean busy/locked error.
 # This lock serializes ALL background DB writes so only one thread writes
 # at a time.  Reads are NOT gated — WAL handles concurrent reads fine.
+#
+# Known incident (Oct 2026): uvicorn --reload on port 5005 spawned a
+# competing worker process that overwrote the NBA engine cache with empty
+# data during concurrent initialization.  Root cause: two Python processes
+# writing the same SQLite file without coordination.  Fix: ensure only ONE
+# uvicorn worker runs at a time (workers=1, no --reload in production),
+# and all writes go through DB_WRITE_LOCK.
 DB_WRITE_LOCK = threading.Lock()
 
 
@@ -459,6 +487,9 @@ class MockBet(Base):
 class MockBetLeg(Base):
     """Individual legs of a MockBet (System 3)."""
     __tablename__ = "mock_bet_legs"
+    __table_args__ = (
+        UniqueConstraint("mock_bet_id", "leg_index", name="uq_mock_bet_legs_bet_leg"),
+    )
 
     id           = Column(Integer, primary_key=True, autoincrement=True)
     mock_bet_id  = Column(String)
@@ -1286,6 +1317,49 @@ class PiConcentrationFlag(Base):
     settled_at           = Column(DateTime, nullable=True)
 
 
+class LabAdjustment(Base):
+    """
+    NFL Lab — logs every user adjustment and model-flagged edge for measurement.
+
+    One row per game-outcome the user interacts with (or model flags as edge).
+    Measured by REALIZED ROI at adequate N, not CLV.
+    """
+    __tablename__ = "lab_adjustments"
+
+    id                = Column(Integer,  primary_key=True, autoincrement=True)
+    fixture_id        = Column(String,   nullable=True)     # OddsAPI game id
+    game_date         = Column(String,   nullable=False)    # YYYY-MM-DD
+    sport             = Column(String,   nullable=False)    # NFL, NCAAF, etc.
+    home_team         = Column(String,   nullable=False)
+    away_team         = Column(String,   nullable=False)
+    outcome_type      = Column(String,   nullable=False)    # spread_cover | total_over | moneyline
+    outcome_line      = Column(Float,    nullable=True)     # e.g. -3.5 (spread), 45.5 (total)
+    # Probabilities (0-1)
+    baseline_prob     = Column(Float,    nullable=True)     # model's probability
+    market_prob       = Column(Float,    nullable=True)     # devigged implied probability
+    adjusted_prob     = Column(Float,    nullable=True)     # user's override (NULL = no override)
+    has_override      = Column(Boolean,  default=False)     # True if user changed the prob
+    # Divergence (percentage points)
+    model_edge_pp     = Column(Float,    nullable=True)     # (baseline - market) * 100
+    user_edge_pp      = Column(Float,    nullable=True)     # (adjusted - market) * 100
+    # Adjustment metadata
+    adjustment_type   = Column(String,   nullable=True)     # feature_level | outcome_level | none
+    feature_changes   = Column(Text,     nullable=True)     # JSON: {feature: {original, adjusted}}
+    user_notes        = Column(Text,     nullable=True)     # free-text reasoning
+    # Bet tracking
+    bet_placed        = Column(Boolean,  default=False)
+    bet_side          = Column(String,   nullable=True)     # description of the bet side
+    bet_odds_decimal  = Column(Float,    nullable=True)     # decimal odds obtained
+    bet_amount        = Column(Float,    nullable=True)     # stake
+    # Outcome (filled at settlement)
+    outcome           = Column(String,   nullable=True)     # WIN | LOSS | PUSH
+    actual_profit     = Column(Float,    nullable=True)     # realized P&L
+    settled           = Column(Boolean,  default=False)
+    # Timestamps
+    created_at        = Column(DateTime, default=datetime.utcnow)
+    settled_at        = Column(DateTime, nullable=True)
+
+
 def _migrate_exploration_tier():
     """Add exploration_tier column to mock_bets for tiered diagnostic tracking."""
     with engine.connect() as conn:
@@ -1481,7 +1555,54 @@ def init_db():
     _migrate_cohort_column()
     # market_eligibility_overrides, BetPatternSignal, PendingMarketAction, PlayerProjection
     # are new tables — created by create_all above, no ALTER needed.
+    _ensure_mock_bet_indexes()
     print(f"[DB] Initialized at {DB_PATH}")
     # New tables are created by Base.metadata.create_all above (LegHistoricalResolution,
     # RegimeAbLog, InjuryReport, LineMovementLog).
     # No explicit migration needed — they're new, not additions to old tables.
+
+
+def _ensure_mock_bet_indexes():
+    """Create indexes on mock_bets/mock_bet_legs for query performance."""
+    import sqlite3 as _sql
+    conn = _sql.connect(DB_PATH)
+    for name, table, cols in [
+        ("idx_mock_bets_status_settled",   "mock_bets",     "status, settled_at"),
+        ("idx_mock_bets_status_source",    "mock_bets",     "status, source"),
+        ("idx_mock_bets_status_game_date", "mock_bets",     "status, game_date"),
+        ("idx_mock_bets_generated_at",     "mock_bets",     "generated_at"),
+        ("idx_mock_bets_source",           "mock_bets",     "source"),
+        ("idx_mock_bet_legs_bet_id",       "mock_bet_legs", "mock_bet_id"),
+    ]:
+        try:
+            conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table}({cols})")
+        except Exception:
+            pass
+    # Unique constraint on (mock_bet_id, leg_index) — prevents duplicate legs
+    # from recovery/replay/retry. Must dedup existing data before creating.
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_mock_bet_legs_bet_leg "
+            "ON mock_bet_legs(mock_bet_id, leg_index)"
+        )
+    except Exception:
+        # Index creation fails if duplicates exist — dedup first, then retry.
+        try:
+            conn.execute("""
+                DELETE FROM mock_bet_legs
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid)
+                    FROM mock_bet_legs
+                    GROUP BY mock_bet_id, leg_index
+                )
+            """)
+            conn.commit()
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_mock_bet_legs_bet_leg "
+                "ON mock_bet_legs(mock_bet_id, leg_index)"
+            )
+            print("[DB] Deduped mock_bet_legs and created unique index on (mock_bet_id, leg_index)")
+        except Exception as _dedup_exc:
+            print(f"[DB] WARNING: could not create unique index on mock_bet_legs: {_dedup_exc}")
+    conn.commit()
+    conn.close()

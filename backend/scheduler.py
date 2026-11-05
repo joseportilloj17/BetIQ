@@ -24,6 +24,20 @@ from auto_settle import run_auto_settle, RETRAIN_STATE, check_retrain_status
 
 _CT = ZoneInfo("America/Chicago")
 
+
+def _notify(title: str, msg: str, sound: str = "Sosumi") -> None:
+    """Send macOS notification + print.  Non-fatal on failure."""
+    print(f"[NOTIFY] {title}: {msg}")
+    try:
+        import subprocess
+        subprocess.Popen([
+            "osascript", "-e",
+            f'display notification "{msg}" with title "{title}" sound name "{sound}"'
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 # ── State (read by API for status endpoint) ────────────────────────────────────
 _scheduler_state = {
     "running":              False,
@@ -157,6 +171,9 @@ _scheduler_state = {
     # Cashout live-odds polling (every 15 min during game windows when open LIVE bets exist)
     "last_cashout_poll":             None,   # ISO timestamp of last poll
     "last_cashout_poll_result":      None,
+    # Injury watcher — Sleeper status polling (every 15 min on NFL game days Thu-Mon)
+    "last_injury_watch_poll":        None,   # ISO timestamp of last poll
+    "last_injury_watch_poll_result": None,
     # Monthly NegBin mu model retrain (1st of month, 4 AM CT)
     "last_negbin_retrain":           None,   # YYYY-MM month string
     "last_negbin_retrain_result":    None,
@@ -324,7 +341,23 @@ def _run_nightly_mlb_update() -> dict:
         return {"date": yesterday, "error": str(exc)}
 
 
+def _is_mlb_season() -> bool:
+    """True during the MLB active window (late March through early November)."""
+    ct = _now_ct()
+    # Spring training starts ~mid-Feb, regular season ends ~late Oct,
+    # World Series can run into early Nov.  Gate: Mar 20 – Nov 10.
+    if ct.month == 3 and ct.day >= 20:
+        return True
+    if 4 <= ct.month <= 10:
+        return True
+    if ct.month == 11 and ct.day <= 10:
+        return True
+    return False
+
+
 def _should_run_nightly_mlb(now: datetime) -> bool:
+    if not _is_mlb_season():
+        return False
     ct = _now_ct()
     if ct.hour < _NIGHTLY_MLB_HOUR_CT:
         return False
@@ -480,6 +513,8 @@ def _should_run_daily_nhl_etl(now: datetime) -> bool:
 
 
 def _should_run_daily_mlb_etl(now: datetime) -> bool:
+    if not _is_mlb_season():
+        return False
     ct = _now_ct()
     if ct.hour < _DAILY_ETL_HOUR_CT:
         return False
@@ -849,6 +884,26 @@ def _run_calibration_check() -> dict:
     except Exception as exc:
         print(f"[Scheduler] parlay_calibration refresh error: {exc}")
 
+    # SGP haircut monitor — track FanDuel's adjustment factor per archetype.
+    # Edge rests on a software choice; if they tighten, edge dies.
+    try:
+        from parlay_builder import sgp_haircut_report as _sgp_report
+        sgp_result = _sgp_report(_db_path)
+        alerts = sgp_result.get("alerts", [])
+        n_total = sgp_result.get("total_sgm_bets", 0)
+        n_archetypes = len(sgp_result.get("archetypes", {}))
+        if alerts:
+            for a in alerts:
+                print(f"[Scheduler] SGP ALERT: {a}")
+        else:
+            print(
+                f"[Scheduler] SGP haircut check: {n_total} SGM bets, "
+                f"{n_archetypes} archetypes tracked, no alerts"
+            )
+        result["sgp_haircut"] = sgp_result
+    except Exception as exc:
+        print(f"[Scheduler] SGP haircut check error: {exc}")
+
     return result
 
 
@@ -965,8 +1020,16 @@ def _run_daily_scout() -> dict:
             print(f"[Scheduler] Scout backfill error (non-fatal): {_bf_exc}")
 
         return result
+        # Alert if zero props for any sport that should have games
+        errors = result.get("errors", [])
+        if errors:
+            _notify("BetIQ Scout", f"{len(errors)} sport error(s): {errors[0]}")
+        if total == 0:
+            _notify("BetIQ Scout", "ZERO props captured across all sports")
+
+        return result
     except Exception as exc:
-        print(f"[Scheduler] Scout run error: {exc}")
+        _notify("BetIQ Scout", f"Scout run FAILED: {exc}")
         return {"error": str(exc)}
 
 
@@ -1013,10 +1076,96 @@ def _run_injury_refresh() -> dict:
             db.close()
         total = sum(result.get("records_saved", {}).values())
         print(f"[Scheduler] Injury refresh: {total} records saved for {result.get('game_date')}")
+        # NBA forward log: fetch official PDF report and log snapshot
+        try:
+            _log_nba_injury_forward()
+        except Exception as _nba_exc:
+            print(f"[Scheduler] NBA injury forward-log error (non-fatal): {_nba_exc}")
         return result
     except Exception as exc:
         print(f"[Scheduler] Injury refresh error: {exc}")
         return {"error": str(exc)}
+
+
+def _log_nba_injury_forward() -> None:
+    """Fetch the official NBA injury report PDF and append to the forward log.
+
+    Uses the nbainjuries package to parse the PDF.  Each row is tagged with
+    the PDF's own ``Game Date`` so settlement matches against box-score data
+    for the correct date.  Called from every injury_refresh slot (am/pm1/pm2).
+    """
+    from datetime import datetime, timezone
+    import nbainjuries.injury as _nba_inj
+    import sqlite3 as _sq
+
+    now_utc = datetime.now(timezone.utc)
+    # NBA PDFs are keyed by ET timestamp — use current time
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        now_et = now_utc  # fallback — timestamp still fine
+    ts = now_et.replace(tzinfo=None)  # nbainjuries expects naive dt
+
+    if not _nba_inj.check_reportvalid(ts):
+        return  # no report available yet
+
+    df = _nba_inj.get_reportdata(ts, return_df=True)
+    if df is None or len(df) == 0:
+        return
+
+    snapshot_utc = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    db_path = os.path.join(os.path.dirname(__file__), "..", "data", "historical.db")
+    conn = _sq.connect(os.path.abspath(db_path))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS nba_injury_forward_log (
+            snapshot_utc   TEXT,
+            game_date      TEXT,
+            player_name    TEXT,
+            player_id      INTEGER,
+            team           TEXT,
+            status         TEXT,
+            source         TEXT,
+            body_part      TEXT,
+            role           TEXT,
+            mpg            REAL,
+            played         INTEGER,
+            actual_minutes REAL,
+            game_time_et   TEXT,
+            PRIMARY KEY (snapshot_utc, player_name)
+        )
+    """)
+
+    rows = []
+    for _, row in df.iterrows():
+        pname = str(row.get("Player Name", ""))
+        status = str(row.get("Current Status", ""))
+        team = str(row.get("Team", ""))
+        reason = str(row.get("Reason", ""))
+        raw_gd = str(row.get("Game Date", ""))
+        game_time = str(row.get("Game Time", ""))
+        if not pname or pname == "nan":
+            continue
+        try:
+            pdf_date = datetime.strptime(raw_gd, "%m/%d/%Y").strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue  # skip rows with unparseable dates
+        rows.append((
+            snapshot_utc, pdf_date, pname, 0, team,
+            status, "nba_pdf", reason, "", 0.0, game_time,
+        ))
+
+    if rows:
+        conn.executemany("""
+            INSERT OR IGNORE INTO nba_injury_forward_log
+            (snapshot_utc, game_date, player_name, player_id, team,
+             status, source, body_part, role, mpg, game_time_et)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
+        conn.commit()
+        print(f"[Scheduler] NBA forward log: {len(rows)} rows for "
+              f"{len(set(r[1] for r in rows))} game date(s)")
+    conn.close()
 
 
 def _should_run_injury_refresh(slot: str) -> bool:
@@ -1088,9 +1237,8 @@ def _run_daily_fixture_refresh() -> dict:
         return result
     except Exception as exc:
         age = fixture_staleness_hours()
-        print(f"[Scheduler] Fixture refresh error: {exc}. "
-              f"Falling back to cached fixtures ({age:.1f}h old)." if age else
-              f"[Scheduler] Fixture refresh error: {exc}. No cached fixtures available.")
+        _notify("BetIQ Fixtures",
+                f"Refresh failed: {exc}" + (f" (cached {age:.0f}h)" if age else " NO CACHE"))
         return {"error": str(exc), "using_cached": True, "cached_age_hours": age}
 
 
@@ -1365,6 +1513,14 @@ def _run_daily_mock_settle() -> dict:
             print(f"[Scheduler] Devig backfill: {dv.get('entry_devig', 0)} entry, {dv.get('close_devig', 0)} close")
         except Exception as _dve:
             print(f"[Scheduler] Devig backfill error (non-fatal): {_dve}")
+        # Settle NBA injury forward log against box scores (best-effort)
+        try:
+            from nba_matchup_engine import NBAMatchupEngine
+            _nba_settled = NBAMatchupEngine.settle_injury_log()
+            if _nba_settled:
+                print(f"[Scheduler] NBA injury settle: {_nba_settled} rows")
+        except Exception as _nis:
+            print(f"[Scheduler] NBA injury settle error (non-fatal): {_nis}")
         return result
     except Exception as exc:
         print(f"[Scheduler] Mock settle error: {exc}")
@@ -2845,7 +3001,10 @@ def _run_props_fetch(slot: str) -> dict:
     try:
         from creator_tier import fetch_player_props
         results = {}
-        for sk in ["baseball_mlb", "basketball_nba", "icehockey_nhl"]:
+        _active_sports = ["basketball_nba", "icehockey_nhl", "americanfootball_nfl"]
+        if _is_mlb_season():
+            _active_sports.insert(0, "baseball_mlb")
+        for sk in _active_sports:
             results[sk] = fetch_player_props(sk, hours_ahead=12)
         total = sum(r.get("props_upserted", 0) for r in results.values())
         print(f"[Scheduler] Props fetch ({slot}): total_props={total}")
@@ -2869,13 +3028,58 @@ def _run_best_lines_daily() -> dict:
 
 
 def _should_run_props(slot: str) -> bool:
-    """Slot 11am (hour 11) or 4pm (hour 16). Run once per day per slot (CT)."""
-    target = 11 if slot == "11am" else 16
+    """Slot 7am (hour 7), 11am (hour 11), or 4pm (hour 16). Once per day per slot (CT)."""
+    target = {"7am": 7, "11am": 11, "4pm": 16}.get(slot, 11)
     ct = _now_ct()
     if ct.hour < target:
         return False
     today_str = ct.strftime("%Y-%m-%d")
     return _scheduler_state.get(f"last_props_{slot}") != today_str
+
+
+def _run_nba_props_morning() -> dict:
+    """Morning NBA prop snapshot — runs before scout at 7 AM CT.
+
+    Captures opening prop odds for comparison with model projections.
+    NBA-only to save credits (~18 credits/day for a 6-game slate).
+    The 11 AM and 4 PM slots cover all sports.
+    """
+    try:
+        from creator_tier import fetch_player_props
+        result = fetch_player_props("basketball_nba", hours_ahead=16)
+        total = result.get("props_upserted", 0)
+        print(f"[Scheduler] NBA morning props: {total} lines captured")
+        return {"status": "ok", "slot": "7am", "nba_props": total, "detail": result}
+    except Exception as exc:
+        print(f"[Scheduler] NBA morning props error: {exc}")
+        return {"error": str(exc)}
+
+
+def _should_run_pretip_props() -> bool:
+    """Run pre-tip NBA prop snapshot every scheduler cycle (10 AM - 11 PM CT).
+
+    Weekend/holiday NBA games can tip as early as ~11 AM CT (12 PM ET).
+    The fetch itself only hits games in the 30-60 min pre-tip window,
+    so running the check earlier just means it finds nothing on weekdays.
+    """
+    ct = _now_ct()
+    return 10 <= ct.hour <= 23
+
+
+def _run_pretip_props() -> dict:
+    """Fetch NBA props for games tipping in 30-60 min.
+    Skips games that already had a pre-tip snapshot this cycle."""
+    try:
+        from creator_tier import fetch_pretip_nba_props
+        result = fetch_pretip_nba_props(min_before_low=30, min_before_high=60)
+        n = result.get("events_pretip", 0)
+        if n > 0:
+            print(f"[Scheduler] Pre-tip props: {n} games, "
+                  f"{result.get('props_upserted', 0)} lines")
+        return result
+    except Exception as exc:
+        print(f"[Scheduler] Pre-tip props error: {exc}")
+        return {"error": str(exc)}
 
 
 def _should_run_best_lines() -> bool:
@@ -3086,7 +3290,10 @@ def _verify_db_write_health() -> tuple[bool, str]:
 
     Writes a sentinel row to a lightweight table, reads it back, deletes it.
     If any step fails, the DB is likely corrupted (header destroyed, WAL issue, etc.).
-    This would have caught the Aug 6-28 corruption that silenced all shadow arms.
+
+    On corruption: attempts .recover FIRST (salvaged 91.2% of pages in the Aug 6-28
+    incident). Only falls back to checkpoint restore as last resort. NEVER overwrites
+    a corrupted file without recovering first.
     """
     import sqlite3 as _sq
     _db_path = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
@@ -3112,13 +3319,305 @@ def _verify_db_write_health() -> tuple[bool, str]:
             return True, "write+read OK"
         return False, "read-back mismatch"
     except _sq.DatabaseError as e:
-        return False, f"DatabaseError: {e}"
+        # ── Corruption detected — attempt auto-recovery ──────────────────
+        msg = f"DatabaseError: {e}"
+        print(f"[DB-Health] CORRUPTION DETECTED: {msg}")
+        recovery_result = _attempt_db_recovery(_db_path)
+        if recovery_result:
+            return False, f"{msg} | RECOVERY: {recovery_result}"
+        return False, msg
     except Exception as e:
         return False, f"error: {e}"
+    finally:
+        # Log open file handles on bets.db — detects stale connections
+        # from crashed processes that could hold WAL locks open
+        try:
+            import subprocess as _sub
+            _lsof = _sub.run(
+                ["lsof", _db_path],
+                capture_output=True, text=True, timeout=5,
+            )
+            _lines = [l for l in _lsof.stdout.strip().splitlines() if l]
+            if len(_lines) > 1:  # first line is header
+                _pids = set()
+                for _l in _lines[1:]:
+                    parts = _l.split()
+                    if len(parts) >= 2:
+                        _pids.add(parts[1])
+                if _pids:
+                    print(f"[DB-Health] Open handles on bets.db: "
+                          f"{len(_pids)} process(es) — PIDs: {sorted(_pids)}")
+        except Exception:
+            pass  # lsof unavailable or timed out
+
+
+def _attempt_db_recovery(db_path: str) -> str:
+    """Attempt to recover a corrupted DB using .recover BEFORE any checkpoint restore.
+
+    Protocol (learned from Aug 6-28 incident where 22 days were unnecessarily lost):
+      1. Back up the corrupted file (NEVER overwrite it)
+      2. Try sqlite3 .recover to extract data from intact pages
+      3. Compare row counts: recovered vs latest checkpoint
+      4. Alert with results — do NOT auto-overwrite
+      5. Only restore from checkpoint if .recover yields zero data
+
+    Returns a status string describing what was found.
+    """
+    import shutil
+    import subprocess
+    import sqlite3 as _sq
+
+    data_dir = os.path.dirname(db_path)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    # 1. Preserve the corrupted file
+    corrupt_bak = os.path.join(data_dir, f"bets.db.corrupted_{ts}.bak")
+    try:
+        shutil.copy2(db_path, corrupt_bak)
+        print(f"[DB-Recovery] Corrupted file backed up: {corrupt_bak}")
+    except Exception as exc:
+        return f"backup_failed: {exc}"
+
+    # 2. Try .recover
+    recovered_path = os.path.join(data_dir, f"bets.db.recovered_{ts}")
+    try:
+        proc = subprocess.run(
+            ["sqlite3", db_path, ".recover"],
+            capture_output=True, text=True, timeout=300
+        )
+        if proc.stdout.strip():
+            # Pipe recovered SQL into a new DB
+            proc2 = subprocess.run(
+                ["sqlite3", recovered_path],
+                input=proc.stdout, capture_output=True, text=True, timeout=300
+            )
+            if proc2.returncode == 0 and os.path.exists(recovered_path):
+                # Count recovered rows
+                try:
+                    rconn = _sq.connect(recovered_path)
+                    tables = [r[0] for r in rconn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()]
+                    counts = {}
+                    for tbl in tables:
+                        try:
+                            cnt = rconn.execute(f"SELECT COUNT(*) FROM [{tbl}]").fetchone()[0]
+                            if cnt > 0:
+                                counts[tbl] = cnt
+                        except Exception:
+                            pass
+                    rconn.close()
+
+                    total = sum(counts.values())
+                    mock_bets = counts.get("mock_bets", counts.get("lost_and_found", 0))
+                    msg = (
+                        f"RECOVERED {total} rows across {len(counts)} tables "
+                        f"(mock_bets-like: {mock_bets}). "
+                        f"Recovered file: {recovered_path}. "
+                        f"Corrupted backup: {corrupt_bak}. "
+                        f"ACTION REQUIRED: merge recovered data before restoring "
+                        f"from checkpoint. Do NOT overwrite."
+                    )
+                    print(f"[DB-Recovery] {msg}")
+                    return msg
+                except Exception as exc:
+                    return f"recover_count_failed: {exc}, file at {recovered_path}"
+            else:
+                return f"recover_import_failed: {proc2.stderr[:200] if proc2.stderr else 'no output'}"
+        else:
+            return "recover_empty: .recover produced no output"
+    except subprocess.TimeoutExpired:
+        return "recover_timeout: .recover took >5min"
+    except Exception as exc:
+        return f"recover_error: {exc}"
+
+
+_ICLOUD_BACKUP_DIR = os.path.expanduser(
+    "~/Library/Mobile Documents/com~apple~CloudDocs/BetIQ-backups"
+)
+# Per-DB generation limits: bets.db is small (~40 MB gz), historical.db is large (~140 MB gz)
+_ICLOUD_MAX_GENS = {"bets_": 7, "historical_": 3}
+
+
+def _icloud_backup(daily_dir: str, result: dict) -> None:
+    """Copy daily backup DBs to iCloud Drive (gzipped).
+
+    Only copies files whose integrity_check passed.
+    Keep 7 generations of bets.db, 3 of historical.db.
+    """
+    import gzip as _gzip
+    import shutil as _shutil
+
+    if not os.path.isdir(daily_dir):
+        return
+
+    os.makedirs(_ICLOUD_BACKUP_DIR, exist_ok=True)
+    today_str = os.path.basename(daily_dir).replace("daily_", "")
+
+    copied = []
+    skipped = []
+
+    # ── bets.db: uncompressed in daily_dir → gzip to iCloud ──
+    if result.get("backup_integrity") != "ok":
+        skipped.append(
+            f"bets.db (integrity={result.get('backup_integrity', 'missing')})")
+    else:
+        src = os.path.join(daily_dir, "bets.db")
+        dst = os.path.join(_ICLOUD_BACKUP_DIR, f"bets_{today_str}.db.gz")
+        if os.path.exists(dst):
+            copied.append(f"{os.path.basename(dst)} (exists)")
+        elif os.path.exists(src):
+            with open(src, "rb") as f_in, _gzip.open(dst, "wb") as f_out:
+                while True:
+                    chunk = f_in.read(1 << 20)  # 1 MB
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
+            sz = os.path.getsize(dst)
+            copied.append(f"{os.path.basename(dst)} ({sz / 1048576:.1f} MB)")
+
+    # ── historical.db: already gzipped locally → copy to iCloud ──
+    if result.get("hist_integrity") != "ok":
+        skipped.append(
+            f"historical.db (integrity="
+            f"{result.get('hist_integrity', 'missing')})")
+    else:
+        src_gz = os.path.join(daily_dir, "historical.db.gz")
+        dst = os.path.join(_ICLOUD_BACKUP_DIR,
+                           f"historical_{today_str}.db.gz")
+        if os.path.exists(dst):
+            copied.append(f"{os.path.basename(dst)} (exists)")
+        elif os.path.exists(src_gz):
+            _shutil.copy2(src_gz, dst)
+            sz = os.path.getsize(dst)
+            copied.append(f"{os.path.basename(dst)} ({sz / 1048576:.1f} MB)")
+
+    result["icloud_copied"] = copied
+    if skipped:
+        result["icloud_skipped"] = skipped
+        print(f"[DB-Maintenance] iCloud skipped (integrity): "
+              f"{', '.join(skipped)}")
+    if copied:
+        print(f"[DB-Maintenance] iCloud backup: {', '.join(copied)}")
+
+    # Prune old generations — per-DB limits
+    for prefix, max_gens in _ICLOUD_MAX_GENS.items():
+        files = sorted(
+            [f for f in os.listdir(_ICLOUD_BACKUP_DIR)
+             if f.startswith(prefix) and f.endswith(".db.gz")],
+            reverse=True,
+        )
+        for old in files[max_gens:]:
+            try:
+                os.remove(os.path.join(_ICLOUD_BACKUP_DIR, old))
+                result.setdefault("icloud_pruned", []).append(old)
+                print(f"[DB-Maintenance] iCloud pruned: {old}")
+            except OSError:
+                pass
+
+
+def _run_restore_test(result: dict) -> None:
+    """Decompress newest iCloud backup of each DB, integrity-check + row counts.
+
+    Restores to data/restore_test/, validates, then deletes test copies.
+    Alerts on any failure.
+    """
+    import gzip as _gzip
+    import sqlite3
+
+    restore_dir = os.path.join(os.path.dirname(__file__), "..", "data",
+                                "restore_test")
+    restore_dir = os.path.normpath(restore_dir)
+    os.makedirs(restore_dir, exist_ok=True)
+
+    test_results = {}
+
+    _KEY_TABLES = {
+        "bets": ["mock_bets", "mock_bet_legs", "fixtures",
+                  "shadow_predictions"],
+        "historical": ["games", "alt_lines", "player_props"],
+    }
+
+    for prefix in ("bets", "historical"):
+        if not os.path.isdir(_ICLOUD_BACKUP_DIR):
+            test_results[prefix] = "no_icloud_dir"
+            continue
+        candidates = sorted(
+            [f for f in os.listdir(_ICLOUD_BACKUP_DIR)
+             if f.startswith(f"{prefix}_") and f.endswith(".db.gz")],
+            reverse=True,
+        )
+        if not candidates:
+            test_results[prefix] = "no_icloud_backup"
+            continue
+
+        src_gz = os.path.join(_ICLOUD_BACKUP_DIR, candidates[0])
+        dst_db = os.path.join(restore_dir, f"{prefix}_test.db")
+
+        try:
+            t0 = time.monotonic()
+            # Decompress
+            with _gzip.open(src_gz, "rb") as f_in, \
+                 open(dst_db, "wb") as f_out:
+                while True:
+                    chunk = f_in.read(1 << 20)  # 1 MB
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
+            decompress_sz = os.path.getsize(dst_db)
+
+            # Integrity check
+            conn = sqlite3.connect(dst_db, timeout=30)
+            ic = conn.execute("PRAGMA integrity_check").fetchone()
+            ic_ok = ic and ic[0] == "ok"
+
+            # Row counts on key tables
+            counts = {}
+            for tbl in _KEY_TABLES.get(prefix, []):
+                try:
+                    n = conn.execute(
+                        f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                    counts[tbl] = n
+                except Exception:
+                    counts[tbl] = "missing"
+
+            conn.close()
+            elapsed = time.monotonic() - t0
+
+            test_results[prefix] = {
+                "source": candidates[0],
+                "size_mb": round(decompress_sz / 1048576, 1),
+                "integrity": "ok" if ic_ok else f"FAILED: {ic}",
+                "counts": counts,
+                "duration_s": round(elapsed, 1),
+            }
+
+            if not ic_ok:
+                print(f"[Restore-Test] ALERT: {prefix} integrity FAILED: "
+                      f"{ic}")
+            else:
+                print(f"[Restore-Test] {prefix}: ok, "
+                      f"{decompress_sz / 1048576:.1f} MB, "
+                      f"{elapsed:.1f}s, counts={counts}")
+
+        except Exception as exc:
+            test_results[prefix] = f"error: {exc}"
+            print(f"[Restore-Test] ALERT: {prefix} restore FAILED: {exc}")
+        finally:
+            if os.path.exists(dst_db):
+                os.remove(dst_db)
+
+    # Clean up restore_test dir if empty
+    try:
+        os.rmdir(restore_dir)
+    except OSError:
+        pass
+
+    result["restore_test"] = test_results
 
 
 def _run_db_maintenance() -> dict:
-    """Nightly DB maintenance: prune old rows, checkpoint WAL.
+    """Nightly DB maintenance: daily backup, prune old rows, checkpoint WAL.
 
     Retention tiers:
       - Operational logs (settle_log, scheduler_runs, injury_reports): 14 days
@@ -3127,66 +3626,384 @@ def _run_db_maintenance() -> dict:
       - NEVER pruned: signal_conflict_outcomes, shadow_predictions,
         shadow_calibration, mock_bets, mock_bet_legs, fixtures
     """
+    import shutil
     import sqlite3
     result = {}
 
-    # ── bets.db ──────────────────────────────────────────────────────────────
+    bets_path = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
+    bets_path = os.path.normpath(bets_path)
+
+    # ── Daily backup (worst-case loss = hours, not weeks) ────────────────────
     try:
-        bets_path = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
-        bets_path = os.path.normpath(bets_path)
-        con = sqlite3.connect(bets_path, timeout=30)
-        con.execute("PRAGMA busy_timeout = 10000")
-        total_pruned = 0
+        checkpoint_dir = os.path.join(os.path.dirname(__file__), "..", "checkpoints")
+        today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        daily_dir = os.path.join(checkpoint_dir, f"daily_{today_str}")
+        if not os.path.exists(daily_dir):
+            os.makedirs(daily_dir, exist_ok=True)
+            # Use sqlite3 backup API for a consistent snapshot (safe even during writes)
+            src_conn = sqlite3.connect(bets_path, timeout=10)
+            dst_path = os.path.join(daily_dir, "bets.db")
+            dst_conn = sqlite3.connect(dst_path)
+            src_conn.backup(dst_conn)
+            dst_conn.close()
+            src_conn.close()
+            result["daily_backup"] = dst_path
+            result["daily_backup_size"] = os.path.getsize(dst_path)
+            print(f"[DB-Maintenance] Daily backup: {dst_path} "
+                  f"({result['daily_backup_size'] / 1024 / 1024:.1f} MB)")
 
-        # (table, column, retention_days, is_date_only)
-        _PRUNE_RULES = [
-            ("settle_log",          "settled_at",  14, False),
-            ("scheduler_runs",      "run_at",      14, False),
-            ("injury_reports",      "game_date",   14, True),
-            ("player_projections",  "game_date",   30, True),
-            ("line_movement_log",   "fetched_at",  90, False),
-            # signal_conflict_outcomes: EXCLUDED — analytical, needs 200+ pairs
-            # shadow_predictions:       EXCLUDED — tripwire accumulation in progress
-            # shadow_calibration:       EXCLUDED — tripwire accumulation in progress
-            # mock_bets / mock_bet_legs: EXCLUDED — permanent record
-        ]
-
-        for tbl, col, days, date_only in _PRUNE_RULES:
+            # Integrity check on backup — alert immediately on failure
             try:
-                if date_only:
-                    con.execute(f"DELETE FROM {tbl} WHERE {col} < date('now', '-{days} days')")
+                check_conn = sqlite3.connect(dst_path, timeout=10)
+                ic = check_conn.execute("PRAGMA integrity_check").fetchone()
+                check_conn.close()
+                if ic and ic[0] == "ok":
+                    result["backup_integrity"] = "ok"
                 else:
-                    con.execute(f"DELETE FROM {tbl} WHERE {col} < datetime('now', '-{days} days')")
-                pruned = con.execute("SELECT changes()").fetchone()[0]
-                if pruned:
-                    total_pruned += pruned
-                    result[f"pruned_{tbl}"] = pruned
-            except Exception as exc:
-                result[f"error_{tbl}"] = str(exc)
+                    result["backup_integrity"] = f"FAILED: {ic}"
+                    print(f"[DB-Maintenance] ALERT: backup integrity check "
+                          f"FAILED: {ic}")
+            except Exception as ic_exc:
+                result["backup_integrity"] = f"ERROR: {ic_exc}"
+                print(f"[DB-Maintenance] ALERT: backup integrity check "
+                      f"error: {ic_exc}")
 
-        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        con.commit()
-        con.close()
-        result["bets_pruned_total"] = total_pruned
+            # Integrity check on live DB
+            try:
+                live_conn = sqlite3.connect(bets_path, timeout=10)
+                ic_live = live_conn.execute("PRAGMA integrity_check").fetchone()
+                live_conn.close()
+                if ic_live and ic_live[0] == "ok":
+                    result["live_integrity"] = "ok"
+                else:
+                    result["live_integrity"] = f"FAILED: {ic_live}"
+                    print(f"[DB-Maintenance] ALERT: live bets.db integrity "
+                          f"check FAILED: {ic_live}")
+            except Exception as ic_exc:
+                result["live_integrity"] = f"ERROR: {ic_exc}"
+                print(f"[DB-Maintenance] ALERT: live bets.db integrity "
+                      f"error: {ic_exc}")
+
+            # Prune backups older than 14 days (keep ≥2 weeks of daily snapshots)
+            for entry in os.listdir(checkpoint_dir):
+                if entry.startswith("daily_") and entry != f"daily_{today_str}":
+                    entry_date = entry.replace("daily_", "")
+                    try:
+                        age = (datetime.now(timezone.utc) -
+                               datetime.strptime(entry_date, "%Y%m%d").replace(
+                                   tzinfo=timezone.utc))
+                        if age.days > 14:
+                            shutil.rmtree(os.path.join(checkpoint_dir, entry),
+                                          ignore_errors=True)
+                            result.setdefault("pruned_backups", []).append(entry)
+                    except ValueError:
+                        pass  # Not a daily backup dir
+        else:
+            result["daily_backup"] = "already_exists"
+    except Exception as e:
+        result["backup_error"] = str(e)
+        print(f"[DB-Maintenance] Daily backup FAILED: {e}")
+
+    # ── Daily backup: historical.db (VACUUM INTO — compacted, no freelist) ──
+    import gzip as _gzip
+    hist_path = os.path.join(os.path.dirname(__file__), "..", "data",
+                             "historical.db")
+    hist_path = os.path.normpath(hist_path)
+    try:
+        hist_tmp = os.path.join(daily_dir, "historical.db")
+        hist_gz = os.path.join(daily_dir, "historical.db.gz")
+        already = os.path.exists(hist_gz) or os.path.exists(hist_tmp)
+        if os.path.isdir(daily_dir) and not already:
+            t0 = time.monotonic()
+            # VACUUM INTO creates a consistent, compacted copy (no freelist)
+            vac = sqlite3.connect(hist_path, timeout=30)
+            vac.execute("PRAGMA busy_timeout = 30000")
+            vac.execute(f"VACUUM INTO '{hist_tmp}'")
+            vac.close()
+            vacuum_sz = os.path.getsize(hist_tmp)
+            result["hist_vacuum_size"] = vacuum_sz
+            print(f"[DB-Maintenance] historical.db VACUUM INTO: "
+                  f"{vacuum_sz / 1048576:.1f} MB "
+                  f"({time.monotonic() - t0:.1f}s)")
+
+            # Integrity check on the compacted copy
+            ic_ok = False
+            try:
+                c = sqlite3.connect(hist_tmp, timeout=10)
+                ic = c.execute("PRAGMA integrity_check").fetchone()
+                c.close()
+                if ic and ic[0] == "ok":
+                    result["hist_integrity"] = "ok"
+                    ic_ok = True
+                else:
+                    result["hist_integrity"] = f"FAILED: {ic}"
+                    print(f"[DB-Maintenance] ALERT: historical.db VACUUM "
+                          f"integrity FAILED: {ic}")
+            except Exception as _ic_e:
+                result["hist_integrity"] = f"ERROR: {_ic_e}"
+                print(f"[DB-Maintenance] ALERT: historical.db integrity "
+                      f"error: {_ic_e}")
+
+            if ic_ok:
+                # Gzip the compacted copy, then delete uncompressed
+                with open(hist_tmp, "rb") as f_in, \
+                     _gzip.open(hist_gz, "wb") as f_out:
+                    while True:
+                        chunk = f_in.read(1 << 20)  # 1 MB
+                        if not chunk:
+                            break
+                        f_out.write(chunk)
+                gz_sz = os.path.getsize(hist_gz)
+                os.remove(hist_tmp)
+                result["hist_backup"] = hist_gz
+                result["hist_backup_size"] = gz_sz
+                elapsed = time.monotonic() - t0
+                result["hist_backup_duration_s"] = round(elapsed, 1)
+                print(f"[DB-Maintenance] historical.db compressed: "
+                      f"{gz_sz / 1048576:.1f} MB (total {elapsed:.1f}s)")
+
+                # Keep only 1 local compressed generation
+                for entry in os.listdir(checkpoint_dir):
+                    if (entry.startswith("daily_")
+                            and entry != os.path.basename(daily_dir)):
+                        old_gz = os.path.join(checkpoint_dir, entry,
+                                              "historical.db.gz")
+                        if os.path.exists(old_gz):
+                            os.remove(old_gz)
+                            result.setdefault(
+                                "hist_pruned_local", []).append(
+                                os.path.join(entry, "historical.db.gz"))
+            else:
+                # Integrity failed — keep uncompressed for diagnosis
+                result["hist_backup"] = f"integrity_failed:{hist_tmp}"
+                print(f"[DB-Maintenance] historical.db kept uncompressed "
+                      f"(integrity failed): {hist_tmp}")
+        else:
+            result["hist_backup"] = "already_exists"
+    except Exception as e:
+        result["hist_backup_error"] = str(e)
+        print(f"[DB-Maintenance] historical.db backup FAILED: {e}")
+        # Clean up partial VACUUM INTO on error
+        _htmp = os.path.join(daily_dir, "historical.db")
+        if os.path.exists(_htmp):
+            try:
+                os.remove(_htmp)
+            except OSError:
+                pass
+
+    # ── Off-machine copy to iCloud Drive ──────────────────────────────────────
+    try:
+        _icloud_backup(daily_dir, result)
+    except Exception as e:
+        result["icloud_error"] = str(e)
+        print(f"[DB-Maintenance] iCloud backup FAILED: {e}")
+
+    # ── Monthly restore test (1st of each month) ────────────────────────────
+    if datetime.now(timezone.utc).day == 1:
+        try:
+            _run_restore_test(result)
+        except Exception as e:
+            result["restore_test_error"] = str(e)
+            print(f"[DB-Maintenance] Restore test FAILED: {e}")
+
+    # ── bets.db: prune old rows ──────────────────────────────────────────────
+    # Acquire DB_WRITE_LOCK to serialize with other bets.db writers
+    # (mock_bets, auto_settle, scout, etc.) and avoid SQLITE_LOCKED.
+    try:
+        with DB_WRITE_LOCK:
+            con = sqlite3.connect(bets_path, timeout=60)
+            con.execute("PRAGMA busy_timeout = 60000")
+            con.execute("PRAGMA journal_size_limit=67108864")
+            total_pruned = 0
+
+            # (table, column, retention_days, is_date_only)
+            _PRUNE_RULES = [
+                ("settle_log",          "settled_at",  14, False),
+                ("scheduler_runs",      "run_at",      14, False),
+                # injury_reports:           EXCLUDED — needed by injury watcher replay
+                # player_projections:       EXCLUDED — needed by NBA S5-2 forward test
+                # line_movement_log:        EXCLUDED — odds data needed by forward tests
+                # signal_conflict_outcomes: EXCLUDED — analytical, needs 200+ pairs
+                # shadow_predictions:       EXCLUDED — tripwire accumulation in progress
+                # shadow_calibration:       EXCLUDED — tripwire accumulation in progress
+                # mock_bets / mock_bet_legs: EXCLUDED — permanent record
+            ]
+
+            for tbl, col, days, date_only in _PRUNE_RULES:
+                try:
+                    if date_only:
+                        con.execute(f"DELETE FROM {tbl} WHERE {col} < date('now', '-{days} days')")
+                    else:
+                        con.execute(f"DELETE FROM {tbl} WHERE {col} < datetime('now', '-{days} days')")
+                    pruned = con.execute("SELECT changes()").fetchone()[0]
+                    if pruned:
+                        total_pruned += pruned
+                        result[f"pruned_{tbl}"] = pruned
+                except Exception as exc:
+                    result[f"error_{tbl}"] = str(exc)
+                    print(f"[DB-Maintenance] ALERT: prune {tbl} failed: {exc}")
+
+            # WAL checkpoint — PASSIVE only. NEVER use TRUNCATE or RESTART:
+            # TRUNCATE rewrites page 1 and corrupts the database if interrupted
+            # (confirmed root cause of recurring bets.db corruption Oct 2026).
+            # PASSIVE is always safe — it checkpoints whatever it can without
+            # blocking readers. If WAL grows large, it's harmless.
+            try:
+                wal_result = con.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                wal_pages = wal_result[1] if wal_result else 0
+                checkpointed = wal_result[2] if wal_result else 0
+                remaining = wal_pages - checkpointed if wal_pages and checkpointed else 0
+                result["wal_passive"] = {"total": wal_pages, "checkpointed": checkpointed}
+                if remaining > 100:
+                    print(f"[DB-Maintenance] WAL: PASSIVE left {remaining} pages "
+                          f"(will checkpoint on next cycle, NOT escalating)")
+                else:
+                    print(f"[DB-Maintenance] bets.db WAL checkpoint: ok "
+                          f"({checkpointed}/{wal_pages} pages)")
+            except Exception as wal_exc:
+                result["wal_error"] = str(wal_exc)
+                print(f"[DB-Maintenance] ALERT: bets.db WAL checkpoint "
+                      f"failed: {wal_exc}")
+
+            con.commit()
+            con.close()
+            result["bets_pruned_total"] = total_pruned
+            print(f"[DB-Maintenance] bets.db prune: ok "
+                  f"({total_pruned} rows removed)")
     except Exception as e:
         result["bets_error"] = str(e)
+        print(f"[DB-Maintenance] ALERT: bets.db prune/checkpoint failed: {e}")
 
-    # ── historical.db ────────────────────────────────────────────────────────
+    # ── historical.db: WAL checkpoint (no row pruning — props/lines preserved) ─
     try:
         hist_path = os.path.join(os.path.dirname(__file__), "..", "data", "historical.db")
         hist_path = os.path.normpath(hist_path)
-        con = sqlite3.connect(hist_path, timeout=30)
-        con.execute("PRAGMA busy_timeout = 10000")
-        con.execute("DELETE FROM player_props WHERE game_date < date('now', '-14 days')")
-        pp_pruned = con.execute("SELECT changes()").fetchone()[0]
-        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con = sqlite3.connect(hist_path, timeout=60)
+        con.execute("PRAGMA busy_timeout = 60000")
+        con.execute("PRAGMA journal_size_limit=67108864")
+        # player_props / alt_lines: NEVER pruned — forward tests need full history
+        wal_h = con.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        h_pages = wal_h[1] if wal_h else 0
+        h_done = wal_h[2] if wal_h else 0
+        result["hist_wal"] = {"total": h_pages, "checkpointed": h_done}
+        print(f"[DB-Maintenance] historical.db WAL checkpoint: ok "
+              f"({h_done}/{h_pages} pages)")
         con.commit()
         con.close()
-        result["pruned_player_props"] = pp_pruned
     except Exception as e:
         result["historical_error"] = str(e)
+        print(f"[DB-Maintenance] ALERT: historical.db WAL checkpoint "
+              f"failed: {e}")
 
-    print(f"[DB-Maintenance] Pruned: {result}")
+    # ── Summary ──────────────────────────────────────────────────────────────
+    # Check for any failures across all steps
+    failures = [k for k in result if "error" in k.lower() or
+                (isinstance(result[k], str) and "FAILED" in result[k])]
+    if failures:
+        _notify("BetIQ Maintenance",
+                f"{len(failures)} step(s) failed: {', '.join(failures)}")
+    else:
+        print(f"[DB-Maintenance] All steps completed successfully")
+
+    # INFRA-2: Persist maintenance results to bets.db for 7-day audit
+    try:
+        import json as _j
+        _mcon = sqlite3.connect(bets_path, timeout=30)
+        _mcon.execute("PRAGMA busy_timeout = 30000")
+        _mcon.execute("""
+            CREATE TABLE IF NOT EXISTS maintenance_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_date TEXT NOT NULL,
+                run_utc TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                has_errors INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        _mcon.execute("CREATE INDEX IF NOT EXISTS idx_maint_date "
+                      "ON maintenance_log(run_date)")
+        _now = datetime.now(timezone.utc)
+        _mcon.execute(
+            "INSERT INTO maintenance_log (run_date, run_utc, result_json, has_errors) "
+            "VALUES (?, ?, ?, ?)",
+            (_now.strftime("%Y-%m-%d"), _now.isoformat(),
+             _j.dumps(result, default=str), 1 if failures else 0),
+        )
+        # Prune entries older than 30 days
+        _mcon.execute(
+            "DELETE FROM maintenance_log WHERE run_date < date('now', '-30 days')")
+        _mcon.commit()
+        _mcon.close()
+        print(f"[DB-Maintenance] INFRA-2: result persisted to maintenance_log")
+    except Exception as _pe:
+        print(f"[DB-Maintenance] INFRA-2: persist error (non-fatal): {_pe}")
+
+    return result
+
+
+def _run_prop_health_check() -> dict:
+    """Daily health check: verify captured prop rows match expectations.
+
+    Checks historical.db:player_props for today's data. Alerts if:
+    - Zero rows for any game that had events available
+    - Any market has zero rows (e.g. alternate lines missing)
+    - Any expected book has zero rows
+
+    Returns summary dict; prints ALERT on any failure.
+    """
+    import sqlite3
+    result = {}
+    try:
+        hist_path = os.path.join(os.path.dirname(__file__), "..", "data",
+                                 "historical.db")
+        hist_path = os.path.normpath(hist_path)
+        con = sqlite3.connect(hist_path, timeout=10)
+        today = _now_ct().strftime("%Y-%m-%d")
+
+        # Rows per game (event_id) today
+        rows = con.execute(
+            "SELECT event_id, COUNT(*) as cnt, "
+            "COUNT(DISTINCT market_key) as markets, "
+            "COUNT(DISTINCT bookmaker) as books "
+            "FROM player_props "
+            "WHERE sport_key = 'basketball_nba' "
+            "AND DATE(fetched_at) = ? "
+            "GROUP BY event_id", (today,)
+        ).fetchall()
+        con.close()
+
+        result["date"] = today
+        result["games_with_data"] = len(rows)
+
+        if not rows:
+            result["alert"] = "ZERO prop rows captured today"
+            _notify("BetIQ PropHealth", result["alert"])
+        else:
+            total_rows = sum(r[1] for r in rows)
+            min_markets = min(r[2] for r in rows) if rows else 0
+            min_books = min(r[3] for r in rows) if rows else 0
+            result["total_rows"] = total_rows
+            result["min_markets_per_game"] = min_markets
+            result["min_books_per_game"] = min_books
+
+            alerts = []
+            for event_id, cnt, mkts, bks in rows:
+                if cnt < 50:
+                    alerts.append(f"{event_id}: only {cnt} rows")
+                if mkts < 3:
+                    alerts.append(f"{event_id}: only {mkts} markets")
+            if alerts:
+                result["alerts"] = alerts
+                _notify("BetIQ PropHealth",
+                        f"{len(alerts)} game(s) with low coverage")
+            else:
+                result["status"] = "healthy"
+                print(f"[PropHealth] OK: {len(rows)} games, "
+                      f"{total_rows} rows, "
+                      f"min {min_markets}/game markets, "
+                      f"min {min_books}/game books")
+    except Exception as exc:
+        result["error"] = str(exc)
+        print(f"[PropHealth] ERROR: {exc}")
     return result
 
 
@@ -3922,6 +4739,17 @@ def _loop(interval_mins: int, auto_retrain: bool):
 
         _dispatch("nightly_odds",        _should_run_nightly_odds,          _run_nightly_odds_update,       "last_odds_update")
         _dispatch("nightly_ats",         _should_run_nightly_ats,           _run_nightly_ats_update,        "last_ats_update")
+
+        # S5-2: Grade NBA forward preds after game logs are updated
+        try:
+            if _scheduler_state.get("last_ats_update") == today_ct:
+                from scout.runner import grade_nba_forward_preds
+                _grade = grade_nba_forward_preds()
+                if _grade.get("graded", 0) > 0:
+                    print(f"[Scheduler] S5-2 grading: {_grade}")
+        except Exception as _exc:
+            _notify("BetIQ S5-2", f"Grading error: {_exc}", sound="Basso")
+
         _dispatch("nightly_mlb",         _should_run_nightly_mlb,           _run_nightly_mlb_update,        "last_mlb_update")
         _dispatch("nightly_nhl",         _should_run_nightly_nhl,           _run_nightly_nhl_update,        "last_nhl_update")
         _dispatch("nhl_etl",             _should_run_daily_nhl_etl,         _run_daily_nhl_etl,             "last_nhl_etl_update")
@@ -4021,10 +4849,28 @@ def _loop(interval_mins: int, auto_retrain: bool):
             print(f"[Scheduler] ERROR in imminent_fetch: {_exc}")
 
         # Props and best-lines (no now_utc arg)
+        # 7 AM CT: NBA-only morning prop snapshot (before scout runs at 9 AM)
+        # Captures opening prop odds for S5-2 model-vs-market comparison.
+        # ~18 credits/day for a 6-game slate. Stored in historical.db:player_props.
+        try:
+            if _should_run_props("7am"):
+                p7_result = _run_nba_props_morning()
+                # Only mark done if no error — allows retry on next cycle
+                if "error" not in p7_result:
+                    _scheduler_state["last_props_7am"]        = today_ct
+                else:
+                    print(f"[Scheduler] props_7am FAILED, will retry: {p7_result['error']}")
+                _scheduler_state["last_props_7am_result"] = p7_result
+        except Exception as _exc:
+            print(f"[Scheduler] ERROR in props_7am: {_exc}")
+
         try:
             if _should_run_props("11am"):
                 p11_result = _run_props_fetch("11am")
-                _scheduler_state["last_props_11am"]        = today_ct
+                if "error" not in p11_result:
+                    _scheduler_state["last_props_11am"]        = today_ct
+                else:
+                    print(f"[Scheduler] props_11am FAILED, will retry: {p11_result['error']}")
                 _scheduler_state["last_props_11am_result"] = p11_result
         except Exception as _exc:
             print(f"[Scheduler] ERROR in props_11am: {_exc}")
@@ -4032,10 +4878,45 @@ def _loop(interval_mins: int, auto_retrain: bool):
         try:
             if _should_run_props("4pm"):
                 p4_result = _run_props_fetch("4pm")
-                _scheduler_state["last_props_4pm"]        = today_ct
+                if "error" not in p4_result:
+                    _scheduler_state["last_props_4pm"]        = today_ct
+                else:
+                    print(f"[Scheduler] props_4pm FAILED, will retry: {p4_result['error']}")
                 _scheduler_state["last_props_4pm_result"] = p4_result
         except Exception as _exc:
             print(f"[Scheduler] ERROR in props_4pm: {_exc}")
+
+        # Pre-tip NBA injury refresh — capture latest report before prop snapshot
+        try:
+            if _should_run_pretip_props():
+                _log_nba_injury_forward()
+        except Exception as _exc:
+            print(f"[Scheduler] Pre-tip injury refresh error (non-fatal): {_exc}")
+
+        # Pre-tip NBA props — every cycle 10 AM-11 PM CT, targets games tipping in 30-60 min
+        try:
+            if _should_run_pretip_props():
+                pretip_result = _run_pretip_props()
+                pretip_events = pretip_result.get("event_ids", [])
+                if pretip_events:
+                    # Track which events got a pre-tip snapshot today
+                    done = _scheduler_state.get("pretip_done_events", set())
+                    done.update(pretip_events)
+                    _scheduler_state["pretip_done_events"] = done
+                    _scheduler_state["last_pretip_result"] = pretip_result
+        except Exception as _exc:
+            print(f"[Scheduler] ERROR in pretip_props: {_exc}")
+
+        # S5-2: Pre-tip forward predictions — re-run sim with latest injuries
+        try:
+            if _should_run_pretip_props():
+                from scout.runner import run_pretip_nba_forward_preds
+                _fp_result = run_pretip_nba_forward_preds()
+                if _fp_result.get("rows", 0) > 0:
+                    print(f"[Scheduler] S5-2 pre-tip forward preds: "
+                          f"{_fp_result['games']} games, {_fp_result['rows']} rows")
+        except Exception as _exc:
+            _notify("BetIQ S5-2", f"Pre-tip forward preds error: {_exc}", sound="Basso")
 
         try:
             if _should_run_best_lines():
@@ -4045,10 +4926,82 @@ def _loop(interval_mins: int, auto_retrain: bool):
         except Exception as _exc:
             print(f"[Scheduler] ERROR in best_lines: {_exc}")
 
+        # Prop capture health check — once daily after 4 PM slot
+        try:
+            if (hour_ct >= 17
+                    and _scheduler_state.get("last_prop_health") != today_ct):
+                _prop_health = _run_prop_health_check()
+                _scheduler_state["last_prop_health"] = today_ct
+                _scheduler_state["last_prop_health_result"] = _prop_health
+                # Record first day of complete capture
+                if (_prop_health.get("status") == "healthy"
+                        and not _scheduler_state.get("first_complete_capture_day")):
+                    _scheduler_state["first_complete_capture_day"] = today_ct
+                    print(f"[PropHealth] Forward test effective day 1: {today_ct}")
+        except Exception as _exc:
+            print(f"[Scheduler] ERROR in prop_health_check: {_exc}")
+
         # Wong teaser shadow — NFL structural edge forward validation
         _dispatch("teaser_shadow", _should_run_teaser_shadow, _run_teaser_shadow, "last_teaser_shadow", use_now_utc=False)
         # Prop shadow — batter HR + TB (runs after 4 PM props fetch)
         _dispatch("prop_shadow", _should_run_prop_shadow, _run_prop_shadow, "last_prop_shadow", use_now_utc=False)
+
+        # Fantasy projections — NFL weekly consensus + prop gap analysis
+        # Runs once per day on Wednesdays-Saturdays during NFL season (Sep-Jan)
+        try:
+            ct_now = _now_ct()
+            _is_nfl_season = ct_now.month >= 9 or ct_now.month <= 1
+            _is_proj_day = ct_now.weekday() in (2, 3, 4, 5)  # Wed-Sat
+            _proj_ran_today = _scheduler_state.get("last_fantasy_proj") == today_ct
+            if _is_nfl_season and _is_proj_day and not _proj_ran_today and ct_now.hour >= 10:
+                from fantasy_projections import run_weekly_pipeline as _run_fp
+                fp_result = _run_fp(fetch_props=True)
+                _scheduler_state["last_fantasy_proj"]        = today_ct
+                _scheduler_state["last_fantasy_proj_result"] = {
+                    "n_gaps": fp_result.get("n_gaps", 0),
+                    "sources": fp_result.get("sources", []),
+                    "n_matched": fp_result.get("n_matched", 0),
+                }
+                print(f"[Scheduler] Fantasy projections: {fp_result.get('n_gaps', 0)} gaps found")
+        except Exception as _exc:
+            print(f"[Scheduler] ERROR in fantasy_projections: {_exc}")
+
+        # Fantasy forward grading — grade last week's predictions on Tuesdays (after MNF settles)
+        try:
+            ct_now = _now_ct()
+            _is_nfl_season_g = ct_now.month >= 9 or ct_now.month <= 1
+            _grade_ran_today = _scheduler_state.get("last_fantasy_grade") == today_ct
+            if _is_nfl_season_g and ct_now.weekday() == 1 and not _grade_ran_today and ct_now.hour >= 12:
+                from fantasy_projections import grade_forward_predictions as _grade_fp, get_current_nfl_week as _get_week
+                _s, _w = _get_week()
+                _grade_week = max(1, _w - 1)  # grade last week
+                _grade_result = _grade_fp(_s, _grade_week)
+                _scheduler_state["last_fantasy_grade"] = today_ct
+                _graded = _grade_result.get("graded", 0)
+                print(f"[Scheduler] Fantasy forward grade: week {_grade_week}, {_graded} predictions graded")
+        except Exception as _exc:
+            print(f"[Scheduler] ERROR in fantasy forward grading: {_exc}")
+
+        # v1.2 prediction coverage check — once/day Wed-Sun 11 AM CT during NFL season
+        try:
+            ct_now_pc = _now_ct()
+            _is_nfl_pc = ct_now_pc.month >= 9 or ct_now_pc.month <= 1
+            _is_check_day_pc = ct_now_pc.weekday() in (2, 3, 4, 5, 6)  # Wed-Sun
+            _pc_ran_today = _scheduler_state.get("last_pred_coverage_check") == today_ct
+            if _is_nfl_pc and _is_check_day_pc and not _pc_ran_today and ct_now_pc.hour >= 11:
+                from nfl_calibration_diagnosis import check_prediction_coverage
+                _pc_result = check_prediction_coverage()
+                _scheduler_state["last_pred_coverage_check"] = today_ct
+                _scheduler_state["last_pred_coverage_result"] = {
+                    "ok": _pc_result.get("ok"),
+                    "total_preds": _pc_result.get("total_preds", 0),
+                    "missing": _pc_result.get("missing", []),
+                }
+                if _pc_result.get("missing"):
+                    print(f"[Scheduler] ⚠ v1.2 coverage gap: "
+                          f"{len(_pc_result['missing'])} games missing predictions")
+        except Exception as _exc:
+            print(f"[Scheduler] ERROR in pred_coverage_check: {_exc}")
 
         # Researcher — daily news + synthesis (runs once after 9 AM CT)
         try:
@@ -4080,6 +5033,55 @@ def _loop(interval_mins: int, auto_retrain: bool):
                     _scheduler_state["last_cashout_poll_result"] = _poll_result
         except Exception as _co_exc:
             print(f"[Scheduler] ERROR in cashout_poll: {_co_exc}")
+
+        # ── Injury watcher — Sleeper status poll (every 15 min, NFL game days) ──
+        try:
+            ct_now_iw = _now_ct()
+            _is_nfl_season_iw = ct_now_iw.month >= 9 or ct_now_iw.month <= 1
+            _is_game_day_iw = ct_now_iw.weekday() in (0, 3, 4, 5, 6)  # Mon,Thu,Fri,Sat,Sun
+            if _is_nfl_season_iw and _is_game_day_iw and ct_now_iw.hour >= 10:
+                _last_iw = _scheduler_state.get("last_injury_watch_poll")
+                _iw_ok = True
+                if _last_iw:
+                    try:
+                        _iw_dt = datetime.fromisoformat(_last_iw)
+                        if _iw_dt.tzinfo is None:
+                            _iw_dt = _iw_dt.replace(tzinfo=timezone.utc)
+                        _iw_ok = (datetime.now(timezone.utc) - _iw_dt).total_seconds() >= 840
+                    except Exception:
+                        pass
+                if _iw_ok:
+                    from injury_watcher import run_poll_cycle as _iw_poll
+                    _iw_ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                    _iw_result = _iw_poll()
+                    _scheduler_state["last_injury_watch_poll"]        = datetime.now(timezone.utc).isoformat()
+                    _scheduler_state["last_injury_watch_poll_result"] = _iw_result
+                    _iw_ch = _iw_result.get("changes", 0)
+                    _iw_tr = _iw_result.get("triggers", 0)
+                    print(f"[Scheduler] InjuryWatcher heartbeat {_iw_ts} UTC — "
+                          f"{_iw_ch} changes, {_iw_tr} triggers"
+                          + (f" ({_iw_result['credits']} credits)" if _iw_tr > 0 else ""))
+            # End-of-day alert: if it's 11 PM CT on a game day and we had
+            # zero triggered changes all day, something is wrong
+            if ct_now_iw.hour == 23 and _scheduler_state.get("iw_alerted_today") != today_ct:
+                _iw_day_triggers = _scheduler_state.get("iw_triggers_today", 0)
+                if _iw_ch > 0:
+                    _scheduler_state["iw_triggers_today"] = _iw_day_triggers + _iw_tr
+                if _scheduler_state.get("iw_triggers_today", 0) == 0:
+                    print(f"[InjuryWatcher] ALERT: 0 triggered changes on game day "
+                          f"{today_ct}. Check trigger_prop_fetch() and Sleeper API.")
+                _scheduler_state["iw_alerted_today"] = today_ct
+            elif ct_now_iw.hour < 23:
+                # Accumulate daily trigger count
+                if _iw_tr > 0:
+                    _scheduler_state["iw_triggers_today"] = (
+                        _scheduler_state.get("iw_triggers_today", 0) + _iw_tr)
+                # Reset counter on new day
+                if _scheduler_state.get("iw_count_date") != today_ct:
+                    _scheduler_state["iw_count_date"] = today_ct
+                    _scheduler_state["iw_triggers_today"] = _iw_tr
+        except Exception as _iw_exc:
+            print(f"[Scheduler] ERROR in injury_watch_poll: {_iw_exc}")
 
         # ── Nightly DB maintenance (3 AM CT): prune old rows, checkpoint WAL ──
         try:
@@ -4357,6 +5359,16 @@ def start(interval_mins: int = 30, auto_retrain: bool = True, daemon: bool = Tru
         print("[Scheduler] Already running.")
         return
 
+    # ── SQLite version check (WAL-Reset bug) ──
+    import sqlite3 as _sq_ver
+    _sv = _sq_ver.sqlite_version
+    _svt = tuple(int(x) for x in _sv.split("."))
+    if _svt < (3, 44, 6):
+        print(f"[Scheduler] WARNING: SQLite {_sv} is vulnerable to WAL-Reset "
+              f"bug (silent lost writes). Upgrade to >= 3.51.3.")
+    else:
+        print(f"[Scheduler] SQLite {_sv} — WAL-Reset safe")
+
     _stop_event.clear()
     _scheduler_state["running"]       = True
     _scheduler_state["interval_mins"] = interval_mins
@@ -4442,11 +5454,27 @@ def start(interval_mins: int = 30, auto_retrain: bool = True, daemon: bool = Tru
 
 
 def stop():
-    """Signal the scheduler to stop after the current sleep."""
+    """Signal the scheduler to stop after the current sleep.
+
+    Performs a clean WAL checkpoint on shutdown to avoid leaving
+    a dirty WAL that could corrupt page 1 if the process is killed
+    during an auto-checkpoint on next startup.
+    """
     global _scheduler_state
     _stop_event.set()
     _scheduler_state["running"] = False
     print("[Scheduler] Stop requested.")
+
+    # Clean WAL checkpoint on shutdown — PASSIVE is always safe
+    try:
+        import sqlite3 as _sq
+        _db = os.path.join(os.path.dirname(__file__), "..", "data", "bets.db")
+        _con = _sq.connect(_db, timeout=5)
+        _wal = _con.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        _con.close()
+        print(f"[Scheduler] Shutdown WAL checkpoint: {_wal}")
+    except Exception as _e:
+        print(f"[Scheduler] Shutdown WAL checkpoint failed (non-fatal): {_e}")
 
 
 def run_once(auto_retrain: bool = True) -> dict:

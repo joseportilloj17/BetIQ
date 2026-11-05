@@ -24,7 +24,10 @@ from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
-BACKUP_DIR = "/tmp/betiq_backups"
+# Persistent backup directory — NOT /tmp (cleared by macOS on reboot).
+# Keep alongside data/ so it's part of the project.
+BACKUP_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "backups", "safe_migrate")
+BACKUP_DIR = os.path.normpath(BACKUP_DIR)
 _BACKUP_DONE_TODAY: set[str] = set()   # in-process guard (avoid repeat stat calls)
 
 
@@ -71,8 +74,17 @@ def _backup_if_needed(db_path: str):
         _BACKUP_DONE_TODAY.add(today)
         return
     try:
-        shutil.copy2(db_path, backup_path)
-        log.info(f"[safe_migrate] Backup written: {backup_path}")
+        # Use sqlite3 backup API instead of plain file copy.
+        # shutil.copy2 is UNSAFE for WAL-mode databases: it copies only
+        # the main file, missing uncommitted WAL pages. If the WAL is
+        # in mid-write, the backup can be silently corrupt.
+        # sqlite3.backup() creates a consistent snapshot regardless.
+        src_conn = sqlite3.connect(db_path, timeout=10)
+        dst_conn = sqlite3.connect(backup_path)
+        src_conn.backup(dst_conn)
+        dst_conn.close()
+        src_conn.close()
+        log.info(f"[safe_migrate] Backup written (sqlite3 API): {backup_path}")
         _BACKUP_DONE_TODAY.add(today)
         _prune_old_backups()
     except Exception as exc:

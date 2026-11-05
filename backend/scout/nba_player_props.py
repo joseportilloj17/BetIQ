@@ -15,6 +15,7 @@ For each player in both rosters we:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from math import sqrt
 from typing import List, Optional
 
 from scout.base import GameInfo, ScoutedProp, PROJECTION_VERSION
@@ -148,12 +149,17 @@ def _scout_player(
     team: str,
     scout_date: str,
     def_factor: float = 1.0,
+    engine_proj: Optional[dict] = None,
 ) -> List[ScoutedProp]:
     """Project all markets for a single NBA player.
 
     def_factor: multiplicative adjustment for opponent defense.
     1.0 = league average. >1.0 = soft defense. <1.0 = tough defense.
     Applied only to scoring markets (points, pra, threes).
+
+    engine_proj: when supplied (from NBAMatchupEngine), provides
+    matchup-specific projections with pace, defense, form, and rest
+    adjustments already baked in. Falls back to ESPN blend when None.
     """
     results: List[ScoutedProp] = []
 
@@ -181,6 +187,16 @@ def _scout_player(
     # Scoring markets that benefit from defensive adjustment
     _DEF_ADJUSTED = {"player_points", "player_pra", "player_threes"}
 
+    # Mapping from market_type → engine_proj key + std key
+    _ENGINE_MAP = {
+        "player_points":   ("points",   "pts_std"),
+        "player_rebounds":  ("rebounds", "reb_std"),
+        "player_assists":   ("assists",  "ast_std"),
+        "player_threes":    ("threes",   "thr_std"),
+        "player_steals":    ("steals",   None),
+        "player_blocks":    ("blocks",   None),
+    }
+
     # ── Standard markets ──────────────────────────────────────────────────────
     for market_type, (season_key, recent_key, sport_stat) in _STAT_MAP.items():
         season_avg = _safe_float(season_stats.get(season_key))
@@ -188,18 +204,44 @@ def _scout_player(
             continue
 
         recent_avg_val = _recent_avg(recent_games, recent_key, n=7)
-        projected_mean = blend_season_recent(season_avg, recent_avg_val)
 
-        # Apply defensive adjustment to scoring markets
-        if market_type in _DEF_ADJUSTED and def_factor != 1.0:
-            projected_mean = projected_mean * def_factor
-
-        std            = std_from_average(projected_mean, "NBA", sport_stat)
+        # ── Use matchup engine projection when available ──
+        eng_key, eng_std_key = _ENGINE_MAP.get(market_type, (None, None))
+        if engine_proj and eng_key and engine_proj.get(eng_key, 0) > 0:
+            projected_mean = engine_proj[eng_key]
+            # Use engine's game-log std dev if available
+            if eng_std_key and engine_proj.get(eng_std_key, 0) > 0:
+                std = engine_proj[eng_std_key]
+            else:
+                std = std_from_average(projected_mean, "NBA", sport_stat)
+        else:
+            # Fallback: ESPN season + recent blend
+            projected_mean = blend_season_recent(season_avg, recent_avg_val)
+            if market_type in _DEF_ADJUSTED and def_factor != 1.0:
+                projected_mean = projected_mean * def_factor
+            std = std_from_average(projected_mean, "NBA", sport_stat)
 
         # Minutes trend — down-grade if avg minutes < 20 (limited opportunity)
         avg_min = _safe_float(season_stats.get("avg_minutes", 0))
         confidence_factors = [f"Season avg: {season_avg:.1f}", home_road_note]
         risk_factors       = []
+
+        # Engine adjustment annotations
+        if engine_proj and eng_key:
+            adj_parts = []
+            if engine_proj.get("pace_adj", 1.0) != 1.0:
+                adj_parts.append(f"pace {engine_proj['pace_adj']:.2f}x")
+            if engine_proj.get("def_adj", 1.0) != 1.0:
+                d = engine_proj["def_adj"]
+                label = "soft" if d > 1.0 else "tough" if d < 1.0 else "avg"
+                adj_parts.append(f"def {d:.2f}x ({label})")
+            if engine_proj.get("form_adj", 1.0) != 1.0:
+                adj_parts.append(f"form {engine_proj['form_adj']:.2f}x")
+            if engine_proj.get("rest_adj", 1.0) != 1.0:
+                adj_parts.append(f"rest {engine_proj['rest_adj']:.2f}x")
+            if adj_parts:
+                confidence_factors.append("Matchup adj: " + ", ".join(adj_parts))
+            confidence_factors.append("src:matchup_engine")
 
         # Hot/cold streak detection (L3 games)
         streak_label, l3_avg = detect_streak(recent_games, recent_key, season_avg, n=3)
@@ -208,9 +250,9 @@ def _scout_player(
         elif streak_label == "COLD":
             risk_factors.append(f"COLD streak: L3 avg {l3_avg:.1f}")
 
-        if def_factor != 1.0:
-            dir_label = "easier" if def_factor > 1.0 else "harder"
-            confidence_factors.append(f"Opp def adj: {def_factor:.2f}x ({dir_label} matchup)")
+        if not engine_proj and def_factor != 1.0:
+            dir_label = "soft" if def_factor > 1.0 else "tough" if def_factor < 1.0 else "avg"
+            confidence_factors.append(f"Opp def adj: {def_factor:.2f}x ({dir_label})")
         if avg_min > 0 and avg_min < 20:
             risk_factors.append(f"Low minutes ({avg_min:.0f} MPG) — bench risk")
         if recent_avg_val is not None:
@@ -251,8 +293,8 @@ def _scout_player(
             hit_probability  = round(hit_prob, 4),
             quality_grade    = grade,
             confidence_factors = confidence_factors,
-            risk_factors       = risk_factors,
-            data_source        = "espn",
+            risk_factors       = risk_factors + ["UNCALIBRATED"],
+            data_source        = "matchup_engine" if engine_proj else "espn",
             projection_version = PROJECTION_VERSION,
         ))
 
@@ -261,10 +303,23 @@ def _scout_player(
     reb_avg = _safe_float(season_stats.get("avg_rebounds"))
     ast_avg = _safe_float(season_stats.get("avg_assists"))
     if pts_avg + reb_avg + ast_avg >= _MIN_AVG["player_pra"]:
-        pra_mean, pra_std = _project_pra(season_stats, recent_games)
-        # Apply def_factor to PRA (scoring portion ~55% of PRA)
-        if def_factor != 1.0:
-            pra_mean = pra_mean * (1.0 + (def_factor - 1.0) * 0.55)
+        # Use engine PRA when available (already matchup-adjusted)
+        if engine_proj and engine_proj.get("pra", 0) > 0:
+            pra_mean = engine_proj["pra"]
+            # B3: Use combined-rate PRA std (captures covariance through shared minutes)
+            if engine_proj.get("pra_std", 0) > 0:
+                pra_std = engine_proj["pra_std"]
+            else:
+                # Fallback: independent sum (underestimates)
+                p_std = engine_proj.get("pts_std", 0)
+                r_std = engine_proj.get("reb_std", 0)
+                a_std = engine_proj.get("ast_std", 0)
+                pra_std = sqrt(p_std**2 + r_std**2 + a_std**2) if (p_std + r_std + a_std) > 0 else pra_mean * 0.20
+        else:
+            pra_mean, pra_std = _project_pra(season_stats, recent_games)
+            if def_factor != 1.0:
+                pra_mean = pra_mean * (1.0 + (def_factor - 1.0) * 0.55)
+
         threshold, hit_prob = _pick_best_threshold("player_pra", pra_mean, pra_std)
         if hit_prob >= _MIN_EMIT_PROB:
             grade = grade_from_probability(hit_prob)
@@ -273,7 +328,9 @@ def _scout_player(
                 hit_prob = clamp_probability(1.0 - hit_prob)
             lo95, hi95 = compute_ci_95(pra_mean, pra_std)
             pra_conf = [f"PRA season: {pts_avg+reb_avg+ast_avg:.1f}", home_road_note]
-            if def_factor != 1.0:
+            if engine_proj:
+                pra_conf.append("src:matchup_engine")
+            elif def_factor != 1.0:
                 pra_conf.append(f"Opp def adj: {def_factor:.2f}x")
             results.append(ScoutedProp(
                 scout_date        = scout_date,
@@ -295,7 +352,7 @@ def _scout_player(
                 hit_probability   = round(hit_prob, 4),
                 quality_grade     = grade,
                 confidence_factors= pra_conf,
-                risk_factors      = [],
+                risk_factors      = ["UNCALIBRATED"],
                 data_source       = "espn",
                 projection_version= PROJECTION_VERSION,
             ))
@@ -307,25 +364,51 @@ def _scout_player(
 
 _NBA_LEAGUE_AVG_PPG = 114.5   # ~2024-25 season average points allowed per game
 
-def _opp_def_factor(opp_team_id: str) -> float:
+# ── Matchup engine singleton ─────────────────────────────────────────────────
+_engine = None
+
+def _get_engine():
+    """Lazy-load the NBAMatchupEngine (cached, loads once per process)."""
+    global _engine
+    if _engine is None:
+        try:
+            from nba_matchup_engine import NBAMatchupEngine
+            _engine = NBAMatchupEngine(cache=True)  # auto-detects current season
+            _engine.load()
+            n_roster = len(getattr(_engine, '_roster_teams', {}))
+            print(f"[nba_player_props] Matchup engine loaded: "
+                  f"{len(_engine.player_profiles)} players, "
+                  f"{len(_engine.trades)} trades, "
+                  f"{n_roster} roster assignments")
+            # Report any roster-vs-profile team mismatches
+            changes = _engine.report_roster_changes()
+            if changes:
+                print(f"[nba_player_props] WARNING: {len(changes)} roster team mismatches")
+        except Exception as e:
+            print(f"[nba_player_props] Matchup engine unavailable: {e}")
+            _engine = False  # sentinel: tried and failed
+    return _engine if _engine is not False else None
+
+
+def _opp_def_factor(opp_team_id: str, opp_abbr: str = "",
+                    stat: str = "points") -> float:
     """
-    Fetch opponent team's avg points allowed per game from ESPN stats.
-    Returns a multiplicative factor: >1.0 means soft defense (projects higher),
-    <1.0 means elite defense (projects lower).
-    Clamps to [0.85, 1.15] to prevent overcorrection.
+    Defensive adjustment factor for a stat vs an opponent.
+
+    Prefers the matchup engine (per-stat defense from nba_api opponent stats).
+    Falls back to ESPN season stats if engine unavailable.
+    Returns multiplier: >1.0 = soft defense, <1.0 = tough defense.
+    Clamped to [0.85, 1.15].
     """
+    # Try matchup engine first (much richer data)
+    engine = _get_engine()
+    if engine and opp_abbr:
+        raw = engine._defensive_factor(opp_abbr, stat)
+        return max(0.85, min(1.15, raw))
+
+    # Fallback: ESPN season stats
     try:
         stats = ds.get_nba_team_season_stats(opp_team_id)
-        # avg_points_allowed is not directly in ESPN stats; use league_avg as fallback
-        # ESPN team stats endpoint gives avg_points_scored; we approximate allowed
-        # from the complementary team's perspective — use opponent scoring as proxy.
-        opp_ppg = _safe_float(stats.get("avg_points", _NBA_LEAGUE_AVG_PPG))
-        if opp_ppg <= 0:
-            return 1.0
-        # Factor > 1 for teams that score a lot (good offense) = tough opponent
-        # We want: if opponent allows many pts → our players project higher
-        # avg_points here is the opponent's OWN scoring, not pts allowed.
-        # As a simple proxy, use 1.0 (no adjustment) unless we have pts_allowed.
         pts_allowed = _safe_float(stats.get("avg_points_allowed", 0))
         if pts_allowed <= 0:
             return 1.0
@@ -335,35 +418,285 @@ def _opp_def_factor(opp_team_id: str) -> float:
         return 1.0
 
 
+def _proj_to_dict(proj) -> dict:
+    """Serialize a PlayerProjection to a dict for _scout_player()."""
+    return {
+        "points": proj.points, "rebounds": proj.rebounds,
+        "assists": proj.assists, "steals": proj.steals,
+        "blocks": proj.blocks, "threes": proj.threes,
+        "pra": proj.pra, "minutes": proj.minutes,
+        "pts_std": proj.pts_std, "reb_std": proj.reb_std,
+        "ast_std": proj.ast_std, "thr_std": proj.thr_std,
+        "pra_std": proj.pra_std,
+        "pace_adj": proj.pace_adj, "def_adj": proj.def_adj,
+        "form_adj": proj.form_adj, "rest_adj": proj.rest_adj,
+        "recon_pts_scale": proj.recon_pts_scale,
+        "recon_reb_scale": proj.recon_reb_scale,
+        "recon_ast_scale": proj.recon_ast_scale,
+    }
+
+
+def _engine_game_projection(
+    home_abbr: str, away_abbr: str,
+    market_total: float = 0.0,
+    market_spread: float = 0.0,
+    exclude_players: set | None = None,
+) -> Optional[dict]:
+    """Run project_game() and return {player_name: projection_dict}.
+
+    Falls back to None if engine unavailable.
+    exclude_players: explicit set of player names to exclude (e.g. from
+        injury report). Merged with engine-level exclusion.
+    """
+    engine = _get_engine()
+    if not engine:
+        return None
+    try:
+        game_proj = engine.project_game(
+            home_abbr, away_abbr,
+            market_total=market_total,
+            market_spread=market_spread,
+            exclude_players=exclude_players,
+        )
+        return {
+            name: _proj_to_dict(pp)
+            for name, pp in game_proj.players.items()
+        }
+    except Exception as e:
+        print(f"[nba_player_props] project_game failed: {e}")
+        return None
+
+
+def _engine_game_simulation(
+    home_abbr: str, away_abbr: str,
+    market_total: float = 0.0,
+    market_spread: float = 0.0,
+    n_draws: int = 10_000,
+    exclude_players: set | None = None,
+    injury_statuses: dict | None = None,
+    hours_to_tip: float | None = None,
+):
+    """B5: Run Monte Carlo game simulation for SGP pricing.
+
+    Returns (player_proj_dict, SimulationResult) or (None, None).
+    """
+    engine = _get_engine()
+    if not engine:
+        return None, None
+    try:
+        game_proj = engine.project_game(
+            home_abbr, away_abbr,
+            market_total=market_total,
+            market_spread=market_spread,
+            exclude_players=exclude_players,
+        )
+        proj_dict = {
+            name: _proj_to_dict(pp)
+            for name, pp in game_proj.players.items()
+        }
+        # Extract absence impacts from minutes model for per-draw redistribution
+        absence_impacts = None
+        try:
+            absence_impacts = engine.get_absence_impacts_for_game(
+                game_proj, home_abbr, away_abbr
+            ) or None
+        except Exception:
+            pass
+        # Run B5 joint-draw simulation
+        from nba_game_sim import GameSimulator
+        sim = GameSimulator(
+            game_proj,
+            injury_statuses=injury_statuses,
+            absence_impacts=absence_impacts,
+            hours_to_tip=hours_to_tip,
+        )
+        result = sim.run(n_draws=n_draws)
+        return proj_dict, result
+    except Exception as e:
+        print(f"[nba_player_props] game simulation failed: {e}")
+        return None, None
+
+
+def _engine_projection(player_name: str, opp_abbr: str,
+                       is_home: bool) -> Optional[dict]:
+    """Get matchup-engine projection for a player if available.
+
+    Single-player fallback (no reconciliation). Prefer _engine_game_projection
+    when game context is available.
+    """
+    engine = _get_engine()
+    if not engine:
+        return None
+    proj = engine.project_player(player_name, opp_abbr, is_home=is_home)
+    if proj is None:
+        return None
+    return _proj_to_dict(proj)
+
+
 # ── Game-level entry point ─────────────────────────────────────────────────────
 
 def scout_game(game: GameInfo) -> List[ScoutedProp]:
     """
     Generate all NBA player prop ScoutedProps for one game.
-    Fetches rosters for both teams and projects all eligible players.
-    Applies a defensive-adjustment factor based on the opponent's pts-allowed.
+
+    Uses project_game() (B3) for team-reconciled projections when the
+    matchup engine is loaded. Falls back to per-player project_player()
+    or ESPN season averages + generic defense factor.
     """
     scout_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     results: List[ScoutedProp] = []
 
-    # Pre-fetch defensive factors for both opponents
-    # home players face away team defense, and vice versa
-    home_def_factor = _opp_def_factor(game.away_team_id)  # home players vs away defense
-    away_def_factor = _opp_def_factor(game.home_team_id)  # away players vs home defense
+    # Determine opponent abbreviations for matchup engine
+    # GameInfo.extra may have {'home_abbr': 'PHI', 'away_abbr': 'CLE'}
+    extra = game.extra if hasattr(game, "extra") and isinstance(game.extra, dict) else {}
+    home_abbr = extra.get("home_abbr", game.home_team or "")
+    away_abbr = extra.get("away_abbr", game.away_team or "")
 
-    for team_id, team_name, def_factor in [
-        (game.home_team_id, game.home_team, home_def_factor),
-        (game.away_team_id, game.away_team, away_def_factor),
+    # B3-F1: Run project_game() once for team-reconciled projections.
+    # market_total/market_spread are populated by runner.py from fixtures.
+    market_total = float(extra.get("market_total", 0))
+    market_spread = float(extra.get("market_spread", 0))
+    _no_anchor = bool(extra.get("_no_market_anchor"))
+    if _no_anchor:
+        print(f"[nba_player_props] [NO MARKET ANCHOR] {game.away_team} @ "
+              f"{game.home_team} — using model-only fallback")
+
+    # Fetch injury exclusions (Out/IR players)
+    injury_exclude = set()
+    engine = _get_engine()
+    if engine:
+        try:
+            if not hasattr(engine, "_injury_report"):
+                engine.fetch_injury_report()
+                engine.log_injury_snapshot()
+            injury_exclude = engine.get_excluded_players()
+            if injury_exclude:
+                # Filter to players relevant to this game's teams
+                game_exclude = {n for n in injury_exclude
+                                if engine._injury_report.get(n, {}).get("team") in
+                                (home_abbr, away_abbr)}
+                if game_exclude:
+                    print(f"[nba_player_props] Excluding {len(game_exclude)} "
+                          f"injured players: {', '.join(sorted(game_exclude)[:5])}"
+                          f"{'...' if len(game_exclude) > 5 else ''}")
+                injury_exclude = game_exclude
+        except Exception as e:
+            print(f"[nba_player_props] Injury fetch failed: {e}")
+
+    game_projs = _engine_game_projection(
+        home_abbr, away_abbr,
+        market_total=market_total,
+        market_spread=market_spread,
+        exclude_players=injury_exclude or None,
+    )
+
+    # Build injury_statuses dict for sim availability draws
+    # Maps player_name -> status string for non-excluded players
+    # (Out/IR already excluded above; this carries DTD/GTD/Questionable/Probable)
+    injury_statuses = {}
+    if engine and hasattr(engine, "_injury_report"):
+        for pname, info in engine._injury_report.items():
+            if info.get("team") in (home_abbr, away_abbr):
+                status = info.get("status")
+                if status and pname not in injury_exclude:
+                    injury_statuses[pname] = status
+
+    # Compute hours to tip for timing-conditional P(plays) rates
+    hours_to_tip = None
+    try:
+        from datetime import datetime, timezone
+        tip_utc = datetime.fromisoformat(game.commence_time.replace("Z", "+00:00"))
+        now_utc = datetime.now(timezone.utc)
+        hours_to_tip = (tip_utc - now_utc).total_seconds() / 3600
+        if hours_to_tip < 0:
+            hours_to_tip = 0.0
+    except Exception:
+        pass
+
+    # B5: Run joint-draw simulation for SGP pricing (non-blocking)
+    game_sim = None
+    try:
+        _, game_sim = _engine_game_simulation(
+            home_abbr, away_abbr,
+            market_total=market_total,
+            market_spread=market_spread,
+            exclude_players=injury_exclude or None,
+            injury_statuses=injury_statuses or None,
+            hours_to_tip=hours_to_tip,
+        )
+        if game_sim is not None:
+            print(f"[nba_player_props] B5 sim: {game_sim.n_draws} draws, "
+                  f"{len(game_sim.player_names)} players"
+                  f"{f', {len(injury_statuses)} with injury status' if injury_statuses else ''}")
+    except Exception as e:
+        print(f"[nba_player_props] B5 sim skipped: {e}")
+
+    # Pre-fetch defensive factors for both opponents (fallback path)
+    home_def_pts = _opp_def_factor(game.away_team_id, away_abbr, "points")
+    away_def_pts = _opp_def_factor(game.home_team_id, home_abbr, "points")
+
+    for team_id, team_name, def_factor, is_home in [
+        (game.home_team_id, game.home_team, home_def_pts, True),
+        (game.away_team_id, game.away_team, away_def_pts, False),
     ]:
+        opp_abbr = away_abbr if is_home else home_abbr
         roster = ds.get_nba_team_roster(team_id)
         if not roster:
             continue
         for player in roster:
             try:
-                props = _scout_player(player, game, team_name, scout_date,
-                                      def_factor=def_factor)
+                player_name = player.get("fullName") or player.get("displayName", "")
+
+                # B3: Use reconciled game-level projection; fall back to per-player
+                eng_proj = (game_projs or {}).get(player_name)
+                if eng_proj is None:
+                    eng_proj = _engine_projection(player_name, opp_abbr, is_home)
+
+                props = _scout_player(
+                    player, game, team_name, scout_date,
+                    def_factor=def_factor,
+                    engine_proj=eng_proj,
+                )
+                # B3-F1: Tag every prop from this game with NO MARKET ANCHOR
+                if _no_anchor:
+                    for p in props:
+                        if hasattr(p, "risk_factors") and isinstance(p.risk_factors, list):
+                            p.risk_factors.append("NO MARKET ANCHOR")
                 results.extend(props)
             except Exception as exc:
                 print(f"[nba_player_props] skip {player.get('fullName', '?')}: {exc}")
 
+    # B5: Attach simulation result for SGP/parlay queries
+    # Callers can access via scout_game_with_sim() or the module-level cache
+    game_key = f"{away_abbr}@{home_abbr}"
+    if game_sim is not None:
+        _SIM_CACHE[game_key] = game_sim
+    # S5-2: Store context needed for nba_forward_preds persistence
+    _SIM_CONTEXT[game_key] = {
+        "injury_statuses": injury_statuses or {},
+        "hours_to_tip": hours_to_tip,
+    }
+
     return results
+
+
+# B5: Module-level sim cache for SGP queries after scout_game() runs
+_SIM_CACHE: dict = {}
+# S5-2: Parallel context cache for forward-test persistence
+_SIM_CONTEXT: dict = {}
+
+
+def get_game_sim(away_abbr: str, home_abbr: str):
+    """Retrieve the SimulationResult for a game after scout_game() has run.
+
+    Returns None if simulation wasn't run or game not found.
+    """
+    return _SIM_CACHE.get(f"{away_abbr}@{home_abbr}")
+
+
+def get_game_sim_context(away_abbr: str, home_abbr: str) -> dict | None:
+    """Retrieve injury_statuses and hours_to_tip stored at scout time.
+
+    Returns dict with 'injury_statuses' and 'hours_to_tip', or None.
+    """
+    return _SIM_CONTEXT.get(f"{away_abbr}@{home_abbr}")

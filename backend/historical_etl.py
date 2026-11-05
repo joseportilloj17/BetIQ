@@ -40,10 +40,11 @@ from datetime import datetime
 
 from sqlalchemy import (
     Column, Integer, String, Float, Text, DateTime,
-    create_engine, text,
+    create_engine, event, text,
     or_ as db_or, and_ as db_and,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.pool import NullPool
 
 # Ensure the backend directory is on sys.path so config imports cleanly
 sys.path.insert(0, os.path.dirname(__file__))
@@ -61,7 +62,17 @@ log = logging.getLogger(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "historical.db")
 DB_URL  = f"sqlite:///{os.path.abspath(DB_PATH)}"
 
-engine       = create_engine(DB_URL, connect_args={"check_same_thread": False})
+engine       = create_engine(DB_URL, connect_args={"check_same_thread": False},
+                            poolclass=NullPool)
+
+@event.listens_for(engine, "connect")
+def _set_hist_pragmas(dbapi_conn, _rec):
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=30000")
+    cursor.execute("PRAGMA journal_size_limit=67108864")
+    cursor.close()
+
 SessionLocal = sessionmaker(bind=engine)
 Base         = declarative_base()
 
