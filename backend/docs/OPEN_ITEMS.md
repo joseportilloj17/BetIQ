@@ -706,7 +706,7 @@ Source field tracks provenance: `nba_pdf`, `sleeper`, `espn`. PDF wins when pres
 | S5-3 | Forward weeks separate | **ACTIVE** | 2026-27 NBA season underway. First full market-linked capture 2026-11-15: 4,602 rows (9 games, 620 main + 3,953 alt + 29 fallback). Prior rows (Nov 8-9, 430 rows) are no_market=1 fallback only. Pre-tip snapshots scheduled for game windows. First Brier read at N≥100 games (~late-Dec 2026). |
 | S5-4 | Pre-register rules | **DONE** | See locked configuration below. |
 
-#### S5-4: Pre-registered sim configuration (RE-FROZEN 2026-11-15, commit c26cb6e)
+#### S5-4: Pre-registered sim configuration (RE-FROZEN 2026-11-15, tag `s5-4-freeze-2026-11-15`, commit 47389d4)
 
 **Amendment log**: Original freeze 2026-10-30. Re-frozen 2026-11-15 before any day-1 data analyzed. Changes from original: P(plays) rates updated from hand-set to measured (178 game dates); timing-conditional tables added; role-based base rates added; supplementary blowout/OT/early-exit constants documented. No sim logic or engine parameters changed — only injury P(plays) inputs.
 
