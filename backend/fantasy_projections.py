@@ -1762,6 +1762,18 @@ def store_forward_predictions(season: int, week: int, gaps: list[dict],
 
         sup_rule = g.get("suppression_rule")
 
+        # When the market line moves, demote stale 'main' rows for this
+        # (player, stat, week, method) to 'stale_main' so only the current
+        # line is treated as the main line.
+        if line_depth == "main":
+            conn.execute("""
+                UPDATE fantasy_forward_preds
+                SET line_depth = 'stale_main'
+                WHERE season = ? AND week = ? AND player_name = ? AND stat_type = ?
+                  AND method = 'distributional' AND line_depth = 'main'
+                  AND prop_line != ?
+            """, (season, week, g["player"], stat, g["prop_line"]))
+
         # Preserve original_created_at: if row already exists, keep its created_at
         existing_created = conn.execute("""
             SELECT created_at FROM fantasy_forward_preds
@@ -1807,6 +1819,14 @@ def store_forward_predictions(season: int, week: int, gaps: list[dict],
         # For count stats on MAIN lines, ALSO store mean-direction prediction
         if stat_cat == "count" and line_depth == "main":
             mean_dir = g["direction"]
+            # Demote stale main mean_direction rows (same logic as distributional)
+            conn.execute("""
+                UPDATE fantasy_forward_preds
+                SET line_depth = 'stale_main'
+                WHERE season = ? AND week = ? AND player_name = ? AND stat_type = ?
+                  AND method = 'mean_direction' AND line_depth = 'main'
+                  AND prop_line != ?
+            """, (season, week, g["player"], stat, g["prop_line"]))
             # Check existing created_at for mean_direction row
             existing_md = conn.execute("""
                 SELECT created_at FROM fantasy_forward_preds

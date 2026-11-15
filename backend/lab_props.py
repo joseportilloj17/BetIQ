@@ -795,11 +795,10 @@ def build_lab_props(season: int | None = None,
     preds = [dict(r) for r in preds_rows]
 
     # Dedup: when multiple rows are tagged 'main' for the same (player, stat),
-    # keep the one whose prop_line is closest to the consensus mean (the model's
-    # actual projection). This anchors on the most relevant line — the one
-    # closest to what the model projects — rather than an arbitrary median of
-    # lines from different books. Relabel the rest as 'book_alt'.
-    from statistics import median as _median
+    # keep the most recently created row (reflects the current market line).
+    # When lines move between refreshes, old rows linger with stale consensus
+    # values — preferring latest created_at ensures we show the live line.
+    # Relabel stale duplicates as 'stale_main'.
     _main_groups = defaultdict(list)  # (player, stat) → [indices]
     for i, p in enumerate(preds):
         if p.get("line_depth") == "main":
@@ -807,16 +806,12 @@ def build_lab_props(season: int | None = None,
     for key, indices in _main_groups.items():
         if len(indices) <= 1:
             continue
-        # Use median of consensus means as anchor (robust to outlier books)
-        means = [preds[i].get("consensus_mean") or 0 for i in indices]
-        anchor = _median(means)
-        # Keep the line closest to the consensus anchor
-        best_idx = min(indices,
-                       key=lambda i: (abs((preds[i].get("prop_line") or 0) - anchor),
-                                      preds[i].get("prop_line") or 0))
+        # Keep the row with the latest created_at timestamp
+        best_idx = max(indices,
+                       key=lambda i: preds[i].get("created_at") or "")
         for i in indices:
             if i != best_idx:
-                preds[i]["line_depth"] = "book_alt"
+                preds[i]["line_depth"] = "stale_main"
 
     preds_by_team = defaultdict(list)
 

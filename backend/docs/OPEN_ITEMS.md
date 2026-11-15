@@ -1392,6 +1392,9 @@ All items collecting forward data. Each has a decision date and minimum N.
 | FW-1 | NBA S5-2 market comparison | **BLOCKED — threshold mismatch** | Late-Dec 2026 (N≥100 games) | Day 1 = 2026-11-08 (212 rows, 7 games). 193/212 graded. **Model↔market join: 0/193 (0%)**. Unjoin causes: line not posted for player (138, 71%), alt market one-sided/over-only (45, 23%), player not in props (10, 5%). Root cause: `_pick_best_threshold()` maximizes |P-0.5|, always selecting the lowest rung (pts 10.5, reb 3.5, pra 14.5) — far below market-posted main lines for starters. **Action**: must persist predictions at market-posted lines. Also fixed: `player_props.game_date` UTC→CT backfill (704K rows); `creator_tier.py` uses `_utc_to_ct_date()` going forward. Oct 30–Nov 7 LOST. |
 | FW-2 | NFL prereg rec_yds OVER (lognormal) | **COLLECTING** | W14 (~2026-12-05) with interim looks W10/W12 | Three regimes: R1 (W2-W8, suppression bug), R2 (W9 pre-fix), R3 (W10+, clean). Verdict on R3 data only. Coverage 156/156 rec_yds players on main line. **R1 corrected** (2026-11-07f): 13/154 picks were post-kickoff contaminated; clean R1: N=141, WR=66.0%, ROI=+24.7%. **Shadow gamma** (2026-11-08b): `p_over_v12_gamma` stored from W10; post-W14 head-to-head lognormal vs gamma on same predictions. **Amendment 2026-11-08** (pre-W10): Added O'Brien-Fleming interim analysis at W10/W12/W14 (alpha spending 0.0005/0.014/0.045 for two-sided; see `data/prereg_fw2_amendment_20261108.md`). **W2-W8 head-to-head** (2026-11-08): all yardage (main+alt, N=6,432) gamma Brier 0.167 vs lognormal 0.209 (Δ=-0.042, t=-17.6); main-line only (N=2,698) Δ=-0.086; calibration error 0.047 vs 0.172; main-line prereg ROI +13.5% vs -0.4%. All in-sample for base rates (W2-W5 training); W5-W8 OOS improvements *larger*. |
 | FW-2b | NFL prereg rec_yds OVER (shifted-gamma) | **COLLECTING** | W14 (~2026-12-05) with interim looks W10/W12 | **Parallel prereg** registered 2026-11-08 (pre-W10). Uses `p_over_v12_gamma` (shifted-gamma CDF) instead of `p_over` (lognormal). Same design: rec_yds OVER, edge ≥ 5pp vs devigged implied, main-line, method=distributional. Same O'Brien-Fleming schedule. Runs simultaneously with FW-2 on identical predictions — only the P(over) and therefore edge calculation differs. See `data/prereg_fw2b_gamma_20261108.md`. |
+| FW-2c | NFL low-line OVER (shifted-gamma) | **COLLECTING — BET** | W14 (~2026-12-05) with OBF interim W10/W12/W14 | Registered 2026-11-15 pre-W10 kickoff. See definition below. **OVER only** — UNDER ROI -28.6% (N=28). Live bets placed from W10. |
+| FW-2d | NFL QB rush_yds (shifted-gamma) | **COLLECTING — TRACK ONLY** | W14 (~2026-12-05) with OBF interim W10/W12/W14 | Registered 2026-11-15 pre-W10. See definition below. Both sides; UNDER stronger (+32.2%) but OVER not significant (+16.0%). Track only until W14 verdict. |
+| FW-2e | NFL edge >15pp non-low non-QB-rush (shifted-gamma) | **COLLECTING — TRACK ONLY** | W14 (~2026-12-05) with OBF interim W10/W12/W14 | Registered 2026-11-15 pre-W10. See definition below. Diverse composition (rec_yds 62, receptions 52, rush_yds 51). Track only — high edge might be model artifact despite +15.9% ROI. |
 | FW-3 | SGP validation (personal bets) | **PARTIAL** | Pending Pikkit export | 602 bets in bets.db (2024-01-04 → 2026-04-23). 100/589 fully priceable (17%). Overcharge c rises 1.05→1.18 by leg count. Need Pikkit export ~2026-04-24 → today to complete. |
 | FW-4 | Injury edge-at-news collection | **COLLECTING** | N≥50 events (~Jan 2027) | `injury_watcher.py` polls Sleeper every 15 min on game days. 1,417 snapshots in `injury_edge_snapshots`. Tracks teammate prop edge at first post-news fetch vs baseline. |
 | FW-5 | NFL-12 suppression re-validation | **BLOCKED** | After W11 (~2026-11-21) | Re-validate `alt_over`, `deep_alt_under_rec_pass`, `rb_rush_over_low_conv` on R3 data. Need N≥30-50 per rule. |
@@ -1399,6 +1402,82 @@ All items collecting forward data. Each has a decision date and minimum N.
 | FW-7 | NFL-13 elite-CB shadow forward test | **COLLECTING** | End of playoffs (W19+, ~Feb 2027) | Market-comparison design. 37 frozen elite CBs. MDE ~19 yds at N=30. Expect INCONCLUSIVE. Weekly shadow log entries. |
 | FW-8 | NBA S5-3 forward weeks | **ACTIVE** | Late-Dec 2026 (N≥100 games) | 2026-27 season underway. Day 1 = 2026-11-08 (212 rows: 97 scout + 115 pre-tip, 7 games). Nov 8 graded: 193/212 (6 players unmatched: Sabonis, Hardy, Markkanen, Powell, Prince, Missi). Two code bugs fixed (datetime shadowing + missing _fetch_market_lines). Four infrastructure fixes deployed 2026-11-09: git hash capture, health status display, db_backup retry, per-game tip freeze. Market anchors missing (fixtures empty) — model-only fallback. |
 | FW-9 | Lognormal vs gamma weekly update | **ACTIVE** | OBF interim W10/W12/W14 | `backend/h2h_pover_analysis.py` — re-run after each week grades. Compare `p_over` (lognormal) vs `p_over_v12_gamma` (shifted-gamma) Brier on R3 data. Apply OBF boundaries (W10: \|z\|>3.471, W12: \|z\|>2.454, W14: \|z\|>2.004). Baseline W2-W8: **all yardage (main+alt, N=6,432) Δ=-0.042 (t=-17.6)**; **main-line only (N=2,698) Δ=-0.086**. Use main-line as primary metric (matches prereg population). |
+
+#### FW-2c: Pre-registered low-line OVER rule (registered 2026-11-15T16:20Z, commit 8a172b3)
+
+**Population**: `fantasy_forward_preds` WHERE `season=2026 AND method='distributional' AND line_depth='main' AND data_error IS NULL`. Stale main-line duplicates excluded (see 2026-11-15 data-quality note below).
+
+**Qualifying criteria** (all must hold):
+1. **Low line**: `(stat_type IN ('pass_yds','rush_yds','rec_yds') AND prop_line < 10)` OR `(stat_type = 'receptions' AND prop_line <= 1.5)`
+2. **Not QB rush**: exclude `position = 'QB' AND stat_type = 'rush_yds'` (that's FW-2d)
+3. **OVER side only**: gamma P(over) > 0.5 for yardage, lognormal P(over) > 0.5 for counts → side = OVER
+4. **Edge ≥ 3pp**: `(model_prob - mkt_prob) × 100 ≥ 3.0` where `model_prob = p_over_v12_gamma` (yardage) or `p_over` (counts), `mkt_prob = devigged_implied`
+5. **Price band ≤ +100**: FanDuel decimal price ≤ 2.0
+6. **Positive EV**: `model_prob × (fd_price - 1) - (1 - model_prob) > 0`
+7. **Not stale**: `NOT (prop_line >= 5 AND ABS(consensus_mean - prop_line) > 0.40 * prop_line AND ABS(consensus_mean - prop_line) > 10)`
+8. **Not past kickoff**: `kickoff_utc > now`
+9. **Injury**: Out/IR/Doubtful excluded; Questionable listed separately, re-checked after inactives
+
+**Staking**: 1u for yardage stats, 0.5u for count stats (lower model confidence). Max 1 bet per player, 2 per game, 5u total per slate.
+
+**Decision**: same OBF schedule as FW-2 (interim W10: |z|>3.471, W12: |z|>2.454, W14: |z|>2.004). Primary metric: ROI with game-clustered bootstrap CI excluding zero.
+
+**Backtest (in-sample, deduped)**: OVER N=111, 50 games, WR=81.1%, ROI=+45.6% [+32.1%, +58.0%]. UNDER excluded (N=28, ROI=-28.6%). Both early (W2-W5) and late (W6-W9) periods significant for OVER.
+
+#### FW-2d: Pre-registered QB rush_yds rule (registered 2026-11-15T16:20Z, commit 8a172b3)
+
+**Population**: same as FW-2c.
+
+**Qualifying criteria**:
+1. `position = 'QB' AND stat_type = 'rush_yds'`
+2. Edge ≥ 3pp (gamma P(over) for rush_yds)
+3. Price band ≤ +100 (FanDuel decimal ≤ 2.0)
+4. Positive EV, not stale, not past kickoff, injury filtered (same as FW-2c)
+5. **Both OVER and UNDER** — UNDER stronger (+32.2% ROI) but sample small
+
+**Status**: TRACK ONLY. Live bets from W10 (user's decision to include).
+
+**Staking**: 1u per pick. Max 1 per player, 2 per game (within 5u total with FW-2c).
+
+**Backtest (in-sample, deduped)**: ALL N=80, 57 games, WR=65.0%, ROI=+22.7% [+1.3%, +42.6%]. UNDER N=33, +32.2% [+4.7%, +59.5%]. OVER N=47, +16.0% [-12.3%, +43.2%] (not significant). Early (W2-W5) strong +44.8%, late (W6-W9) +6.3% (not significant) — possible regime drift.
+
+#### FW-2e: Pre-registered edge >15pp rule (registered 2026-11-15T16:20Z, commit 8a172b3)
+
+**Population**: same as FW-2c.
+
+**Qualifying criteria**:
+1. Edge > 15pp (same gamma/lognormal P(over) and devigged_implied as FW-2c)
+2. **Not low-line** (not qualifying for FW-2c) and **not QB rush** (not qualifying for FW-2d)
+3. Price band ≤ +100 (FanDuel decimal ≤ 2.0)
+4. Positive EV, not stale, not past kickoff, injury filtered
+
+**Status**: TRACK ONLY (no bets). Diverse composition: rec_yds 62, receptions 52, rush_yds 51, pass_tds 10, pass_yds 5. High edge may be model artifact — tracking to distinguish.
+
+**Backtest (in-sample, deduped)**: N=153, 62 games, WR=61.4%, ROI=+15.9% [+0.2%, +31.5%] (barely significant).
+
+---
+
+### 2026-11-15: Stale main-line duplicate data-quality fix
+
+**Bug**: when market lines moved between projection refreshes (e.g. Metchie rec_yds 13.5→7.5), the UNIQUE constraint `(season, week, player_name, stat_type, method, prop_line, line_depth)` included `prop_line`, so old rows at the previous line kept `line_depth='main'` alongside the new row at the current line. Both were treated as main-line predictions.
+
+**Impact**: 3,874 stale duplicate rows across all 2026 weeks (44% of graded main-line data). All calibration figures, scorecard computations, and h2h analyses prior to this fix used contaminated data with double-counted predictions. FW-2 R1 was partially affected (alt-line rows also duplicated).
+
+**Fix (3 parts)**:
+1. `fantasy_projections.py`: `store_forward_predictions()` now runs `UPDATE SET line_depth='stale_main'` on existing main rows with a different `prop_line` before inserting the new row.
+2. `lab_props.py`: dedup logic changed from "closest to median consensus mean" to "latest `created_at`" — ensures frontend shows the current market line.
+3. DB cleanup: 3,874 rows demoted from `main` to `stale_main`. Zero main-line duplicates remain.
+
+**Corrected calibration (W2-W8, deduped, edge ≥ 3pp, price ≤ +100)**:
+
+| Category | N (old→new) | ROI | 95% CI (10k boot) | Sig? |
+|---|---|---|---|---|
+| (a) QB rush | 154→84 | +24.8% | [+4.4%, +43.5%] | YES (was no) |
+| (b) Low lines | 259→163 | +27.4% | [+11.8%, +41.7%] | YES |
+| (c) Edge >15pp | 374→153 | +15.9% | [+0.2%, +31.5%] | YES (was no) |
+| (d) Rest 3-15pp | 1736→709 | +4.6% | [-3.3%, +12.5%] | no |
+
+**Action**: all forward analyses (h2h, FW-2 R1, scorecard, ladder) must be re-run on deduped data. Prior figures are superseded.
 
 ## Cleanup Reminders
 
