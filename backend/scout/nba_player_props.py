@@ -533,6 +533,167 @@ def _engine_projection(player_name: str, opp_abbr: str,
     return _proj_to_dict(proj)
 
 
+# ── EV-based pick selection ───────────────────────────────────────────────────
+
+# Sim stat_type → market_key for MKT_TO_SIM reverse lookup
+_SIM_TO_MKT = {
+    "PTS": "player_points", "REB": "player_rebounds",
+    "AST": "player_assists", "FG3M": "player_threes",
+    "STL": "player_steals", "BLK": "player_blocks",
+    "PRA": "player_pra",
+}
+
+# Odds band filter: skip lines with odds outside this range
+# Min at 1.667 (-150) to match NFL evidence until NBA has its own calibration
+_MIN_ODDS = 1.667  # -150
+_MAX_ODDS = 3.50   # +250
+
+
+def _ev_upgrade_props(
+    props: List[ScoutedProp],
+    sim,
+    game: GameInfo,
+) -> None:
+    """Replace each prop's threshold with the best-EV market line (in-place).
+
+    For each (player, stat) in props, queries player_props for all posted
+    lines, computes EV = model_P × payout − (1 − model_P) at the best price,
+    and replaces the prop's threshold/hit_probability/side if a positive-EV
+    line exists within the odds band.
+
+    Falls back to the original _pick_best_threshold selection if no market
+    data or no positive-EV lines.
+    """
+    from scout.runner import _get_market_lines_for_game, _MKT_KEY_TO_STAT
+
+    # Convert commence_time to ET date for player_props lookup
+    try:
+        from zoneinfo import ZoneInfo
+        _et = ZoneInfo("America/New_York")
+        tip_utc = datetime.fromisoformat(
+            game.commence_time.replace("Z", "+00:00"))
+        game_date = tip_utc.astimezone(_et).strftime("%Y-%m-%d")
+    except Exception:
+        game_date = (game.commence_time or "")[:10]
+
+    market_lines = _get_market_lines_for_game(
+        game_date, game.home_team, game.away_team
+    )
+    if not market_lines:
+        return
+
+    # Build lookup: (player_name_norm, stat_type) → list of market line dicts
+    from collections import defaultdict
+    from scout.runner import _normalize_player_name
+
+    mkt_by_player_stat = defaultdict(list)
+    for ml in market_lines:
+        norm = (_normalize_player_name(ml["player_name"]) or "").lower()
+        mkt_by_player_stat[(norm, ml["stat_type"])].append(ml)
+
+    # Also build alias map (Odds API name → sim name) for matching
+    sim_players = set(sim._player_idx.keys())
+    sim_norm_map = {}
+    for sp in sim_players:
+        n = (_normalize_player_name(sp) or "").lower()
+        sim_norm_map[n] = sp
+
+    upgraded = 0
+    was_heavy_fav_alt = 0
+
+    for prop in props:
+        if prop.sport != "NBA":
+            continue
+
+        # Map sim stat name
+        sim_stat_key = {
+            "player_points": "PTS", "player_rebounds": "REB",
+            "player_assists": "AST", "player_threes": "FG3M",
+            "player_steals": "STL", "player_blocks": "BLK",
+            "player_pra": "PRA",
+        }.get(prop.market_type)
+        if not sim_stat_key or prop.player_name not in sim._player_idx:
+            continue
+
+        # Check if current pick is a heavy-favorite alt rung
+        # (P(over) > 0.80 at a low threshold — characteristic of _pick_best_threshold)
+        orig_p_over = sim.p_over(prop.player_name, sim_stat_key, prop.threshold)
+        if orig_p_over > 0.80:
+            was_heavy_fav_alt += 1
+
+        # Find market lines for this player × stat
+        pnorm = (_normalize_player_name(prop.player_name) or "").lower()
+        candidates = mkt_by_player_stat.get((pnorm, prop.market_type), [])
+        if not candidates:
+            continue
+
+        # Evaluate EV at each candidate line
+        best_ev = -999.0
+        best_line = None
+        for ml in candidates:
+            price = ml["best_price"]
+            if price < _MIN_ODDS or price > _MAX_ODDS:
+                continue
+
+            point = ml["point"]
+            try:
+                p_over = sim.p_over(prop.player_name, sim_stat_key, point)
+                p_under = sim.p_under(prop.player_name, sim_stat_key, point)
+            except Exception:
+                continue
+
+            # Compute EV for both sides
+            ev_over = p_over * price - 1.0
+            ev_under = p_under * price - 1.0
+
+            # Use the better side
+            if ml["side"] == "over":
+                ev = ev_over
+                model_p = p_over
+            else:
+                ev = ev_under
+                model_p = p_under
+
+            # For two-sided lines, also check the other side
+            if ml["devig_method"] == "multiplicative":
+                # We stored best_price for the better-priced side
+                # Check if flipping gives better EV
+                if ml["side"] == "over" and ev_under > ev:
+                    ev = ev_under
+                    model_p = p_under
+
+            if ev > best_ev:
+                best_ev = ev
+                best_line = {
+                    "point": point,
+                    "model_p": model_p,
+                    "side": "over" if model_p == p_over else "under",
+                    "ev": ev,
+                    "price": price,
+                    "line_depth": ml["line_depth"],
+                }
+
+        if best_line is not None and best_ev > 0:
+            # Replace prop attributes with best-EV selection
+            prop.threshold = best_line["point"]
+            prop.side = best_line["side"]
+            prop.hit_probability = round(best_line["model_p"], 4)
+            prop.quality_grade = grade_from_probability(best_line["model_p"])
+            if hasattr(prop, "confidence_factors") and isinstance(prop.confidence_factors, list):
+                prop.confidence_factors.append(
+                    f"EV-selected: {best_line['ev']:+.3f} at {best_line['price']:.2f} "
+                    f"({best_line['line_depth']})")
+            # Shadow-only: NBA EV picks are not actionable while UNCALIBRATED
+            if hasattr(prop, "risk_factors") and isinstance(prop.risk_factors, list):
+                if "EV_SHADOW" not in prop.risk_factors:
+                    prop.risk_factors.append("EV_SHADOW")
+            upgraded += 1
+
+    if upgraded or was_heavy_fav_alt:
+        print(f"[nba_player_props] EV upgrade: {upgraded}/{len(props)} props upgraded, "
+              f"{was_heavy_fav_alt} were heavy-favorite alt rungs before upgrade")
+
+
 # ── Game-level entry point ─────────────────────────────────────────────────────
 
 def scout_game(game: GameInfo) -> List[ScoutedProp]:
@@ -604,7 +765,6 @@ def scout_game(game: GameInfo) -> List[ScoutedProp]:
     # Compute hours to tip for timing-conditional P(plays) rates
     hours_to_tip = None
     try:
-        from datetime import datetime, timezone
         tip_utc = datetime.fromisoformat(game.commence_time.replace("Z", "+00:00"))
         now_utc = datetime.now(timezone.utc)
         hours_to_tip = (tip_utc - now_utc).total_seconds() / 3600
@@ -676,6 +836,14 @@ def scout_game(game: GameInfo) -> List[ScoutedProp]:
         "injury_statuses": injury_statuses or {},
         "hours_to_tip": hours_to_tip,
     }
+
+    # ── EV-based pick selection: replace _pick_best_threshold output with
+    #    best-EV market line when sim + market data are available ─────────
+    if game_sim is not None:
+        try:
+            _ev_upgrade_props(results, game_sim, game)
+        except Exception as exc:
+            print(f"[nba_player_props] EV upgrade failed (using fallback): {exc}")
 
     return results
 

@@ -117,6 +117,7 @@ _PROP_MARKETS: dict[str, list[str]] = {
         "player_pass_tds",
         "player_pass_yds",
         "player_rush_yds",
+        "player_rush_attempts",
         "player_receptions",
         "player_reception_yds",
         "player_anytime_td",
@@ -124,6 +125,7 @@ _PROP_MARKETS: dict[str, list[str]] = {
         "player_pass_yds_alternate",
         "player_rush_yds_alternate",
         "player_reception_yds_alternate",
+        "player_receptions_alternate",
     ],
 }
 
@@ -189,7 +191,8 @@ THRESHOLD_SUSPENDED  = 100      # remaining < this → all fetches suspended
 # ─── DB helpers ───────────────────────────────────────────────────────────────
 
 def _hist_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(os.path.abspath(_HIST_DB))
+    conn = sqlite3.connect(os.path.abspath(_HIST_DB), timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -512,10 +515,9 @@ def check_credit_tripwire(date_str: str | None = None) -> dict:
 
     Returns dict with all fields + an 'alert' bool (True if gap > 5% AND > 50).
 
-    NOTE: Backfill scripts (clv_backfill, props_clv_backfill, soccer_clv_backfill)
-    call TheOddsAPI directly and do NOT log to credits_log. On days those run,
-    the gap will be elevated without indicating external compromise. The alert
-    message includes this caveat so the operator can check whether a backfill ran.
+    NOTE: Backfill scripts (clv_backfill, props_clv_backfill, soccer_clv_backfill,
+    f5_shadow) now route API calls through _log_credits(), so their usage is
+    captured in credits_log and no longer causes false-positive tripwire alerts.
     """
     _ensure_tables()
     conn = _hist_conn()
@@ -1008,7 +1010,7 @@ def fetch_player_props(sport_key: str, bookmakers: list[str] | None = None,
     for ev in (event_list_data or []):
         if ev.get("id") in imminent_ids:
             imminent_meta[ev["id"]] = {
-                "game_date": (ev.get("commence_time") or "")[:10],
+                "game_date": _utc_to_ct_date(ev.get("commence_time")) or (ev.get("commence_time") or "")[:10],
                 "home_team": ev.get("home_team", ""),
                 "away_team": ev.get("away_team", ""),
             }
@@ -1085,6 +1087,20 @@ def fetch_player_props(sport_key: str, bookmakers: list[str] | None = None,
         "credits_budget_status": budget,
     }
     print(f"[PlayerProps] {result}")
+    return result
+
+
+def fetch_pretip_nba_props(min_before_low: int = 30, min_before_high: int = 60) -> dict:
+    """Fetch NBA props for games tipping within a narrow pre-tip window.
+
+    Wraps fetch_player_props with hours_ahead=1 so only games starting
+    within the next hour are captured, then returns which event IDs were hit.
+    """
+    result = fetch_player_props("basketball_nba", hours_ahead=1)
+    result["pretip_window"] = f"{min_before_low}-{min_before_high}min"
+    # Expose event IDs for the scheduler's dedup tracking
+    result["event_ids"] = list(result.get("event_meta", {}).keys()) if "event_meta" in result else []
+    result["events_pretip"] = result.get("events_scoped", 0)
     return result
 
 

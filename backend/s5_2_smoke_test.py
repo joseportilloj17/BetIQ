@@ -166,21 +166,37 @@ if sample_game:
         }
         mkt_key = _stat_to_mkt.get(sample_stat, sample_stat)
 
-        market_lines = hcon.execute("""
-            SELECT point, price_over, price_under, bookmaker
+        # player_props stores one row per side (over_under='Over'/'Under')
+        # Pivot to get over+under prices per (bookmaker, point)
+        market_raw = hcon.execute("""
+            SELECT bookmaker, point, over_under, price
             FROM player_props
             WHERE game_date = ? AND player_name = ?
               AND market_key = ? AND sport_key = 'basketball_nba'
-            LIMIT 10
+            ORDER BY bookmaker, point
         """, (target_date, sample_player, mkt_key)).fetchall()
+
+        # Pivot: group by (bookmaker, point) → {over_price, under_price}
+        _pivot: dict[tuple, dict] = {}
+        for mr in market_raw:
+            key = (mr['bookmaker'], mr['point'])
+            if key not in _pivot:
+                _pivot[key] = {'bookmaker': mr['bookmaker'], 'point': mr['point'],
+                               'over_price': None, 'under_price': None}
+            if mr['over_under'] == 'Over':
+                _pivot[key]['over_price'] = mr['price']
+            elif mr['over_under'] == 'Under':
+                _pivot[key]['under_price'] = mr['price']
+        market_lines = [v for v in _pivot.values()
+                        if v['over_price'] is not None and v['under_price'] is not None]
 
         if market_lines:
             print(f"   Player: {sample_player}, Stat: {sample_stat}")
             print(f"   {'Book':15s} {'Line':>5s} {'mktOver':>8s} {'mktUnder':>8s} "
                   f"{'devig_O':>8s} {'simP_O':>8s} {'diff':>7s}")
             for ml in market_lines[:5]:
-                over_odds = ml['price_over'] or 0
-                under_odds = ml['price_under'] or 0
+                over_odds = ml['over_price'] or 0
+                under_odds = ml['under_price'] or 0
                 # American odds → implied prob
                 def _imp(american):
                     if american is None or american == 0:
@@ -281,6 +297,198 @@ if bdl_fill and bdl_fill['total'] > 0:
 else:
     print("   No rows to check")
 
+# ── 9. New storage columns (market_key, line_depth, devig) ──────────────────
+print(f"\n9. Market-Linked Storage (new columns):")
+try:
+    mkt_rows = hcon.execute("""
+        SELECT line_depth,
+               COUNT(*) as n,
+               COUNT(DISTINCT player_name) as players,
+               COUNT(DISTINCT stat_type) as stats,
+               SUM(CASE WHEN devig_implied IS NOT NULL THEN 1 ELSE 0 END) as has_devig
+        FROM nba_forward_preds
+        WHERE game_date = ? AND snapshot_type = 'scout'
+        GROUP BY line_depth
+        ORDER BY line_depth
+    """, (target_date,)).fetchall()
+    if mkt_rows:
+        for r in mkt_rows:
+            depth = r['line_depth'] or 'NULL'
+            devig_pct = 100 * (r['has_devig'] or 0) / r['n'] if r['n'] > 0 else 0
+            print(f"   {depth:10s}: {r['n']:5d} rows, {r['players']:3d} players, "
+                  f"{r['stats']:2d} stats, devig fill: {devig_pct:.0f}%")
+    else:
+        print("   No rows with line_depth column (pre-rewrite data)")
+
+    # Main-line join rate: rows with line_depth='main' and devig_implied IS NOT NULL
+    main_total = hcon.execute("""
+        SELECT COUNT(*) FROM nba_forward_preds
+        WHERE game_date = ? AND snapshot_type = 'scout' AND line_depth = 'main'
+    """, (target_date,)).fetchone()[0]
+    main_devig = hcon.execute("""
+        SELECT COUNT(*) FROM nba_forward_preds
+        WHERE game_date = ? AND snapshot_type = 'scout'
+          AND line_depth = 'main' AND devig_implied IS NOT NULL
+          AND devig_method = 'multiplicative'
+    """, (target_date,)).fetchone()[0]
+    if main_total > 0:
+        join_pct = 100 * main_devig / main_total
+        print(f"\n   Main-line join rate: {main_devig}/{main_total} ({join_pct:.0f}%) "
+              f"have two-sided devig")
+        target_met = "YES" if join_pct >= 95 else "NO"
+        print(f"   Target (≥95%): {target_met}")
+    else:
+        print(f"\n   Main-line join rate: 0 main-line rows (old storage format)")
+except Exception as exc:
+    main_total = 0
+    print(f"   SKIP: {exc}")
+
+# ── 10. Heavy-favorite check ────────────────────────────────────────────────
+print(f"\n10. Heavy-Favorite Alt Rung Check:")
+try:
+    hf = hcon.execute("""
+        SELECT COUNT(*) total,
+               SUM(CASE WHEN sim_p_over > 0.80 THEN 1 ELSE 0 END) heavy,
+               ROUND(AVG(line), 1) avg_line,
+               ROUND(AVG(sim_median), 1) avg_median
+        FROM nba_forward_preds
+        WHERE game_date = ? AND snapshot_type = 'scout'
+    """, (target_date,)).fetchone()
+    if hf['total'] > 0:
+        hf_pct = 100 * (hf['heavy'] or 0) / hf['total']
+        print(f"   Total: {hf['total']}, Heavy-fav (P>0.80): {hf['heavy']} ({hf_pct:.0f}%)")
+        print(f"   Avg line: {hf['avg_line']}, Avg median: {hf['avg_median']}")
+        if hf_pct > 50:
+            print("   WARNING: >50% heavy-favorites — check if EV upgrade is active")
+    else:
+        print("   No rows")
+except Exception as exc:
+    print(f"   SKIP: {exc}")
+
+# ── 11. Snapshot × line_depth matrix ─────────────────────────────────────────
+print(f"\n11. Snapshot × Line-Depth Matrix:")
+try:
+    matrix = hcon.execute("""
+        SELECT snapshot_type, line_depth,
+               COUNT(*) as n,
+               COUNT(DISTINCT player_name) as players,
+               COUNT(DISTINCT stat_type) as stats,
+               COUNT(DISTINCT game_id) as games
+        FROM nba_forward_preds
+        WHERE game_date = ?
+        GROUP BY snapshot_type, line_depth
+        ORDER BY snapshot_type, line_depth
+    """, (target_date,)).fetchall()
+    if matrix:
+        print(f"   {'snapshot':10s} {'depth':10s} {'rows':>6s} {'players':>8s} "
+              f"{'stats':>6s} {'games':>6s}")
+        for r in matrix:
+            snap = r['snapshot_type'] or 'NULL'
+            depth = r['line_depth'] or 'NULL'
+            print(f"   {snap:10s} {depth:10s} {r['n']:6d} {r['players']:8d} "
+                  f"{r['stats']:6d} {r['games']:6d}")
+    else:
+        print("   No rows")
+except Exception as exc:
+    print(f"   SKIP: {exc}")
+
+# ── 12. Per-tip pre-tip coverage ─────────────────────────────────────────────
+print(f"\n12. Per-Tip Pre-Tip Coverage:")
+try:
+    # Get all games on target_date with their tip-off times (from commence_time in game_id)
+    games_with_tips = hcon.execute("""
+        SELECT DISTINCT game_id, home_team, away_team
+        FROM nba_forward_preds
+        WHERE game_date = ? AND snapshot_type = 'scout'
+    """, (target_date,)).fetchall()
+
+    if games_with_tips:
+        print(f"   {'game':45s} {'scout':>6s} {'pretip':>7s} {'depth_main':>10s} "
+              f"{'depth_alt':>9s} {'fallback':>8s}")
+        for g in games_with_tips:
+            gid = g['game_id']
+            label = f"{g['away_team']} @ {g['home_team']}"
+            scout_n = hcon.execute("""
+                SELECT COUNT(*) FROM nba_forward_preds
+                WHERE game_date = ? AND game_id = ? AND snapshot_type = 'scout'
+            """, (target_date, gid)).fetchone()[0]
+            pretip_n = hcon.execute("""
+                SELECT COUNT(*) FROM nba_forward_preds
+                WHERE game_date = ? AND game_id = ? AND snapshot_type = 'pre_tip'
+            """, (target_date, gid)).fetchone()[0]
+            main_n = hcon.execute("""
+                SELECT COUNT(*) FROM nba_forward_preds
+                WHERE game_date = ? AND game_id = ? AND snapshot_type = 'scout'
+                  AND line_depth = 'main'
+            """, (target_date, gid)).fetchone()[0]
+            alt_n = hcon.execute("""
+                SELECT COUNT(*) FROM nba_forward_preds
+                WHERE game_date = ? AND game_id = ? AND snapshot_type = 'scout'
+                  AND line_depth = 'alt'
+            """, (target_date, gid)).fetchone()[0]
+            fb_n = hcon.execute("""
+                SELECT COUNT(*) FROM nba_forward_preds
+                WHERE game_date = ? AND game_id = ? AND snapshot_type = 'scout'
+                  AND (line_depth = 'fallback' OR line_depth IS NULL)
+            """, (target_date, gid)).fetchone()[0]
+            pretip_str = str(pretip_n) if pretip_n > 0 else "NONE"
+            print(f"   {label:45s} {scout_n:6d} {pretip_str:>7s} "
+                  f"{main_n:10d} {alt_n:9d} {fb_n:8d}")
+
+        # Coverage summary
+        total_games = len(games_with_tips)
+        games_with_pretip = hcon.execute("""
+            SELECT COUNT(DISTINCT game_id) FROM nba_forward_preds
+            WHERE game_date = ? AND snapshot_type = 'pre_tip'
+        """, (target_date,)).fetchone()[0]
+        print(f"\n   Pre-tip coverage: {games_with_pretip}/{total_games} games "
+              f"({100*games_with_pretip/total_games:.0f}%)")
+    else:
+        print("   No games found")
+except Exception as exc:
+    print(f"   SKIP: {exc}")
+
+# ── 13. no_market rows ──────────────────────────────────────────────────────
+print(f"\n13. No-Market (Fallback) Rows:")
+try:
+    nm = hcon.execute("""
+        SELECT COUNT(*) total,
+               SUM(CASE WHEN no_market = 1 THEN 1 ELSE 0 END) flagged
+        FROM nba_forward_preds
+        WHERE game_date = ? AND snapshot_type = 'scout'
+    """, (target_date,)).fetchone()
+    if nm['total'] > 0:
+        flagged = nm['flagged'] or 0
+        pct = 100 * flagged / nm['total']
+        print(f"   {flagged}/{nm['total']} rows flagged no_market=1 ({pct:.0f}%)")
+        if pct > 30:
+            print("   WARNING: >30% fallback rows — check Odds API coverage")
+    else:
+        print("   No rows")
+except Exception as exc:
+    print(f"   SKIP (column may not exist yet): {exc}")
+
+# ── 14. Devig method breakdown ──────────────────────────────────────────────
+print(f"\n14. Devig Method Breakdown (scout snapshot):")
+try:
+    devig = hcon.execute("""
+        SELECT devig_method, COUNT(*) as n,
+               ROUND(AVG(devig_implied), 4) as avg_devig
+        FROM nba_forward_preds
+        WHERE game_date = ? AND snapshot_type = 'scout'
+          AND devig_method IS NOT NULL
+        GROUP BY devig_method
+        ORDER BY n DESC
+    """, (target_date,)).fetchall()
+    if devig:
+        for r in devig:
+            print(f"   {r['devig_method']:20s}: {r['n']:5d} rows, "
+                  f"avg devigged P = {r['avg_devig']:.4f}")
+    else:
+        print("   No devigged rows")
+except Exception as exc:
+    print(f"   SKIP: {exc}")
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 print(f"\n=== Chain status for {target_date} ===")
 chain = []
@@ -293,6 +501,7 @@ chain.append(("game_logs", hcon.execute(
     "SELECT COUNT(*) FROM nba_player_game_logs WHERE game_date=?",
     (target_date,)).fetchone()[0] > 0))
 chain.append(("grading", (graded['graded'] or 0) > 0 if graded else False))
+chain.append(("main_line_rows", main_total > 0 if 'main_total' in vars() else False))
 
 for name, ok in chain:
     print(f"  {'OK' if ok else 'MISSING':>7s}  {name}")
@@ -300,5 +509,5 @@ for name, ok in chain:
 hcon.close()
 bcon.close()
 
-any_fail = any(not ok for name, ok in chain if name != "pre_tip_write")
+any_fail = any(not ok for name, ok in chain if name not in ("pre_tip_write", "main_line_rows"))
 sys.exit(1 if any_fail else 0)

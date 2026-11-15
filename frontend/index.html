@@ -347,6 +347,8 @@
   <div class="nav-item" onclick="showPage('place')">➕ Place Bet</div>
   <div class="nav-item" onclick="showPage('predict')">🔮 Predict</div>
   <div class="nav-item" onclick="showPage('fixtures')">⚡ Fixtures</div>
+  <div class="nav-item" onclick="showPage('scorecard')" style="color:var(--teal);font-weight:600">📋 Scorecard</div>
+  <div class="nav-item" onclick="showPage('nfllab')" style="color:var(--teal)">🏈 NFL Lab</div>
   <div class="nav-item" onclick="showPage('oddslab')">🔬 Odds Lab</div>
   <div class="nav-item" id="nav-settle" onclick="showPage('settle')">🤖 Auto-Settle</div>
   <div class="nav-item" onclick="showPage('livebets')" style="color:var(--amber);font-weight:600">💸 Live Bets</div>
@@ -2244,6 +2246,7 @@ Rockets +4.5  Alt Spread  -950"
       <div style="display:flex;gap:8px;align-items:center">
         <div style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;font-size:11px">
           <button onclick="setLogSourceFilter('model')"      id="log-src-model" style="padding:4px 8px;background:var(--blue);color:#fff;border:none;cursor:pointer">Model</button>
+          <button onclick="setLogSourceFilter('top_picks_page')" id="log-src-picks" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Calibration</button>
           <button onclick="setLogSourceFilter('')"            id="log-src-all"   style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">All</button>
           <button onclick="setLogSourceFilter('exploration')" id="log-src-expl"  style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Explore</button>
           <button onclick="setLogSourceFilter('shadow')"      id="log-src-shadow" style="padding:4px 8px;background:var(--surface2);color:var(--text);border:none;cursor:pointer;border-left:1px solid var(--border)">Shadow</button>
@@ -3076,6 +3079,168 @@ Rockets +4.5  Alt Spread  -950"
   </div>
 </div>
 
+<!-- ── Model Scorecard ── -->
+<div class="page" id="page-scorecard">
+  <div class="page-header">
+    <div>
+      <div class="page-title">NFL Model Scorecard</div>
+      <div class="page-sub">Projection accuracy &middot; Direction &middot; Calibration &middot; Biggest misses</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <select id="sc-week" onchange="loadScorecard()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+        <option value="0">Season-to-Date</option>
+      </select>
+      <select id="sc-stat" onchange="loadScorecard()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+        <option value="_ALL_">All Stats</option>
+        <option value="pass_yds">Pass Yds</option>
+        <option value="rush_yds">Rush Yds</option>
+        <option value="rec_yds">Rec Yds</option>
+        <option value="receptions">Receptions</option>
+        <option value="pass_tds">Pass TDs</option>
+      </select>
+      <select id="sc-pos" onchange="loadScorecard()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+        <option value="_ALL_">All Positions</option>
+        <option value="QB">QB</option>
+        <option value="RB">RB</option>
+        <option value="WR">WR</option>
+        <option value="TE">TE</option>
+      </select>
+      <select id="sc-mv" onchange="loadScorecard()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+        <option value="_ALL_">All Versions</option>
+        <option value="v0">v0</option>
+        <option value="v0_capped">v0_capped</option>
+        <option value="v1.2_shifted_gamma">v1.2</option>
+      </select>
+      <select id="sc-ld" onchange="loadScorecard()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+        <option value="_ALL_">All Depths</option>
+        <option value="main">Main</option>
+        <option value="near_alt">Near Alt</option>
+        <option value="deep_alt">Deep Alt</option>
+      </select>
+      <select id="sc-team" onchange="_loadPredictionTable()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+        <option value="">All Teams</option>
+      </select>
+      <select id="sc-opp" onchange="_loadPredictionTable()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-size:12px">
+        <option value="">All Opponents</option>
+      </select>
+      <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:var(--muted);cursor:pointer">
+        <input type="checkbox" id="sc-stale-only" onchange="_loadPredictionTable()"> Stale only
+      </label>
+    </div>
+  </div>
+
+  <!-- Accuracy Card -->
+  <div class="card" style="margin-top:16px">
+    <div class="card-title">Projection Accuracy</div>
+    <div id="sc-accuracy-table" class="table-wrap" style="font-size:13px"></div>
+  </div>
+
+  <!-- Direction Card -->
+  <div class="card" style="margin-top:12px">
+    <div class="card-title">Direction vs Market-Implied</div>
+    <div id="sc-direction-table" class="table-wrap" style="font-size:13px"></div>
+  </div>
+
+  <!-- Side-Aware Accuracy Card -->
+  <div class="card" style="margin-top:12px">
+    <div class="card-title">Side-Aware Accuracy <span style="font-size:11px;color:var(--muted);font-weight:400">(main lines only)</span></div>
+    <div id="sc-cushion-summary" style="font-size:13px;margin-bottom:8px"></div>
+    <div id="sc-cushion-table" class="table-wrap" style="font-size:13px"></div>
+    <canvas id="sc-cushion-chart" height="160" style="margin-top:12px"></canvas>
+  </div>
+
+  <!-- Alt-Line Ladder Card -->
+  <div class="card" style="margin-top:12px">
+    <div class="card-title">Alt-Line Ladder <span style="font-size:11px;color:var(--muted);font-weight:400">(model vs market Brier by rung)</span></div>
+    <div id="sc-ladder-table" class="table-wrap" style="font-size:13px"></div>
+    <canvas id="sc-ladder-chart" height="180" style="margin-top:12px"></canvas>
+  </div>
+
+  <!-- Calibration Card -->
+  <div class="card" style="margin-top:12px">
+    <div class="card-title">Probability Calibration</div>
+    <div id="sc-brier-summary" style="font-size:13px;margin-bottom:8px;color:var(--muted)"></div>
+    <div id="sc-calibration-table" class="table-wrap" style="font-size:13px"></div>
+  </div>
+
+  <!-- Biggest Misses Card -->
+  <div class="card" style="margin-top:12px">
+    <div class="card-title">Biggest Misses</div>
+    <div id="sc-misses-table" class="table-wrap" style="font-size:13px"></div>
+  </div>
+
+  <!-- Per-Prediction Log -->
+  <div class="card" style="margin-top:12px">
+    <div class="card-title">Per-Prediction Log</div>
+    <div id="sc-pred-filters" style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;font-size:12px">
+      <label style="color:var(--muted)">|Miss| ≥ <input type="number" id="sc-miss-min" style="width:50px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:12px" onchange="_loadPredictionTable()"></label>
+      <label style="color:var(--muted)">≤ <input type="number" id="sc-miss-max" style="width:50px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:12px" onchange="_loadPredictionTable()"></label>
+      <select id="sc-pred-dir" onchange="_loadPredictionTable()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:12px">
+        <option value="">All Directions</option>
+        <option value="over">Model Too High</option>
+        <option value="under">Model Too Low</option>
+      </select>
+    </div>
+    <div id="sc-pred-status" style="font-size:12px;color:var(--muted);margin-bottom:6px"></div>
+    <div id="sc-pred-table" class="table-wrap" style="font-size:12px"></div>
+    <div id="sc-pred-pager" style="display:flex;gap:8px;justify-content:center;margin-top:10px;font-size:12px"></div>
+  </div>
+
+  <!-- Trend Chart -->
+  <div class="card" style="margin-top:12px">
+    <div class="card-title">MAE Trend by Week</div>
+    <canvas id="sc-trend-chart" height="200"></canvas>
+  </div>
+</div>
+
+<!-- ── NFL Lab ── -->
+<div class="page" id="page-nfllab">
+  <div class="page-header">
+    <div>
+      <div class="page-title">🏈 NFL Lab</div>
+      <div class="page-sub">v1.2 player props — projections, edges, injury adjustments, weather</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span id="nfllab-coverage" style="font-size:11px;padding:3px 8px;border-radius:12px;background:var(--surface2);color:var(--muted)"></span>
+      <button class="btn btn-ghost btn-sm" onclick="loadNflLab()">↻ Refresh</button>
+    </div>
+  </div>
+
+  <!-- Filters -->
+  <div class="filter-row" style="margin-bottom:14px;flex-wrap:wrap;gap:8px">
+    <select id="nfllab-stat" onchange="renderNflLabTable()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+      <option value="">All Stats</option>
+      <option value="pass_yds">Pass Yards</option>
+      <option value="rush_yds">Rush Yards</option>
+      <option value="rec_yds">Rec Yards</option>
+      <option value="pass_tds">Pass TDs</option>
+      <option value="receptions">Receptions</option>
+    </select>
+    <select id="nfllab-pos" onchange="renderNflLabTable()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+      <option value="">All Positions</option>
+      <option value="QB">QB</option>
+      <option value="RB">RB</option>
+      <option value="WR">WR</option>
+      <option value="TE">TE</option>
+    </select>
+    <select id="nfllab-edge" onchange="renderNflLabTable()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+      <option value="0">All Edges</option>
+      <option value="3">Edge ≥ 3pp</option>
+      <option value="5" selected>Edge ≥ 5pp</option>
+      <option value="10">Edge ≥ 10pp</option>
+    </select>
+    <select id="nfllab-depth" onchange="renderNflLabTable()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+      <option value="main">Main lines</option>
+      <option value="">All depths</option>
+    </select>
+    <select id="nfllab-game" onchange="renderNflLabTable()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+      <option value="">All Games</option>
+    </select>
+  </div>
+
+  <div id="nfllab-content"><div class="loading">Loading…</div></div>
+</div>
+
 <!-- ── Odds Lab (Creator Tier) ── -->
 <div class="page" id="page-oddslab">
   <div class="page-header">
@@ -3586,6 +3751,8 @@ function showPage(name, skipHash) {
     shadowaltline: loadShadowAltline,
     armscompare: loadArmsComparison,
     researcher:  loadResearcher,
+    scorecard:   loadScorecard,
+    nfllab:      loadNflLab,
   };
   loaders[name]?.();
 }
@@ -7676,8 +7843,10 @@ function renderTopPicksCalibration(el, data) {
   const mlcBkts     = data.min_leg_conf_buckets || [];
   const kellyBkts   = data.kelly_roi_buckets || [];
   const n           = data.n_settled || 0;
+  const nLegs       = data.n_legs || 0;
   const interp      = data.interpretation || '';
   const warn        = data.data_warning;
+  const meta        = data.metadata || {};
 
   // ── Color helpers ──────────────────────────────────────────────────────────
   const deltaColor = d => Math.abs(d) <= 5 ? 'var(--green)' : (d > 5 ? 'var(--blue)' : 'var(--red)');
@@ -7690,6 +7859,73 @@ function renderTopPicksCalibration(el, data) {
                 border-radius:6px;font-size:12px;color:var(--amber);margin-bottom:14px">
       ⚠ ${warn}
     </div>` : '';
+
+  // ── Metadata caption ────────────────────────────────────────────────────────
+  const sportList = meta.sports ? Object.keys(meta.sports).join(', ') : '—';
+  const dateFrom  = meta.date_range?.from || '?';
+  const dateTo    = meta.date_range?.to || '?';
+  const ciLo      = meta.roi_ci_95?.lo;
+  const ciHi      = meta.roi_ci_95?.hi;
+  const ciStr     = (ciLo != null && ciHi != null) ? `[${ciLo > 0 ? '+' : ''}${ciLo}%, ${ciHi > 0 ? '+' : ''}${ciHi}%]` : '';
+  const avgLegs = nLegs > 0 && n > 0 ? (nLegs / n).toFixed(1) : '?';
+  const metaHtml  = `
+    <details style="margin-bottom:12px">
+      <summary style="cursor:pointer;font-size:11px;color:var(--muted);font-weight:600;
+                      letter-spacing:.03em;text-transform:uppercase;user-select:none">
+        How to read this panel
+      </summary>
+      <div style="padding:8px 10px;background:var(--surface2);border-radius:0 0 6px 6px;
+                  font-size:11px;color:var(--muted);line-height:1.7;margin-top:4px">
+        <strong>What bets?</strong> Paper parlays (not real money) placed by BetIQ's ML models
+        <em>before</em> games start. Each sport's classifier scores available legs by win probability;
+        legs above a confidence threshold (55–70%) are assembled into ${avgLegs}-leg parlays on average.<br>
+        <strong>Period &amp; scope:</strong> ${sportList} · ${dateFrom} → ${dateTo} ·
+        ${n} settled parlays / ${nLegs} legs · avg combined odds ~${
+          (data.overall?.avg_theoretical_odds || 0) > 0
+          ? data.overall.avg_theoretical_odds.toFixed(2)
+          : '3.10'
+        }.<br>
+        <strong>Win/loss &amp; ROI:</strong> A parlay wins when <em>all</em> legs hit (pushes count as wins).
+        ROI = profit ÷ stake. Stakes are 25% Kelly on a $500 paper bankroll.
+        Odds are real bookmaker prices from TheOddsAPI, combined as product of leg decimals.<br>
+        <strong>In-sample?</strong> No — bets are generated prospectively before game time and settled
+        against actual results. The ML model was trained on older historical data, not the evaluation window shown here.<br>
+        <strong>Exclusions:</strong> Bets with data_error legs or excluded_from_metrics legs are removed.
+      </div>${(data.sample_rows && data.sample_rows.length) ? `
+      <div style="margin-top:8px;padding:6px 10px;font-size:11px;color:var(--muted)">
+        <strong>Example rows (3 most recent):</strong>
+        <table style="width:100%;border-collapse:collapse;margin-top:4px;font-size:10px">
+          <thead><tr style="border-bottom:1px solid var(--border)">
+            <th style="padding:3px 6px;text-align:left">Date</th>
+            <th style="padding:3px 6px;text-align:left">Sport</th>
+            <th style="padding:3px 6px;text-align:right">Legs</th>
+            <th style="padding:3px 6px;text-align:right">Pred WP</th>
+            <th style="padding:3px 6px;text-align:right">Odds</th>
+            <th style="padding:3px 6px;text-align:right">Stake</th>
+            <th style="padding:3px 6px;text-align:left">Result</th>
+            <th style="padding:3px 6px;text-align:right">Profit</th>
+          </tr></thead>
+          <tbody>${data.sample_rows.map(r => `<tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:3px 6px">${r.gen_date}</td>
+            <td style="padding:3px 6px">${r.sport || '?'}</td>
+            <td style="padding:3px 6px;text-align:right">${r.n_legs ?? '?'}</td>
+            <td style="padding:3px 6px;text-align:right">${r.pred_wp}%</td>
+            <td style="padding:3px 6px;text-align:right">${r.odds}</td>
+            <td style="padding:3px 6px;text-align:right">$${r.stake}</td>
+            <td style="padding:3px 6px;color:${r.status === 'SETTLED_WIN' ? 'var(--green)' : 'var(--red)'}">${r.status === 'SETTLED_WIN' ? 'WIN' : 'LOSS'}</td>
+            <td style="padding:3px 6px;text-align:right;color:${r.profit >= 0 ? 'var(--green)' : 'var(--red)'}">$${r.profit}</td>
+          </tr>`).join('')}</tbody>
+        </table>
+      </div>` : ''}
+    </details>
+    <div style="padding:6px 10px;background:var(--surface2);border-radius:6px;font-size:11px;
+                color:var(--muted);margin-bottom:12px;line-height:1.6">
+      <strong>Sports:</strong> ${sportList} ·
+      <strong>Period:</strong> ${dateFrom} → ${dateTo} ·
+      <strong>N:</strong> ${n} parlays / ${nLegs} legs ·
+      <strong>Odds:</strong> real bookmaker (∏ leg prices) ·
+      <strong>Stake:</strong> 25% Kelly / $500${ciStr ? ` · <strong>ROI 95% CI:</strong> ${ciStr}` : ''}
+    </div>`;
 
   // ── Overall stat tiles ─────────────────────────────────────────────────────
   const wrColor  = (overall.win_rate_pct || 0) >= (overall.avg_predicted_wp || 0)
@@ -7712,7 +7948,7 @@ function renderTopPicksCalibration(el, data) {
       <div style="padding:10px;background:var(--surface2);border-radius:8px;text-align:center">
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:3px">ROI</div>
         <div style="font-size:18px;font-weight:700;color:${roiColor(overall.roi_pct)}">${roiStr(overall.roi_pct)}</div>
-        <div style="font-size:10px;color:var(--muted)">25% Kelly / $500</div>
+        <div style="font-size:10px;color:var(--muted)">${ciStr ? `95% CI ${ciStr}` : '25% Kelly / $500'}</div>
       </div>
       <div style="padding:10px;background:var(--surface2);border-radius:8px;text-align:center">
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;margin-bottom:3px">Brier Score</div>
@@ -7919,6 +8155,7 @@ function renderTopPicksCalibration(el, data) {
 
   el.innerHTML = `
     ${warnHtml}
+    ${metaHtml}
     ${overallHtml}
     ${interpHtml}
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:14px">
@@ -9784,10 +10021,11 @@ function setLogCatFilter(cat) {
 
 function setLogSourceFilter(src) {
   _logSourceFilter = src;
-  ['model','all','expl','shadow'].forEach(k => {
+  ['model','picks','all','expl','shadow'].forEach(k => {
     const el = document.getElementById(`log-src-${k}`);
     if (!el) return;
     const active = (k === 'model' && src === 'model')
+                || (k === 'picks' && src === 'top_picks_page')
                 || (k === 'all' && src === '')
                 || (k === 'expl' && src === 'exploration')
                 || (k === 'shadow' && src === 'shadow');
@@ -10942,6 +11180,123 @@ function switchOddsLabTab(tab) {
   document.getElementById('oddslab-tab-main').classList.toggle('active',     tab === 'main');
   document.getElementById('oddslab-tab-altlines').classList.toggle('active', tab === 'altlines');
   if (tab === 'altlines') loadTodaysAltLines();
+}
+
+// ── NFL Lab ─────────────────────────────────────────────────────────────────
+let _nflLabData = null;
+
+async function loadNflLab() {
+  const el = document.getElementById('nfllab-content');
+  if (!el) return;
+  el.innerHTML = '<div class="loading">Loading…</div>';
+  const data = await apiFetch('/api/lab/props');
+  if (!data || data.error) {
+    el.innerHTML = `<span style="color:var(--muted);font-size:13px">${data?.error || 'No data — run the NFL pipeline first.'}</span>`;
+    return;
+  }
+  _nflLabData = data;
+  const cov = data.coverage || {};
+  const badge = document.getElementById('nfllab-coverage');
+  if (badge) badge.textContent = `S${data.season} W${data.week} · ${cov.n_players_with_preds || 0} players · ${cov.n_games || 0} games`;
+
+  // Populate game dropdown
+  const gameSel = document.getElementById('nfllab-game');
+  if (gameSel && data.games) {
+    const prev = gameSel.value;
+    gameSel.innerHTML = '<option value="">All Games</option>';
+    for (const g of data.games) {
+      gameSel.innerHTML += `<option value="${g.game_id}">${g.away} @ ${g.home} — ${g.kickoff_et}</option>`;
+    }
+    gameSel.value = prev || '';
+  }
+  renderNflLabTable();
+}
+
+function renderNflLabTable() {
+  const el = document.getElementById('nfllab-content');
+  if (!el || !_nflLabData) return;
+  const data = _nflLabData;
+  const statF = document.getElementById('nfllab-stat')?.value || '';
+  const posF  = document.getElementById('nfllab-pos')?.value || '';
+  const edgeF = parseFloat(document.getElementById('nfllab-edge')?.value || '0') / 100;
+  const depthF = document.getElementById('nfllab-depth')?.value || '';
+  const gameF = document.getElementById('nfllab-game')?.value || '';
+
+  // Flatten players → rows
+  let rows = [];
+  for (const p of (data.players || [])) {
+    if (gameF && p.game_id !== gameF) continue;
+    for (const s of (p.stats || [])) {
+      if (statF && s.stat_type !== statF) continue;
+      if (posF && p.position !== posF) continue;
+      if (depthF && s.line_depth !== depthF) continue;
+      // edge_adjusted includes injury redistribution; edge_base is raw
+      const edgeVal = s.edge_adjusted ?? s.edge_base ?? null;
+      const edge = edgeVal != null ? Math.abs(edgeVal) : 0;
+      if (edge < edgeF) continue;
+      rows.push({ ...s, _edge: edgeVal, player_name: p.player_name, position: p.position,
+                   team: p.team, opponent: p.opponent, game_id: p.game_id,
+                   kickoff_sort: p.kickoff_sort,
+                   injury_status: p.injury_status, weather_badge: p.weather_badge });
+    }
+  }
+
+  // Sort by |edge| descending
+  rows.sort((a, b) => Math.abs(b._edge || 0) - Math.abs(a._edge || 0));
+
+  if (!rows.length) {
+    el.innerHTML = '<span style="color:var(--muted);font-size:13px">No props match the current filters.</span>';
+    return;
+  }
+
+  const statLabel = { pass_yds: 'Pass Yds', rush_yds: 'Rush Yds', rec_yds: 'Rec Yds',
+                      pass_tds: 'Pass TDs', receptions: 'Rec' };
+  const edgeColor = e => e == null ? 'var(--muted)' : (e >= 0.05 ? 'var(--green)' : (e >= 0 ? 'var(--text)' : 'var(--red)'));
+  const pctFmt = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+  const injBadge = s => !s ? '' : (s === 'Out' ? '<span style="color:var(--red);font-weight:600">OUT</span>'
+    : s === 'Questionable' ? '<span style="color:var(--amber)">Q</span>'
+    : s === 'Doubtful' ? '<span style="color:var(--red)">D</span>' : '');
+
+  let html = `<div style="font-size:11px;color:var(--muted);margin-bottom:8px">
+    NFL · S${data.season} W${data.week} · ${rows.length} props shown · P(over): shifted-gamma (yardage), NegBin (counts) · edges use gamma · main lines ${depthF ? 'only' : '+ alts'}
+  </div>`;
+  html += `<table style="width:100%;border-collapse:collapse;font-size:12px">
+  <thead><tr style="border-bottom:2px solid var(--border)">
+    <th style="padding:6px 8px;text-align:left">Player</th>
+    <th style="padding:6px 4px;text-align:center">Pos</th>
+    <th style="padding:6px 4px;text-align:left">Team</th>
+    <th style="padding:6px 4px;text-align:left">Stat</th>
+    <th style="padding:6px 4px;text-align:right">Proj</th>
+    <th style="padding:6px 4px;text-align:right">Line</th>
+    <th style="padding:6px 4px;text-align:right">P(over) <span style="font-weight:400;color:var(--muted);font-size:10px">γ</span></th>
+    <th style="padding:6px 4px;text-align:right">Mkt Impl</th>
+    <th style="padding:6px 4px;text-align:right">Edge</th>
+    <th style="padding:6px 4px;text-align:center">Dir</th>
+    <th style="padding:6px 4px;text-align:center">Inj</th>
+  </tr></thead><tbody>`;
+
+  const limit = 200;
+  for (const r of rows.slice(0, limit)) {
+    const edge = r._edge;
+    const dir = (r.consensus_mean || 0) > (r.prop_line || 0) ? 'OVER' : 'UNDER';
+    const dirColor = dir === 'OVER' ? 'var(--green)' : 'var(--red)';
+    html += `<tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:5px 8px;font-weight:500">${r.player_name}</td>
+      <td style="padding:5px 4px;text-align:center;color:var(--muted)">${r.position}</td>
+      <td style="padding:5px 4px;color:var(--muted)">${r.team || ''}${r.opponent ? ' v ' + r.opponent : ''}</td>
+      <td style="padding:5px 4px">${statLabel[r.stat_type] || r.stat_type}</td>
+      <td style="padding:5px 4px;text-align:right;font-weight:500">${(r.consensus_mean || 0).toFixed(1)}</td>
+      <td style="padding:5px 4px;text-align:right">${(r.prop_line || 0).toFixed(1)}</td>
+      <td style="padding:5px 4px;text-align:right">${pctFmt(r.p_over)}${r.p_over_lognormal != null && r.p_over_gamma != null ? '<br><span style="color:var(--muted);font-size:10px">ln ' + pctFmt(r.p_over_lognormal) + '</span>' : ''}</td>
+      <td style="padding:5px 4px;text-align:right">${pctFmt(r.devigged_implied)}</td>
+      <td style="padding:5px 4px;text-align:right;font-weight:600;color:${edgeColor(edge)}">${edge != null ? (edge > 0 ? '+' : '') + (edge * 100).toFixed(1) + 'pp' : '—'}</td>
+      <td style="padding:5px 4px;text-align:center;font-weight:600;color:${dirColor}">${dir}</td>
+      <td style="padding:5px 4px;text-align:center">${injBadge(r.injury_status)}${r.weather_badge ? ' ' + r.weather_badge : ''}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  if (rows.length > limit) html += `<div style="color:var(--muted);font-size:11px;margin-top:8px">Showing ${limit} of ${rows.length} — narrow filters to see more.</div>`;
+  el.innerHTML = html;
 }
 
 async function loadOddsLab() {
@@ -14954,6 +15309,572 @@ function renderAuLog() {
 function _resToday() {
   return new Date().toISOString().slice(0,10);
 }
+
+// ── Model Scorecard ──────────────────────────────────────────────────────────
+var _scTrendChart = null;
+var _scWeeksLoaded = false;
+
+async function loadScorecard() {
+  if (!_scWeeksLoaded) {
+    // Populate week dropdown from available data
+    try {
+      const res = await fetch('/api/scorecard/NFL?season=2026&stat_type=_ALL_&position=_ALL_&model_version=_ALL_&line_depth=_ALL_');
+      const data = await res.json();
+      const weeks = [...new Set(data.rows.map(r => r.week))].sort((a,b) => a - b);
+      const sel = document.getElementById('sc-week');
+      sel.innerHTML = '<option value="0">Season-to-Date</option>';
+      weeks.filter(w => w > 0).forEach(w => {
+        sel.innerHTML += `<option value="${w}">Week ${w}</option>`;
+      });
+      // Default to latest week
+      const maxW = Math.max(...weeks.filter(w => w > 0));
+      if (maxW > 0) sel.value = String(maxW);
+    } catch(e) { console.warn('Scorecard week load error:', e); }
+    _scWeeksLoaded = true;
+  }
+  _renderScorecard();
+}
+
+async function _renderScorecard() {
+  const week = document.getElementById('sc-week').value;
+  const stat = document.getElementById('sc-stat').value;
+  const pos = document.getElementById('sc-pos').value;
+  const mv = document.getElementById('sc-mv').value;
+  const ld = document.getElementById('sc-ld').value;
+
+  let url = `/api/scorecard/NFL?season=2026&week=${week}`;
+  if (stat !== '_ALL_') url += `&stat_type=${stat}`;
+  if (pos !== '_ALL_') url += `&position=${pos}`;
+  if (mv !== '_ALL_') url += `&model_version=${mv}`;
+  if (ld !== '_ALL_') url += `&line_depth=${ld}`;
+
+  let rows = [];
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    rows = data.rows || [];
+  } catch(e) {
+    console.warn('Scorecard fetch error:', e);
+  }
+
+  // We want to show per-stat breakdown, so fetch with stat=_ALL_ filters to get individual stat rows
+  let allStatUrl = `/api/scorecard/NFL?season=2026&week=${week}&position=${pos}&model_version=${mv}&line_depth=${ld}`;
+  let allRows = [];
+  try {
+    const res2 = await fetch(allStatUrl);
+    const data2 = await res2.json();
+    allRows = data2.rows || [];
+  } catch(e) {}
+
+  // Per-model_version rows for Brier breakdown (only when viewing _ALL_ MV)
+  let mvRows = [];
+  if (mv === '_ALL_') {
+    try {
+      const mvUrl = `/api/scorecard/NFL?season=2026&week=${week}&stat_type=_ALL_&position=${pos}&line_depth=${ld}`;
+      const res3 = await fetch(mvUrl);
+      const data3 = await res3.json();
+      mvRows = data3.rows || [];
+    } catch(e) {}
+  }
+
+  // Filter to per-stat rows (stat_type != _ALL_) with pos/mv/ld = _ALL_ for rollup
+  const statRows = allRows.filter(r =>
+    r.stat_type !== '_ALL_' &&
+    r.position === (pos === '_ALL_' ? '_ALL_' : pos) &&
+    r.model_version === (mv === '_ALL_' ? '_ALL_' : mv) &&
+    r.line_depth === (ld === '_ALL_' ? '_ALL_' : ld)
+  );
+  const allRow = allRows.find(r =>
+    r.stat_type === '_ALL_' &&
+    r.position === (pos === '_ALL_' ? '_ALL_' : pos) &&
+    r.model_version === (mv === '_ALL_' ? '_ALL_' : mv) &&
+    r.line_depth === (ld === '_ALL_' ? '_ALL_' : ld)
+  );
+
+  _renderAccuracyTable(statRows, allRow);
+  _renderDirectionTable(statRows, allRow);
+  _renderCushionCard(statRows, allRow);
+  _renderLadderCard(allRow);
+  _renderCalibrationTable(allRow, mvRows.length ? mvRows : allRows, mv, pos, ld);
+  _renderMissesTable(allRow);
+  _loadTrendChart(pos, mv, ld);
+  _loadTeamsDropdown();
+  _loadPredictionTable();
+}
+
+function _scDeltaCell(model, market) {
+  if (model == null || market == null) return '<td>—</td>';
+  const d = model - market;
+  const color = d < 0 ? 'var(--green, #22c55e)' : d > 0 ? 'var(--red, #ef4444)' : 'var(--text)';
+  const arrow = d < 0 ? ' ▲' : d > 0 ? ' ▼' : '';
+  return `<td style="color:${color};font-weight:600">${d >= 0 ? '+' : ''}${d.toFixed(1)}${arrow}</td>`;
+}
+
+function _scBiasCell(val) {
+  if (val == null) return '<td>—</td>';
+  const abs = Math.abs(val);
+  const color = abs > 5 ? 'color:var(--amber,#f59e0b);font-weight:600' : abs > 2 ? 'color:var(--amber,#f59e0b)' : 'color:var(--green,#22c55e)';
+  return `<td style="${color}">${val >= 0 ? '+' : ''}${val.toFixed(1)}</td>`;
+}
+
+function _renderAccuracyTable(statRows, allRow) {
+  const el = document.getElementById('sc-accuracy-table');
+  if (!statRows.length && !allRow) { el.innerHTML = '<div style="color:var(--muted)">No data</div>'; return; }
+  let html = '<table style="width:100%"><thead><tr><th>Stat</th><th>N</th><th>Model MAE</th><th>MAE (Dist Med)</th><th>Market MAE</th><th>Delta</th><th>Bias</th><th>WAPE</th></tr></thead><tbody>';
+  statRows.sort((a,b) => a.stat_type.localeCompare(b.stat_type)).forEach(r => {
+    const medMAE = r.mae_median != null ? r.mae_median.toFixed(1) : '—';
+    html += `<tr><td>${r.stat_type}</td><td>${r.n_preds}</td><td>${r.mae?.toFixed(1) ?? '—'}</td><td>${medMAE}</td><td>${r.market_mae?.toFixed(1) ?? '—'}</td>${_scDeltaCell(r.mae, r.market_mae)}${_scBiasCell(r.mean_signed_error)}<td>${r.wape != null ? (r.wape * 100).toFixed(1) + '%' : '—'}</td></tr>`;
+  });
+  if (allRow) {
+    const medMAE = allRow.mae_median != null ? allRow.mae_median.toFixed(1) : '—';
+    html += `<tr style="font-weight:700;border-top:2px solid var(--border)"><td>ALL</td><td>${allRow.n_preds}</td><td>${allRow.mae?.toFixed(1) ?? '—'}</td><td>${medMAE}</td><td>${allRow.market_mae?.toFixed(1) ?? '—'}</td>${_scDeltaCell(allRow.mae, allRow.market_mae)}${_scBiasCell(allRow.mean_signed_error)}<td>${allRow.wape != null ? (allRow.wape * 100).toFixed(1) + '%' : '—'}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function _renderDirectionTable(statRows, allRow) {
+  const el = document.getElementById('sc-direction-table');
+  if (!statRows.length && !allRow) { el.innerHTML = '<div style="color:var(--muted)">No data</div>'; return; }
+  let html = '<table style="width:100%"><thead><tr><th>Stat</th><th>N</th><th>Hit%</th><th>Mkt Exp</th><th>Edge</th><th>95% CI</th></tr></thead><tbody>';
+  function _dirRow(r, label, style) {
+    if (!r || !r.direction_n) return '';
+    const pct = (r.direction_pct * 100).toFixed(1) + '%';
+    const exp = r.direction_expected_pct != null ? (r.direction_expected_pct * 100).toFixed(1) + '%' : '—';
+    const edge = r.direction_edge_pp != null ? (r.direction_edge_pp * 100) : null;
+    const edgeStr = edge != null ? (edge >= 0 ? '+' : '') + edge.toFixed(1) + 'pp' : '—';
+    const elo = r.edge_ci_lo != null ? (r.edge_ci_lo * 100) : null;
+    const ehi = r.edge_ci_hi != null ? (r.edge_ci_hi * 100) : null;
+    const ciStr = elo != null ? `[${elo >= 0 ? '+' : ''}${elo.toFixed(1)}, ${ehi >= 0 ? '+' : ''}${ehi.toFixed(1)}]` : '—';
+    const edgeColor = edge != null && edge > 0 ? 'color:var(--green,#22c55e);font-weight:600' : edge != null && edge < -2 ? 'color:var(--red,#ef4444)' : '';
+    return `<tr style="${style || ''}"><td>${label}</td><td>${r.direction_n}</td><td>${pct}</td><td>${exp}</td><td style="${edgeColor}">${edgeStr}</td><td style="font-size:11px">${ciStr}</td></tr>`;
+  }
+  function _leanSubRow(lean, label) {
+    if (!lean || !lean.n || lean.n < 10) return '';
+    const pct = lean.pct != null ? (lean.pct * 100).toFixed(1) + '%' : '—';
+    const edge = lean.edge_pp != null ? (lean.edge_pp * 100) : null;
+    const edgeStr = edge != null ? (edge >= 0 ? '+' : '') + edge.toFixed(1) + 'pp' : '—';
+    const edgeColor = edge != null && edge > 0 ? 'color:var(--green,#22c55e)' : edge != null && edge < -2 ? 'color:var(--red,#ef4444)' : '';
+    return `<tr style="font-size:11px;color:var(--muted)"><td style="padding-left:18px">↳ ${label}</td><td>${lean.n}</td><td>${pct}</td><td>—</td><td style="${edgeColor}">${edgeStr}</td><td></td></tr>`;
+  }
+  statRows.sort((a,b) => a.stat_type.localeCompare(b.stat_type)).forEach(r => {
+    html += _dirRow(r, r.stat_type, '');
+    // Show lean sub-rows if edge split is notable (>3pp difference between over/under)
+    const dl = r.direction_lean || {};
+    const ov = dl.over, un = dl.under;
+    if (ov && un && ov.n >= 10 && un.n >= 10 && ov.edge_pp != null && un.edge_pp != null) {
+      const gap = Math.abs((ov.edge_pp - un.edge_pp) * 100);
+      if (gap > 3) {
+        html += _leanSubRow(ov, 'OVER');
+        html += _leanSubRow(un, 'UNDER');
+      }
+    }
+  });
+  if (allRow) html += _dirRow(allRow, 'ALL', 'font-weight:700;border-top:2px solid var(--border)');
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+var _scCushionChart = null;
+
+function _renderCushionCard(statRows, allRow) {
+  const sumEl = document.getElementById('sc-cushion-summary');
+  const tblEl = document.getElementById('sc-cushion-table');
+  const chartEl = document.getElementById('sc-cushion-chart');
+  const c = allRow && allRow.cushion ? allRow.cushion : null;
+  if (!c || !c.n) {
+    sumEl.innerHTML = '';
+    tblEl.innerHTML = '<div style="color:var(--muted)">No cushion data (main lines only)</div>';
+    chartEl.style.display = 'none';
+    return;
+  }
+  // Summary line
+  const rsr = c.right_side_rate != null ? (c.right_side_rate * 100).toFixed(1) + '%' : '—';
+  const mcr = c.mean_cushion_right != null ? c.mean_cushion_right.toFixed(1) : '—';
+  const mdw = c.mean_deficit_wrong != null ? c.mean_deficit_wrong.toFixed(1) : '—';
+  const asym = allRow.asymmetric_mae != null ? allRow.asymmetric_mae.toFixed(2) : '—';
+  sumEl.innerHTML = `<span style="font-weight:600">Right side: ${rsr}</span> (${c.n_right}/${c.n}) · ` +
+    `Mean cushion (right): <span style="color:var(--green,#22c55e)">${mcr}</span> · ` +
+    `Mean deficit (wrong): <span style="color:var(--red,#ef4444)">${mdw}</span> · ` +
+    `Asym MAE: ${asym} <span style="font-size:10px;color:var(--muted)">(display only)</span>`;
+
+  // Per-stat table: right-side vs wrong-side MAE
+  const withCush = statRows.filter(r => r.cushion && r.cushion.n);
+  if (withCush.length) {
+    let html = '<table style="width:100%"><thead><tr><th>Stat</th><th>N Right</th><th>MAE Right</th><th>N Wrong</th><th>MAE Wrong</th></tr></thead><tbody>';
+    withCush.sort((a,b) => a.stat_type.localeCompare(b.stat_type)).forEach(r => {
+      const cu = r.cushion;
+      html += `<tr><td>${r.stat_type}</td><td>${cu.n_right}</td><td style="color:var(--green,#22c55e)">${cu.mae_right?.toFixed(1) ?? '—'}</td><td>${cu.n_wrong}</td><td style="color:var(--red,#ef4444)">${cu.mae_wrong?.toFixed(1) ?? '—'}</td></tr>`;
+    });
+    if (c) {
+      html += `<tr style="font-weight:700;border-top:2px solid var(--border)"><td>ALL</td><td>${c.n_right}</td><td style="color:var(--green,#22c55e)">${c.mae_right?.toFixed(1) ?? '—'}</td><td>${c.n_wrong}</td><td style="color:var(--red,#ef4444)">${c.mae_wrong?.toFixed(1) ?? '—'}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    tblEl.innerHTML = html;
+  } else {
+    tblEl.innerHTML = '';
+  }
+
+  // Histogram chart
+  const hist = c.histogram;
+  if (hist && hist.length && typeof Chart !== 'undefined') {
+    chartEl.style.display = '';
+    const labels = hist.map(b => `${b.lo} to ${b.hi}`);
+    const counts = hist.map(b => b.n);
+    const colors = hist.map(b => {
+      const mid = (b.lo + b.hi) / 2;
+      return mid >= 0 ? 'rgba(34,197,94,0.6)' : 'rgba(239,68,68,0.5)';
+    });
+    if (_scCushionChart) _scCushionChart.destroy();
+    _scCushionChart = new Chart(chartEl, {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{ label: 'Count', data: counts, backgroundColor: colors, borderWidth: 0 }]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { display: false },
+          title: { display: true, text: 'Cushion Distribution (positive = right side)', color: 'rgb(156,163,175)', font: { size: 12 } }
+        },
+        scales: {
+          x: { ticks: { color: 'rgb(156,163,175)', maxRotation: 45, font: { size: 10 } }, grid: { color: 'rgba(156,163,175,0.1)' } },
+          y: { ticks: { color: 'rgb(156,163,175)' }, grid: { color: 'rgba(156,163,175,0.1)' }, title: { display: true, text: 'N', color: 'rgb(156,163,175)' } }
+        }
+      }
+    });
+  } else {
+    chartEl.style.display = 'none';
+  }
+}
+
+var _scLadderChart = null;
+
+function _renderLadderCard(allRow) {
+  const tblEl = document.getElementById('sc-ladder-table');
+  const chartEl = document.getElementById('sc-ladder-chart');
+  const ladder = allRow && allRow.ladder_brier ? allRow.ladder_brier : [];
+  if (!ladder.length) {
+    tblEl.innerHTML = '<div style="color:var(--muted)">No ladder data (requires _ALL_ line depth with alt lines)</div>';
+    chartEl.style.display = 'none';
+    return;
+  }
+
+  // Bucket rungs into 10-unit bins for display (e.g., -30 to -21, -20 to -11, ...)
+  const binSize = 10;
+  const bins = {};
+  ladder.forEach(r => {
+    let binKey;
+    if (r.rung_distance === 0) { binKey = 0; }
+    else if (r.rung_distance > 0) { binKey = Math.ceil(r.rung_distance / binSize) * binSize; }
+    else { binKey = Math.floor(r.rung_distance / binSize) * binSize; }
+    if (!bins[binKey]) bins[binKey] = { totalN: 0, modelSum: 0, marketSum: 0, roiSum: 0, roiN: 0, roiCiLo: null, roiCiHi: null };
+    bins[binKey].totalN += r.n;
+    bins[binKey].modelSum += r.model_brier * r.n;
+    bins[binKey].marketSum += r.market_brier * r.n;
+    if (r.roi) {
+      bins[binKey].roiSum += r.roi.mean * r.roi.n;
+      bins[binKey].roiN += r.roi.n;
+      // Keep widest CI across rungs in bin
+      if (bins[binKey].roiCiLo === null || r.roi.ci_lo < bins[binKey].roiCiLo) bins[binKey].roiCiLo = r.roi.ci_lo;
+      if (bins[binKey].roiCiHi === null || r.roi.ci_hi > bins[binKey].roiCiHi) bins[binKey].roiCiHi = r.roi.ci_hi;
+    }
+  });
+  const binned = Object.keys(bins).map(k => {
+    const b = bins[k];
+    const key = Number(k);
+    const roi = b.roiN >= 10 ? {
+      mean: b.roiSum / b.roiN,
+      n: b.roiN,
+      ci_lo: b.roiCiLo,
+      ci_hi: b.roiCiHi,
+    } : null;
+    return {
+      bin: key,
+      n: b.totalN,
+      model_brier: b.modelSum / b.totalN,
+      market_brier: b.marketSum / b.totalN,
+      model_better: (b.modelSum / b.totalN) < (b.marketSum / b.totalN),
+      roi,
+    };
+  }).sort((a,b) => a.bin - b.bin);
+
+  // Table: binned summary with ROI
+  let html = '<table style="width:100%"><thead><tr><th>Rung Band</th><th>N</th><th>Model Brier</th><th>Mkt Brier</th><th>Better?</th><th>ROI @\u22655pp</th><th>95% CI</th></tr></thead><tbody>';
+  binned.forEach(r => {
+    let label;
+    if (r.bin === 0) label = 'Main (0)';
+    else if (r.bin > 0) label = `+${r.bin - binSize + 1} to +${r.bin}`;
+    else label = `${r.bin} to ${r.bin + binSize - 1}`;
+    const betterStr = r.model_better ? '<span style="color:var(--green,#22c55e);font-weight:600">\u2713</span>' : '<span style="color:var(--red,#ef4444)">\u2717</span>';
+    const roiStr = r.roi ? `<span style="color:${r.roi.mean >= 0 ? 'var(--green,#22c55e)' : 'var(--red,#ef4444)'}">${(r.roi.mean * 100).toFixed(1)}%</span> (N=${r.roi.n})` : '\u2014';
+    const ciStr = r.roi ? `[${(r.roi.ci_lo * 100).toFixed(1)}, ${(r.roi.ci_hi * 100).toFixed(1)}]` : '\u2014';
+    const rowStyle = r.bin === 0 ? 'font-weight:700;border-top:2px solid var(--border);border-bottom:2px solid var(--border)' : '';
+    html += `<tr style="${rowStyle}"><td>${label}</td><td>${r.n}</td><td>${r.model_brier.toFixed(4)}</td><td>${r.market_brier.toFixed(4)}</td><td>${betterStr}</td><td>${roiStr}</td><td>${ciStr}</td></tr>`;
+  });
+  html += '</tbody></table>';
+  tblEl.innerHTML = html;
+
+  // Chart: grouped bar on binned data
+  if (typeof Chart !== 'undefined') {
+    chartEl.style.display = '';
+    const labels = binned.map(r => r.bin === 0 ? 'Main' : (r.bin > 0 ? '+' : '') + r.bin);
+    const modelData = binned.map(r => r.model_brier);
+    const marketData = binned.map(r => r.market_brier);
+    const modelColors = binned.map(r => r.model_better ? 'rgba(34,197,94,0.7)' : 'rgba(239,68,68,0.5)');
+    if (_scLadderChart) _scLadderChart.destroy();
+    _scLadderChart = new Chart(chartEl, {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [
+          { label: 'Model Brier', data: modelData, backgroundColor: modelColors, borderWidth: 0 },
+          { label: 'Market Brier', data: marketData, backgroundColor: 'rgba(156,163,175,0.4)', borderWidth: 0 },
+        ]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { labels: { color: 'rgb(156,163,175)' } },
+          title: { display: true, text: 'Model vs Market Brier by Rung Distance (10-unit bins)', color: 'rgb(156,163,175)', font: { size: 12 } }
+        },
+        scales: {
+          x: { ticks: { color: 'rgb(156,163,175)' }, grid: { color: 'rgba(156,163,175,0.1)' } },
+          y: { ticks: { color: 'rgb(156,163,175)' }, grid: { color: 'rgba(156,163,175,0.1)' }, title: { display: true, text: 'Brier Score (weighted avg)', color: 'rgb(156,163,175)' } }
+        }
+      }
+    });
+  } else {
+    chartEl.style.display = 'none';
+  }
+}
+
+function _renderCalibrationTable(allRow, allRows, selectedMV, selectedPos, selectedLD) {
+  const calEl = document.getElementById('sc-calibration-table');
+  const brierEl = document.getElementById('sc-brier-summary');
+  if (!allRow) { calEl.innerHTML = '<div style="color:var(--muted)">No data</div>'; brierEl.innerHTML = ''; return; }
+
+  // Brier summary — overall + per-model_version breakdown
+  let brierHtml = '';
+  if (allRow.brier != null) {
+    const diff = allRow.brier - allRow.market_brier;
+    const better = diff < 0 ? 'better' : 'worse';
+    const color = diff < 0 ? 'var(--green,#22c55e)' : 'var(--red,#ef4444)';
+    brierHtml = `Model Brier: <strong>${allRow.brier.toFixed(4)}</strong> vs Market: ${allRow.market_brier?.toFixed(4) ?? '—'} (<span style="color:${color}">${better} by ${Math.abs(diff).toFixed(4)}</span>)`;
+  }
+  // Per-model_version Brier breakdown (only when viewing _ALL_ model_version)
+  if (selectedMV === '_ALL_' && allRows && allRows.length) {
+    const mvRows = allRows.filter(r =>
+      r.stat_type === '_ALL_' &&
+      r.position === (selectedPos === '_ALL_' ? '_ALL_' : selectedPos) &&
+      r.line_depth === (selectedLD === '_ALL_' ? '_ALL_' : selectedLD) &&
+      r.model_version !== '_ALL_' && r.brier != null
+    ).sort((a,b) => a.brier - b.brier);
+    if (mvRows.length > 1) {
+      brierHtml += '<div style="margin-top:6px;font-size:12px"><strong>By model:</strong> ';
+      brierHtml += mvRows.map(r => {
+        const d = r.brier - r.market_brier;
+        const c = d < 0 ? 'var(--green,#22c55e)' : 'var(--red,#ef4444)';
+        return `${r.model_version}: <span style="color:${c}">${r.brier.toFixed(4)}</span> (N=${r.n_preds})`;
+      }).join(' · ');
+      brierHtml += '</div>';
+    }
+  }
+  brierEl.innerHTML = brierHtml;
+
+  // Calibration buckets
+  const cal = allRow.calibration || [];
+  if (!cal.length) { calEl.innerHTML = '<div style="color:var(--muted)">No calibration data</div>'; return; }
+  let html = '<table style="width:100%"><thead><tr><th>Bucket</th><th>N</th><th>Predicted%</th><th>Actual%</th><th>Gap</th></tr></thead><tbody>';
+  cal.forEach(b => {
+    const gap = b.actual_pct - b.predicted_pct;
+    const gapAbs = Math.abs(gap);
+    const color = gapAbs > 0.10 ? 'color:var(--red,#ef4444)' : gapAbs > 0.05 ? 'color:var(--amber,#f59e0b)' : '';
+    html += `<tr><td>${b.bucket}</td><td>${b.n}</td><td>${(b.predicted_pct*100).toFixed(1)}%</td><td>${(b.actual_pct*100).toFixed(1)}%</td><td style="${color}">${(gap*100).toFixed(1)}pp</td></tr>`;
+  });
+  html += '</tbody></table>';
+  calEl.innerHTML = html;
+}
+
+function _renderMissesTable(allRow) {
+  const el = document.getElementById('sc-misses-table');
+  if (!allRow || !allRow.biggest_misses || !allRow.biggest_misses.length) {
+    el.innerHTML = '<div style="color:var(--muted)">No data</div>'; return;
+  }
+  let html = '';
+  // Stale-input summary at top
+  if (allRow.stale_n > 0) {
+    const stalePct = (allRow.stale_n / allRow.n_preds * 100).toFixed(1);
+    html += `<div style="margin-bottom:10px;padding:8px 12px;background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.3);border-radius:6px;font-size:12px">`;
+    html += `<strong style="color:var(--amber,#f59e0b)">⚠ Stale-Input Flag</strong>: ${allRow.stale_n} predictions (${stalePct}%) had |proj − line| &gt; 40% of line (main lines, line ≥ 5).`;
+    if (allRow.stale_mae != null) html += ` Flagged MAE: ${allRow.stale_mae.toFixed(1)}`;
+    if (allRow.stale_correct != null && allRow.stale_n > 0) html += ` · Direction: ${allRow.stale_correct}/${allRow.stale_n}`;
+    html += `</div>`;
+  }
+  html += '<table style="width:100%"><thead><tr><th>Player</th><th>Stat</th><th>Actual</th><th>Projection</th><th>Line</th><th>|Error|</th></tr></thead><tbody>';
+  allRow.biggest_misses.forEach(m => {
+    html += `<tr><td>${m.player}</td><td>${m.stat}</td><td>${m.actual}</td><td>${m.projection}</td><td>${m.line}</td><td style="color:var(--red,#ef4444);font-weight:600">${m.error}</td></tr>`;
+  });
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+async function _loadTrendChart(pos, mv, ld) {
+  // Fetch all weeks for trend
+  let url = `/api/scorecard/NFL?season=2026&stat_type=_ALL_&position=${pos}&model_version=${mv}&line_depth=${ld}`;
+  let rows = [];
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    rows = data.rows || [];
+  } catch(e) { return; }
+
+  const weekRows = rows.filter(r => r.week > 0).sort((a,b) => a.week - b.week);
+  if (!weekRows.length) return;
+
+  const labels = weekRows.map(r => 'W' + r.week);
+  const modelMAE = weekRows.map(r => r.mae);
+  const mktMAE = weekRows.map(r => r.market_mae);
+
+  const ctx = document.getElementById('sc-trend-chart');
+  if (_scTrendChart) _scTrendChart.destroy();
+  _scTrendChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Model MAE', data: modelMAE, borderColor: 'rgb(59,130,246)', backgroundColor: 'rgba(59,130,246,0.1)', tension: 0.3, fill: false },
+        { label: 'Market MAE', data: mktMAE, borderColor: 'rgb(239,68,68)', backgroundColor: 'rgba(239,68,68,0.1)', tension: 0.3, fill: false, borderDash: [5,5] },
+      ]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { labels: { color: 'rgb(156,163,175)' } } },
+      scales: {
+        x: { ticks: { color: 'rgb(156,163,175)' }, grid: { color: 'rgba(156,163,175,0.1)' } },
+        y: { ticks: { color: 'rgb(156,163,175)' }, grid: { color: 'rgba(156,163,175,0.1)' }, title: { display: true, text: 'MAE', color: 'rgb(156,163,175)' } }
+      }
+    }
+  });
+}
+
+// ── Per-Prediction Table ──────────────────────────────────────────────────────
+
+var _scPredOffset = 0;
+var _scPredSeq = 0;
+var _scTeamsLoaded = false;
+
+async function _loadTeamsDropdown() {
+  if (_scTeamsLoaded) return;
+  try {
+    const res = await fetch('/api/scorecard/NFL/teams?season=2026');
+    const data = await res.json();
+    const teams = data.teams || [];
+    const teamSel = document.getElementById('sc-team');
+    const oppSel = document.getElementById('sc-opp');
+    teams.forEach(t => {
+      teamSel.innerHTML += `<option value="${t}">${t}</option>`;
+      oppSel.innerHTML += `<option value="${t}">${t}</option>`;
+    });
+    _scTeamsLoaded = true;
+  } catch(e) { console.warn('Teams load error:', e); }
+}
+
+async function _loadPredictionTable(resetOffset) {
+  if (resetOffset !== false) _scPredOffset = 0;
+  const seq = ++_scPredSeq;
+  const week = document.getElementById('sc-week').value;
+  const stat = document.getElementById('sc-stat').value;
+  const pos = document.getElementById('sc-pos').value;
+  const mv = document.getElementById('sc-mv').value;
+  const ld = document.getElementById('sc-ld').value;
+  const team = document.getElementById('sc-team').value;
+  const opp = document.getElementById('sc-opp').value;
+  const staleOnly = document.getElementById('sc-stale-only').checked;
+  const missMin = document.getElementById('sc-miss-min').value;
+  const missMax = document.getElementById('sc-miss-max').value;
+  const dir = document.getElementById('sc-pred-dir').value;
+
+  let url = `/api/scorecard/NFL/predictions?season=2026&week=${week}`;
+  if (stat !== '_ALL_') url += `&stat_type=${stat}`;
+  if (pos !== '_ALL_') url += `&position=${pos}`;
+  if (mv !== '_ALL_') url += `&model_version=${mv}`;
+  if (ld !== '_ALL_') url += `&line_depth=${ld}`;
+  if (team) url += `&team=${team}`;
+  if (opp) url += `&opponent=${opp}`;
+  if (staleOnly) url += `&stale_only=true`;
+  if (missMin) url += `&miss_abs_min=${missMin}`;
+  if (missMax) url += `&miss_abs_max=${missMax}`;
+  if (dir) url += `&direction=${dir}`;
+  url += `&limit=50&offset=${_scPredOffset}`;
+
+  const tblEl = document.getElementById('sc-pred-table');
+  const statusEl = document.getElementById('sc-pred-status');
+  const pagerEl = document.getElementById('sc-pred-pager');
+
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    if (seq !== _scPredSeq) return; // stale response
+
+    const rows = data.rows || [];
+    const total = data.total || 0;
+    statusEl.textContent = `Showing ${_scPredOffset + 1}–${_scPredOffset + rows.length} of ${total}`;
+
+    if (!rows.length) {
+      tblEl.innerHTML = '<div style="color:var(--muted)">No predictions match filters</div>';
+      pagerEl.innerHTML = '';
+      return;
+    }
+
+    let html = '<table style="width:100%"><thead><tr>';
+    html += '<th>Player</th><th>Team</th><th>Opp</th><th>Stat</th>';
+    html += '<th>Proj</th><th>Med</th><th>Line</th><th>Actual</th>';
+    html += '<th>Model Miss</th><th>Line Miss</th><th>Beat?</th>';
+    html += '</tr></thead><tbody>';
+    rows.forEach(r => {
+      const beatStr = r.beat_line
+        ? '<span style="color:var(--green,#22c55e);font-weight:600">✓</span>'
+        : '<span style="color:var(--red,#ef4444)">✗</span>';
+      const missColor = Math.abs(r.model_miss) > 20
+        ? 'color:var(--red,#ef4444)' : '';
+      const staleFlag = r.is_stale
+        ? ' <span style="color:var(--amber,#f59e0b);font-size:10px" title="Stale input">⚠</span>' : '';
+      const med = r.consensus_median != null ? r.consensus_median.toFixed(1) : '—';
+      html += `<tr>`;
+      html += `<td>${r.player_name}${staleFlag}</td>`;
+      html += `<td>${r.team || '—'}</td>`;
+      html += `<td>${r.opponent || '—'}</td>`;
+      html += `<td>${r.stat_type}</td>`;
+      html += `<td>${r.consensus_mean?.toFixed(1) ?? '—'}</td>`;
+      html += `<td>${med}</td>`;
+      html += `<td>${r.prop_line?.toFixed(1) ?? '—'}</td>`;
+      html += `<td>${r.actual_value?.toFixed(1) ?? '—'}</td>`;
+      html += `<td style="${missColor}">${r.model_miss?.toFixed(1) ?? '—'}</td>`;
+      html += `<td>${r.line_miss?.toFixed(1) ?? '—'}</td>`;
+      html += `<td>${beatStr}</td>`;
+      html += `</tr>`;
+    });
+    html += '</tbody></table>';
+    tblEl.innerHTML = html;
+
+    // Pager
+    let pagerHtml = '';
+    if (_scPredOffset > 0) {
+      pagerHtml += `<button class="btn btn-ghost btn-sm" onclick="_scPredOffset -= 50; _loadPredictionTable(false)">← Prev</button>`;
+    }
+    if (_scPredOffset + rows.length < total) {
+      pagerHtml += `<button class="btn btn-ghost btn-sm" onclick="_scPredOffset += 50; _loadPredictionTable(false)">Next →</button>`;
+    }
+    pagerEl.innerHTML = pagerHtml;
+  } catch(e) {
+    console.warn('Prediction table error:', e);
+    tblEl.innerHTML = '<div style="color:var(--red,#ef4444)">Error loading predictions</div>';
+  }
+}
+
+// ── Researcher ───────────────────────────────────────────────────────────────
 
 async function loadResearcher() {
   const dateEl = document.getElementById('res-date');

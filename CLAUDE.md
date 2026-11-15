@@ -31,6 +31,27 @@
 - **Stop background shells when their task finishes.**  Never leave a `run_in_background` command, monitor, or subagent running after its purpose is complete.
 - **List any still-running background tasks at the end of each session** so the user can kill stragglers.
 
+## NFL Prereg Freeze (until W14 verdict, ~2026-12-05)
+- **Do NOT change P(over) logic in `find_prop_gaps()`.**  P(over) is frozen as lognormal for yardage stats.  The prereg (FW-2) reads stored `p_over` values; changing the distribution mid-test invalidates the forward read.  The `distributional_median` column uses shifted gamma ppf(0.5) — that is a separate metric and may be updated.
+- **Do NOT change `p_over_line()` function behavior** or the variance inputs to it for yardage stats.  Changes to NegBin (counts) P(over) are allowed if justified.
+- **After W14 verdict**: evaluate switching P(over) to shifted gamma (`p_over_line_gamma_shifted` from `nfl_interim_dispersion.py`) for yardage.  This is logged in OPEN_ITEMS.md entry 2026-11-08a.
+
+## Forward-Prediction Storage
+- **Forward-prediction tables store every market-posted line.**  For each player × stat, store sim probabilities at every line the market posted (main + all alt rungs), with book, prices, and devig method.  Selection and suppression logic runs downstream only, never at storage time.
+
+## UI Metric Labels
+- **Every metric shown in the UI must display**: sport, time period, filters applied, N (sample size), and a confidence interval where applicable.  No naked headline numbers (e.g. "60.5% WR") without context.
+- **Run the frontend smoke test** (`frontend/smoke_test.py`) before reporting any frontend change as done.  The test verifies every nav tab's page div exists, its loader function exists, and there are no unclosed JS blocks.
+
+## Production Verification
+- **"Verified in production" means exercised through the scheduled production code path with rows written**, not through a test harness, manual script, or import check.  A function that parses correctly and passes unit tests is not verified until the scheduler has called it and the expected rows appear in the database.
+- **After deploying new pipeline code**, confirm rows in the target table from the next scheduled run before marking the feature as live.  Check the morning after, not the same session.
+- **A fix to a scheduled path isn't done until the server is restarted and the running commit matches.**  Code on disk doesn't help if the running process is still using the old version.  After any deploy, verify via `/api/health` that `git_commit_running == git_commit_disk`.
+
+## Session Discipline
+- **Commit and push at the end of every session.**  Uncommitted changes on disk make the version hash meaningless.  The health email flags a dirty working tree, but the fix is to not leave one.
+- **Pre-registration freezes always reference a tagged, pushed commit.**  Tag format: `s5-4-freeze-YYYY-MM-DD`.  The tag must exist on `origin` so anyone can `git checkout` the exact frozen code.  Never freeze to an unpushed or uncommitted state.
+
 ## Secrets & Credentials
 - **Never hardcode API keys, passwords, or tokens in source files.**  All secrets live in `backend/.env` (gitignored).  Code reads them via `os.environ.get()` or `from config import`.
 - **Never commit data files** (`*.db`, `*.sqlite`, `*.csv`, `*.json` data exports) to git.  The `data/` directory is gitignored.

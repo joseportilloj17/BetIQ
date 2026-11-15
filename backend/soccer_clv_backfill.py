@@ -124,7 +124,21 @@ def _api_call(url: str, label: str = "") -> tuple[Optional[dict], Optional[int]]
         with urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
             remaining = resp.headers.get("x-requests-remaining")
+            used_last = resp.headers.get("x-requests-last")
             _log(label, resp.status, f"ok, remaining={remaining}")
+
+            # Log credits to historical.db credits_log table
+            # Use x-requests-last (per-request cost) to match creator_tier._get() pattern
+            remaining_int = int(remaining) if remaining and str(remaining).isdigit() else None
+            used_last_int = int(used_last) if used_last and str(used_last).isdigit() else None
+            try:
+                from creator_tier import _log_credits
+                # Strip API key from URL for the endpoint label
+                endpoint = url.split("?")[0].replace(BASE_URL, "")
+                _log_credits(endpoint, used_last_int, remaining_int)
+            except Exception:
+                pass  # fire-and-forget
+
             return data, int(remaining) if remaining else None
     except HTTPError as e:
         body = e.read().decode()[:200] if hasattr(e, "read") else str(e)

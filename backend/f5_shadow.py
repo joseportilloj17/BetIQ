@@ -79,7 +79,7 @@ def fetch_f5_odds_batch(today_str: str | None = None) -> list[dict]:
     if today_str is None:
         today_str = datetime.now(_CT).strftime("%Y-%m-%d")
 
-    # Step 1: free event-list fetch
+    # Step 1: free event-list fetch (0 credits, but log for tracking)
     import requests
     params = {"apiKey": ODDS_API_KEY, "dateFormat": "iso"}
     try:
@@ -88,6 +88,17 @@ def fetch_f5_odds_batch(today_str: str | None = None) -> list[dict]:
         if r.status_code != 200:
             log.warning("F5 event-list fetch failed: HTTP %d", r.status_code)
             return []
+        # Log credits to historical.db credits_log table
+        # Use x-requests-last (per-request cost) to match creator_tier._get() pattern
+        remaining = r.headers.get("x-requests-remaining", "")
+        used_last = r.headers.get("x-requests-last", "")
+        remaining_int = int(remaining) if remaining.isdigit() else None
+        used_last_int = int(used_last) if used_last.isdigit() else None
+        try:
+            from creator_tier import _log_credits
+            _log_credits("/sports/baseball_mlb/events", used_last_int, remaining_int)
+        except Exception:
+            pass  # fire-and-forget
         events_list = r.json()
     except Exception as e:
         log.error("F5 event-list fetch error: %s", e)

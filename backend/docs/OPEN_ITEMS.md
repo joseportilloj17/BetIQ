@@ -1,6 +1,7 @@
-# NBA Prop Model — Open Items
+# BetIQ — Open Items
 
-Last updated: 2026-11-05
+Last updated: 2026-11-09
+**Last reconciled**: 2026-11-07 (re-check weekly)
 
 ## B1: Minutes Model — ALL COMPLETE
 
@@ -687,7 +688,7 @@ Source field tracks provenance: `nba_pdf`, `sleeper`, `espn`. PDF wins when pres
 | # | Item | Status | Notes |
 |---|------|--------|-------|
 | S3-1 | Dispersion fit by stat × role | **DONE** | STL/BLK near-Poisson (OD 1.02-1.05), REB/AST/FG3M mild (1.12-1.46), PTS over-dispersed (2.79). Rate-based Var explains 80-100% — extracted rate_std already absorbs Poisson shot noise. |
-| S3-2 | Draw counts given minutes × rate | **DEFERRED** | Adding NegBin requires rate_std decomposition (true_rate vs shot_noise) to avoid double-counting. For SGP k factors, marginal bias cancels in ratio. Revisit after S4 marginal calibration if PIT shows systematic discrete mismatch. |
+| S3-2 | Draw counts given minutes × rate | **DONE** (implementation) | Gamma-Poisson draws deployed 2026-10-30 for STL/BLK/FG3M in `GameSimulator.run()` (lines 1079-1129). Gamma rate draw + Poisson count draw = NegBin marginal. **Verification pending**: ablation PIT can't validate this (uses Normal-model predictions, not sim draws). Need forward data from `nba_forward_preds` (0 rows as of 2026-11-08; collection started 2026-11-06). Run sim-based PIT when N≥100 graded forward games (~mid-Dec 2026). |
 
 ### Step 4: Validation vs reality (4 seasons of box scores)
 
@@ -701,15 +702,17 @@ Source field tracks provenance: `nba_pdf`, `sleeper`, `espn`. PDF wins when pres
 | # | Item | Status | Notes |
 |---|------|--------|-------|
 | S5-1 | Two-stage calibration | **DONE** | PIT re-verified post engagement draw. Holdout validation (H1→H2, H2→H1) showed all Normal corrections are one-way or dead → REMOVED. Gamma-Poisson for discrete stats is the only surviving structural fix. See S5-1 results below. |
-| S5-2 | Comparison vs devigged market | **COLLECTING** | `nba_forward_preds` table in historical.db stores sim P(over/under), median, config at scout + pre-tip. Grading wired from `nba_player_game_logs`. **Effective day 1: 2026-11-06** (first scout+forward_preds run). Oct 30–Nov 5 LOST: bets.db corruption→server down Oct 31-Nov 2; recovery missed NBA scout Oct 30, Nov 3-5; code deployed after Nov 5 scout. N≥100 games target: ~Dec 2026. |
-| S5-3 | Forward weeks separate | **BLOCKED** | 2026-27 NBA season. Target: first read at N=100 games (~Dec 2026). |
+| S5-2 | Comparison vs devigged market | **ACTIVE — first full capture 2026-11-15** | `_persist_nba_forward_preds()` rewritten: stores sim P(over/under) at EVERY market-posted line (main + all alt rungs), with best_price, best_book, devig_implied, devig_method, n_books. Queries `player_props` for all lines per game via `_get_market_lines_for_game()`. Two-sided lines → multiplicative devig; one-sided alts → borrowed_margin (from same player/stat/book main-line overround, fallback to stat/book median, then global median ~1.05). `_pick_best_threshold` replaced by EV-based selection (`_ev_upgrade_props`, odds band [1.667, 3.50], shadow-only). **First full capture: 2026-11-15** — 4,602 rows (9 games, 117 players), main-line join rate 100% (620/620 two-sided devig), alt lines 3,953 (borrowed_margin), fallback 29 (no_market=1). `no_market` flag excludes fallback rows from S5-2 and pick analyses. 3,771 pre-EV NBA mock bets tagged `pre_ev_threshold`. Heavy-fav share 10% (was ~100% under old logic). **Bug fixed 2026-11-15**: `_persist_nba_forward_preds` ran `CREATE TABLE IF NOT EXISTS` but not `ALTER TABLE ADD COLUMN` migration loop — `no_market` column missing caused silent INSERT failure; added migration loop to match `_ensure_nba_forward_preds_table()`. **Prior data**: Nov 8-9 rows (430) all `no_market=1` (old storage, no market lines). **Effective day 1: 2026-11-15**. First Brier read at N≥100 games (~late-Dec 2026). |
+| S5-3 | Forward weeks separate | **ACTIVE** | 2026-27 NBA season underway. First full market-linked capture 2026-11-15: 4,602 rows (9 games, 620 main + 3,953 alt + 29 fallback). Prior rows (Nov 8-9, 430 rows) are no_market=1 fallback only. Pre-tip snapshots scheduled for game windows. First Brier read at N≥100 games (~late-Dec 2026). |
 | S5-4 | Pre-register rules | **DONE** | See locked configuration below. |
 
-#### S5-4: Pre-registered sim configuration (FROZEN 2026-10-30)
+#### S5-4: Pre-registered sim configuration (RE-FROZEN 2026-11-15, commit c26cb6e)
 
-**Forward test day 1**: ~~2026-10-30~~ → **2026-11-06** (Oct 30–Nov 5 lost to bets.db corruption + server downtime + code deploy timing; see S5-2 status).
+**Amendment log**: Original freeze 2026-10-30. Re-frozen 2026-11-15 before any day-1 data analyzed. Changes from original: P(plays) rates updated from hand-set to measured (178 game dates); timing-conditional tables added; role-based base rates added; supplementary blowout/OT/early-exit constants documented. No sim logic or engine parameters changed — only injury P(plays) inputs.
 
-**Engine (nba_matchup_engine.py):**
+**Forward test day 1**: ~~2026-10-30~~ → ~~2026-11-06~~ → ~~2026-11-09~~ → ~~2026-11-08~~ → ~~2026-11-10~~ → **2026-11-15** (Oct 30–Nov 5: server downtime; Nov 6-7: `_fetch_market_lines()` + `datetime` bugs; Nov 8-9: threshold storage bug — `_pick_best_threshold` selected lowest rungs, 89% P(over)>0.80, 0% joinable to market; Nov 10-14: `no_market` column missing caused silent INSERT failure in `_persist_nba_forward_preds`; fixed 2026-11-15 by adding ALTER TABLE migration loop alongside CREATE TABLE IF NOT EXISTS).
+
+**Engine (nba_matchup_engine.py):** unchanged from original freeze
 - `reconcile: True`, `reconcile_strength: 0.5`, `reconcile_cap: 0.25`
 - `defense: True`, `blowout: True`, `form: False`, `synergy: False`, `matchup: False`
 - `reconcile_pool_fix: True` (OTHER bucket adjustment)
@@ -717,21 +720,54 @@ Source field tracks provenance: `nba_pdf`, `sleeper`, `espn`. PDF wins when pres
 **Sim (nba_game_sim.py):**
 - `_POSS_CV = 0.04` (pace variability)
 - `_MARGIN_SIGMA = 15.8` (margin std, 4,668 games)
-- `_GAME_TOTAL_STD = 19.4` (derived)
+- `_GAME_TOTAL_STD = 19.4` (derived: σ²_game = 4 × 12.5² − 15.8² = 375.4 → σ = 19.4)
+- `_TEAM_TOTAL_STD = 12.5` (team-level scoring std, 9,336 team-games)
 - `_TEAM_SCORING_DAMP = 0.30` (scoring efficiency dampening)
 - `_ENGAGEMENT_CV = 0.15` (per-player good-game/bad-game)
 - `_ENGAGEMENT_LOADINGS = {PTS: 1.0, REB: 0.8, AST: 0.0, STL: 0.0, BLK: 0.0, FG3M: 1.0, PRA: 0.8}`
 - Team scoring mult applies to PTS, FG3M only (not AST)
 - `_BLOWOUT_THRESHOLD = 15.0`, `_BASELINE_BLOWOUT_PROB = 0.326`
+- `_BLOWOUT_STARTER_CUT = 2.3` min, `_BLOWOUT_ROTATION_GAIN = 4.0` min, `_BLOWOUT_SPOT_GAIN = 7.0` min
 - `_OT_PROB = 0.0512`
-- P(plays) rates: HAND-SET (Out=0, Doubtful=0.20, Questionable=0.65, Probable=0.95). Update rule pre-registered separately.
-- In-game early exit: starter 3.5%, rotation 2%, spot 1%
+- `_OT_MINUTES_STARTER = 4.0`, `_OT_MINUTES_ROTATION = 1.0`, `_OT_MINUTES_SPOT = 0.0`
+- In-game early exit: `_EARLY_EXIT_PROB = {starter: 0.035, rotation: 0.020, spot: 0.010}`
+- `_EARLY_EXIT_MEAN = 14.8` min, `_EARLY_EXIT_STD = 4.7` min (minutes at exit)
+- **P(plays) rates**: MEASURED from 178 game dates (nba_injury_forward_log + nba_player_game_logs), replacing original hand-set values:
+
+  | Status | Original (hand-set) | Running (measured) | Source |
+  |--------|--------------------|--------------------|--------|
+  | Out | 0.00 | 0.00 | 7/2,591 = 0.3% (timing artifacts) |
+  | IR | 0.00 | 0.00 | definitional |
+  | Doubtful | 0.20 | **0.02** | 9/411 (pooled starter+rotation) |
+  | Questionable | 0.65 | **0.55** | 1,220/2,198 (pooled starter+rotation) |
+  | Probable | 0.95 | **0.92** | 763/826 (pooled starter+rotation) |
+  | GTD | — | 0.50 | Sleeper-specific label, hand-set |
+  | DTD | — | 0.70 | Sleeper-specific label, hand-set |
+  | Active | — | 1.00 | confirmed healthy |
+  | None/unlisted | — | 1.00 | defers to role base rate |
+
+- **Timing-conditional P(plays)** (used when `hours_to_tip` available):
+
+  | Status | Day-before (>12h) | Game-day (≤12h) |
+  |--------|-------------------|-----------------|
+  | Out | 0.000 | 0.000 |
+  | Doubtful | 0.057 (9/159) | 0.000 (0/252) |
+  | Questionable | 0.565 (534/945) | 0.547 (686/1,253) |
+  | Probable | 0.893 (274/307) | 0.942 (489/519) |
+
+- **Role base rates** (players NOT on injury report): starter 0.998, rotation 0.998, spot 0.658 (captures rest days, late scratches)
 - **Calibration corrections**: NONE — all Normal-distribution corrections (bias + σ_scale) failed holdout validation (fit on H1, test on H2 and vice versa). PTS/PRA corrections were one-way only (helped one half, hurt the other). Only structural fix survived: Gamma-Poisson for discrete stats.
 - **Discrete distributions (Gamma-Poisson compound = exact NegBin):**
-  - STL, BLK, FG3M: Gamma(α,β) rate draw → Poisson(λ = min × rate) — always
-  - AST: Gamma-Poisson for rotation/spot, Normal for starters
+  - STL, BLK, FG3M (`_DISCRETE_STAT_INDICES = {3, 4, 5}`): Gamma(α,β) rate draw → Poisson(λ = min × rate) — always
+  - AST (`_AST_INDEX = 2`): Gamma-Poisson for rotation/spot, Normal for starters
   - Non-negative by construction (no floor at 0), integer output, NegBin-like overdispersion from game-to-game rate uncertainty
   - Gamma params: α = (μ/σ)², β = σ²/μ (matching mean and variance of per-minute rate)
+
+**Storage & selection (scout/runner.py, scout/nba_player_props.py):**
+- Forward preds stored at EVERY market-posted line (main + alt rungs) via `_get_market_lines_for_game()`
+- Two-sided lines: multiplicative devig; one-sided alts: borrowed_margin (same player/stat/book main overround)
+- EV-based pick selection: `_MIN_ODDS = 1.667`, `_MAX_ODDS = 3.50`, shadow-only (`EV_SHADOW` risk factor)
+- Fallback rows: `no_market = 1`, excluded from S5-2 primary analysis
 
 **Decision rules (pre-registered):**
 - Report P(over) conditioned on playing (void rule)
@@ -741,7 +777,7 @@ Source field tracks provenance: `nba_pdf`, `sleeper`, `espn`. PDF wins when pres
 - Stat coverage: PTS, REB, AST, PRA, FG3M, STL, BLK (all stats; discrete stats use Gamma-Poisson)
 - Player coverage: starters + rotation only (spot excluded)
 
-**Holdout calibration validation (S5-1):**
+**Holdout calibration validation (S5-1):** unchanged from original
 
 | Stat × Role | H1→H2 ΔKS | H2→H1 ΔKS | Verdict |
 |-------------|-----------|-----------|---------|
@@ -938,12 +974,435 @@ Devig: Two-sided (over+under pair → proportional vig removal) when both sides 
 | INFRA-3 | Store NBA sim P(over) at scout time | DONE | nba_forward_preds table in historical.db. Written at scout (9 AM) and pre-tip (30-60 min before tip). Grading wired (runs after nightly_ats) with 3-tier resolution: bdl_player_id → alias table → normalized name. `nba_player_alias` table (7 seed aliases) resolves Odds API ↔ BDL name mismatches. `bdl_player_id` column populated at persist time. Smoke test (`s5_2_smoke_test.py`) reports: chain status, match rates (model ↔ player_props), unmatched names, alias table, bdl fill rate. Oct 30–Nov 5 reconstruction LOST (see S5-2). Forward capture starts Nov 6. |
 | INFRA-4 | Repo security cleanup | **DONE** | Hardcoded keys replaced with `os.environ.get()` + `backend/.env` (gitignored). Git history scrubbed with `git filter-repo --replace-text`. Gitleaks pre-commit hook active. GitHub secret scanning + push protection enabled. Credit tripwire deployed: daily 3 AM check compares provider-side usage vs logged calls; alerts (macOS + email) on >5% unexplained gap. API endpoint: `/api/credits/tripwire`. BallDontLie has no usage headers — tripwire covers TheOddsAPI only. Historical gap analysis: 30.7% all-time gap explained by backfill scripts that bypass `_log_credits()`. |
 
-## NFL Items (from existing plan)
+## NFL Items
 
 | # | Item | Status | Notes |
 |---|------|--------|-------|
-| NFL-1 | Violation report + architecture (Phase 0) | NOT STARTED | `nfl_reconciliation_diagnostics.py` |
-| NFL-2 | Coverage data audit (Phase 1) | NOT STARTED | `nfl_coverage_layer.py` |
-| NFL-3 | Team volume reconciliation (Phase 2) | NOT STARTED | `nfl_volume_reconciliation.py` |
-| NFL-4 | Coverage proxy (Phase 3) | BLOCKED by NFL-2 | Conditional on B1 results |
-| NFL-5 | Bet-time logging (Phase 4) | NOT STARTED | model_version column + A/B |
+| NFL-1 | Violation report + architecture (Phase 0) | **DONE** | `nfl_reconciliation_diagnostics.py` built. Team-level and player-level diagnostics, sim scoring chain validation. |
+| NFL-2 | Coverage data audit (Phase 1) | **CLOSED** | Coverage gaps addressed by NFL-6/7/9 pipeline fixes (2026-11-07). Main-line coverage now 100% across all 5 stats. |
+| NFL-3 | Team volume reconciliation (Phase 2) | **DONE** | `nfl_volume_reconciliation.py` + `nfl_player_allocation.py` built. Player share profiles feed `nfl_game_sim.py`. |
+| NFL-4 | Game sim + market anchoring (Phase 3) | **DONE (archived)** | `nfl_game_sim.py` built (drive-level sim with pace, backup QB, OT, penalties). Market anchoring via spread/total. Head-to-head vs v1.2 consensus showed v1.2 dominates — sim archived, not deployed to production. |
+| NFL-5 | Bet-time logging (Phase 4) | **CLOSED** | `model_version` column deployed on `fantasy_forward_preds` (v0, v0_capped, v1.2_shifted_gamma). Regime tagging (R1/R2/R3) tracks pipeline versions. No separate A/B needed — v1.2 is sole production model. |
+| NFL-6 | Lab coverage fix: show all posted props | **DONE** | 2026-11-07. Added "no projection" badge, alias table (7 seeds), calibration-unverified badge, per-game×market QA, API endpoint `/api/lab/props`. Before: 160 players shown (predictions-only). After: all players with posted prop or prediction shown. |
+| NFL-7 | Pipeline root cause: alt-line dedup + suppression fix | **DONE** | 2026-11-07. Two bugs: (1) alt-line at same point as main overwrites via UNIQUE key; (2) main-line entries suppressed by bet-selection filters. Fixed both. Main-line coverage now 100% across all 5 stats: pass_yds 28/28, pass_tds 28/28, rush_yds 79/79, rec_yds 156/156, receptions 151/151. |
+| NFL-8 | Name normalization: apostrophe strip + alias cleanup | **DONE** | 2026-11-07. `_normalize_player_name` now strips apostrophes (fixes Tre' Harris → Tre Harris). Removed 2 bad aliases (Cam Sample→DE, Tre Harris→wrong person). Added Matt Hibner alias. Takes effect on next pipeline run. |
+| NFL-9 | Suppression → flag column (store all, filter at pick layer) | **DONE** | 2026-11-07. Added `suppression_rule TEXT` column. Three rules stored as flags: `alt_over`, `deep_alt_under_rec_pass`, `rb_rush_over_low_conv`. All predictions now stored (none skipped). Grading/calibration use ALL rows (no suppression filter). Suppression applied only at pick-generation layer (`run_weekly_pipeline` display filter). Impact: ~48% of alt-line rows were silently dropped in weeks 5-9 (~16,600 rows). |
+| NFL-10 | Alias validation: both-side resolution + cleanup | **DONE** | 2026-11-07. Bug: `_resolve_nfl_name` only applied to Odds API names, not consensus — Chig Okonkwo, Mike Evans, Gabe Davis all had broken matches (alias mapped to canonical on one side only). Fix: `build_consensus` now uses `_resolve_nfl_name` instead of `_normalize_player_name`, so both sides resolve to the same key. Removed "Ken Walker"→"Kenneth Walker" alias (risky: could merge WR/FA with RB/KC; suffix normalization handles "III" already). 6 aliases validated against Sleeper roster: all team+position match. |
+| NFL-11 | Add rush_attempts + receptions_alternate markets | **DONE** | 2026-11-07. Verified on Odds API: `player_rush_attempts` (2-6 outcomes/book, DraftKings/BetMGM/BetOnline/Bovada/Fanatics) and `player_receptions_alternate` (53-86 outcomes/book, DraftKings/Caesars/FanDuel/BetOnline/BetRivers/Fanatics). Added to `_PROP_MARKETS`, `STAT_TO_ALT_PROP`, and `_MARKET_TO_STAT`. Rush attempts shows with "no projection" badge (no Sleeper/ESPN source). Receptions alternate uses existing receptions consensus. |
+
+## NFL Prereg Coverage Log
+
+| Date | Change | rec_yds rows (before) | rec_yds rows (after) | Notes |
+|------|--------|-----------------------|----------------------|-------|
+| 2026-11-07a | Lab coverage fix: show prop-only players with "no projection" badge; add `nfl_player_alias` (7 seeds); calibration-unverified on receptions/pass_tds; per-game×market coverage QA alert (<95%) | 944 forward preds (224 players) | — | Display-only change, no prediction rows affected |
+| 2026-11-07b | Pipeline root cause fix: alt-line dedup + suppression fix + normalization (apostrophe strip) | 944 (224 players) | 831 rows (156 players) main-line only; 4,975 total (202 players all depths) | Pool EXPANDED: main-line rec_yds from ~125 to 156 players (100% of consensus). Before: `find_prop_gaps` filtered by edge; `store_forward_predictions` suppressed main-line entries; alt-line overwrote main via UNIQUE key. After: all consensus players stored, main never suppressed, alt deduped. Global: pass_yds 100%, pass_tds 100%, rush_yds 100%, rec_yds 97.5%, receptions 95.6%. Remaining gaps (4 rec_yds, 7 receptions) are genuine no-projection players. |
+| 2026-11-07c | **DATA-REGIME CHANGE**: suppression → flag column | — | All predictions now stored with `suppression_rule` flag | Weeks 2-4: pre-suppression (complete). Weeks 5-9: suppressed rows were DROPPED (never stored). Estimated ~16,600 alt-line rows lost across weeks 5-9 (~48% of full alt pool). Three rules: `alt_over` (all alt OVER, -18 to -26% structural ROI), `deep_alt_under_rec_pass` (deep alt UNDER rec/pass, -3.4% ROI), `rb_rush_over_low_conv` (RB rush OVER non-high). From W10 forward, all rows stored with flag; pick-generation filters at display/bet layer. **Prereg impact**: rec_yds OVER near_alt rows (~13-30/week) were suppressed by `alt_over` rule; these include eligible prereg candidates (edge>=5pp, odds>-150). Prereg results before W10 are computed on the stored (filtered) pool only. |
+| 2026-11-07d | **PREREG REGIME R3**: full-storage + alias fix | — | — | **R1** (created_at < 2026-11-05T22:03:48Z, W7–W8): v1.2 deployed, sparse alt rungs. Bugs: (a) suppression dropped near_alt/deep_alt OVER (~48% of alt pool, active since 2026-10-02); (b) consensus-side alias bug (Chig Okonkwo/Mike Evans/Gabe Davis; 68 rows flagged `data_error='alias_mismatch'`). Last R1 row: 2026-11-04T21:27:45Z. **R2** (2026-11-05T22:03:48Z <= created_at < 2026-11-07T10:47:26Z, W9 pre-fix): same bugs as R1; bias-corrected projections deployed; 3,171 rows; last R2 row: 2026-11-06T16:26:12Z. **R3** (created_at >= 2026-11-07T10:47:26Z, W9 post-fix + W10+): 1,804 W9 rows + all future; all rows stored with `suppression_rule` flag, alias resolved both sides, `data_error` flags applied. R3 is the first clean regime — primary evaluation pool. Grading/calibration use ALL rows (no suppression filter); suppression applies only at pick-generation layer. No rows exist in either overnight gap (R1→R2 or R2→R3). |
+| 2026-11-07e | **Shadow-pick suppression deployed** | — | — | Pick-generation filter in `run_weekly_pipeline` now excludes `suppression_rule IS NOT NULL`. Shadow picks were **unfiltered** from 2026-11-07T10:47Z (R3 start) to 2026-11-07 (this fix). Prior to R3, suppression was applied at storage time (rows dropped, never stored). Effect: no shadow picks were generated from suppressed rows in any regime — R1/R2 dropped them, R3 pre-fix stored but never generated picks from them (the display filter already required abs_gap>=1.0 + edge>=5pp which filtered most). This note records the regime boundary for shadow-pick tracking. |
+| 2026-11-07f | **Post-kickoff contamination flagged** | — | — | 3,045 rows flagged `data_error='post_kickoff'` (created_at > kickoff_utc). Root cause: `store_forward_predictions()` used INSERT OR REPLACE without kickoff freeze — Sunday refreshes overwrote pre-kickoff rows after games started. Per-game freeze now enforced (skip rows where `now > kickoff_utc`). Snapshot-based grading restores pre-kickoff consensus when needed. **Prereg R1 impact**: 13/154 R1 picks (W7–W8, rec_yds OVER, v1.2, edge≥5pp) were post-kickoff. Clean R1: N=141, W=93, L=48, WR=66.0%, ROI=+24.7% (vs contaminated: N=154, WR=64.9%, ROI=+22.7%). All analysis queries now filter `data_error IS NULL`. Clean settled pool: 12,931/15,341 (84.3%). |
+| 2026-11-08a | **P(over) distribution mislabel identified + frozen** | — | — | `find_prop_gaps()` has used **lognormal** for yardage P(over) since file creation (commit a91b992, 2026-10-02). All stored `p_over` values for rows tagged `model_version='v1.2_shifted_gamma'` were computed with lognormal, NOT shifted gamma. The shifted gamma CDF (`p_over_line_gamma_shifted`) was only used in `nfl_calibration_diagnosis.py`'s `_rescore_v1(use_v12=True)` path — never in the production storage pipeline. Difference: mean 3.9pp, max 10.4pp (rec_yds WR worst). `distributional_median` now correctly uses shifted gamma ppf(0.5); P(over) is frozen as lognormal until after W14 prereg verdict. Any analysis reading stored `p_over` directly gets lognormal; analyses using `_rescore_v1(use_v12=True)` get shifted gamma. This two-path inconsistency is known but frozen — the prereg reads stored values and must not change mid-test. |
+| 2026-11-08b | **Shadow P(over) v1.2 gamma + distribution label deployed** | — | — | Two new columns on `fantasy_forward_preds`: (1) `p_over_v12_gamma` — shifted gamma CDF P(over) computed alongside frozen lognormal `p_over`. Populated from W10 forward for yardage stats (pass_yds, rush_yds, rec_yds); NULL for counts. Uses same `p_over_line_gamma_shifted(line, mean, cv, base_rate)` as analysis-tool `_rescore_v1`. (2) `p_over_distribution` — labels which CDF produced `p_over`: 'lognormal' for yardage, 'negbin' for counts. Backfilled on all 28,612 existing rows. Reports should use `p_over_distribution` instead of `model_version` to identify the P(over) distribution. Post-W14 head-to-head: compare `p_over` (lognormal) vs `p_over_v12_gamma` (shifted gamma) on same predictions — Brier, calibration, ROI by odds band, prereg rule under each. |
+| 2026-11-08c | **Head-to-head lognormal vs gamma (W2-W8)** | — | — | Backfilled `p_over_v12_gamma` on 6,432 graded yardage rows. **All yardage (main+alt, N=6,432)**: gamma Brier 0.1674 vs lognormal 0.2093 (Δ=-0.042, paired t=-17.6). Calibration error: gamma 0.047 vs lognormal 0.172. **Main-line only (N=2,698)**: gamma Brier 0.250 vs lognormal 0.336 (Δ=-0.086); game-clustered 95% CI: [-0.105, -0.067]. Main-line prereg ROI: gamma +13.5% @≥3pp edge (N=956, WR=59.9%) vs lognormal -0.4% (N=1,879, WR=52.6%); game-clustered 95% CI on ROI: [+4.1%, +22.1%]. Direction disagreements (N=637): gamma right 358 vs lognormal 279 (56.2%). Gamma wins every stat, every week, every position. **Caveat**: v1.2 base rates fitted W2-W5 (in-sample); W5-W8 OOS improvements larger (good sign). **Brier populations**: Δ=-0.042 = all yardage (main+alt); Δ=-0.086 = main-line only. Use main-line as primary (matches prereg population). |
+| 2026-11-08d | **FW-2 prereg amendment + FW-2b parallel prereg** | — | — | (1) FW-2 amended with O'Brien-Fleming interim looks at W10/W12/W14 (alpha spending 0.0005/0.014/0.045, two-sided). Filed at `data/prereg_fw2_amendment_20261108.md` before any W10 graded. (2) FW-2b registered: parallel prereg using `p_over_v12_gamma` (shifted-gamma) instead of `p_over` (lognormal), same design + OBF schedule. Filed at `data/prereg_fw2b_gamma_20261108.md`. Both run simultaneously on identical predictions. Production P(over) stays frozen. |
+| 2026-11-08e | **Deferred items triage** | — | — | Reviewed all BLOCKED/DEFERRED/PARKED items. (1) FW-5 (suppression re-validation) + FW-6 (R3 re-runs): **truly blocked** by missing data (need R3 W10+W11 settled, earliest ~2026-11-21). (2) S3-2 (NBA NegBin for STL/BLK): **unblocked** — trigger condition (PIT discrete mismatch KS=0.19-0.23) already met; promoted to OPEN. (3) PFF subscription: correctly parked (no new evidence). (4) CV Phase 2: correctly closed for CB matchup. (5) P(over) switch: was "after W14"; now has interim looks — first possible verdict at W10 (~2026-11-14). (6) CV/base-rate refit: can run as shadow analysis now; deploy after prereg verdict. |
+| 2026-11-08f | **Decision layer → gamma P(over) for yardage** | — | — | **REGIME R4** (2026-11-08): Lab display and `_recalc_p_over()` (injury redistribution) now use shifted-gamma P(over) (`p_over_v12_gamma`) for yardage stats. Counts (receptions, pass_tds) still use NegBin. **Stored columns preserved**: `edge_vs_market` = lognormal, `dist_direction` = lognormal (frozen for FW-2 prereg). **New columns**: `edge_gamma`, `dist_direction_gamma` store gamma-derived values separately. `_suppression_rule()` uses lognormal `p_over` (matches FW-2). Shadow picks/mock bets from W10+ use gamma-derived edges via `edge_gamma`. Lab shows both values: gamma primary, lognormal greyed with "ln" label. Game-clustered 95% CI on **main-line** (N=2,698) gamma ROI @≥3pp: +13.5% [+4.1%, +22.1%] overall; OOS (W6-W8): +15.8% [+3.0%, +27.3%]. Main-line Brier Δ (gamma-ln): -0.086 [-0.105, -0.067] overall; OOS: -0.106 [-0.132, -0.079]. |
+
+| 2026-11-08g | **B3-F1 market anchoring never ran in NBA production** | — | — | `_fetch_market_lines()` was added to `runner.py` (commit 535d8a4, Nov 5) but never defined in `nba_team_markets.py`. Impact: `AttributeError` at runner.py:854 killed the ENTIRE per-game try block — not just market anchoring, but `nba_props.scout_game()`, `nba_teams.scout_game()`, and `_persist_nba_forward_preds()` all skipped. **Confirmed: 0 NBA scouted_props from Nov 6-8** (last working: Oct 24). This means: (1) NBA player prop scouting = dead since Nov 6; (2) NBA team market scouting = dead; (3) nba_forward_preds = 0 rows (S5-2 broken from start); (4) market anchoring features (blowout minutes, pace from total, team-total reconciliation) = never exercised in production. **No fallback behavior** — the exception was caught silently by the per-game `except Exception` and `continue`d. NBA Lab outputs during Nov 6-8 were unaffected (Lab re-runs engine on demand, not from scouted_props). Fixed 2026-11-08: `_fetch_market_lines()` implemented, queries `fixtures.bookmakers` JSON. Production verification pending (first rows expected Nov 9). |
+| 2026-11-08h | **Silent-failure audit + pipeline health infrastructure** | — | — | Audit of all broad `try/except` in scheduled paths found 20 silent swallows (5 HIGH, 12 MEDIUM, 3 LOW). **ALL 20 FIXED.** HIGH: scout/runner.py per-game exceptions (print-only → logger.error + traceback), fantasy_projections.py gamma calc (except:pass → logger.warning + counter). MEDIUM: scheduler.py `_dispatch()` error handler, 4 nightly job handlers, auto_settle, LiveMonitor, 3 restart-detection bare-except blocks, scorecard error — all now log with `traceback.format_exc()`. LOW: 3 fantasy_projections.py query fallbacks → logger.warning. Infrastructure: (1) `pipeline_health.py` module — 12 tracked pipelines (nfl_fantasy_pipeline, nfl_grading, nba_scout, nba_pretip, nba_grading, nfl_scout, mock_bet_generate, mock_bet_settle, injury_watcher, model_scorecard, nightly_maintenance, db_backup) with per-run tracking (rows written, errors, status OK/DEGRADED/DOWN/STALE), zero-row alerting, health summary. Cadences tuned so STALE = genuinely overdue. (2) **Daily health email at 8 AM CT** — sends per-pipeline status; subject flags issue count; macOS alert on DOWN. (3) Health block appended to Tuesday scorecard email. (4) `record_run()` wired into ALL 12 pipelines (success + error paths). (5) Gamma calc failure tracking: `find_prop_gaps` counts attempts/failures, logs summary; `nfl_fantasy_pipeline` records DEGRADED if >1% of yardage predictions lack `p_over_v12_gamma`. (6) `RotatingFileHandler` in main.py: `logs/betiq_app.log`, 10 MB × 5 backups, all `logger.*` calls now persist to disk with rotation. (7) `CLAUDE.md` rule: "verified in production" = rows from scheduled path. |
+| 2026-11-08i | **NBA Lab market anchoring confirmed** | — | — | Lab on-demand path calls `_get_market_lines()` from `historical.db:betting_lines` (ESPN close lines), passes `market_total`/`market_spread` to `project_game()`. All three anchoring features active: (1) blowout minutes via `market_spread` → minutes model, (2) expected possessions from `market_total` → pace factor, (3) game totals derived from market. Scout path uses `_fetch_market_lines()` from `bets.db:fixtures.bookmakers` (OddsAPI). Both paths apply identical engine anchoring. Lab outputs during Nov 6-8 B3-F1 outage were **unaffected** — Lab re-runs engine on demand with its own market source, independent of scouted_props. |
+| 2026-11-08j | **S5-2 smoke test: 0 rows — server restart required** | — | — | `s5_2_smoke_test.py` run for 2026-11-08 and 2026-11-09: both show 0 scout rows, 0 pre-tip rows. `player_props` OK (128K rows Nov 8, 9K rows Nov 9), `fixtures` OK (8 games Nov 8, 5 games Nov 9). Root cause: server PID 81526 still running pre-fix code — `_fetch_market_lines` AttributeError continues to kill NBA scout path silently. Additional running-server errors: `fetch_pretip_nba_props` ImportError (pre-tip broken), `_iw_tr` unbound in injury_watch_poll, `database is locked` on props fetch. **All code fixes deployed to disk; server restart will activate them.** Day 1 will be first game-day after restart. Alias table OK (7 entries). |
+
+## Analyses Needing Re-Run on Complete Data (post-W10)
+
+These analyses were computed on the filtered pool (weeks 5-9 missing ~48% of alt-line rows, plus 68 alias-bug rows now flagged `data_error='alias_mismatch'`). All analytical queries now include `AND data_error IS NULL`. Suppression filter is NOT applied to analyses — only at shadow-pick/mock-bet layer.
+
+**Re-run date**: after W11 settles (~2026-11-21), providing 2+ full weeks of clean R3 data (W10–W11). Report flagged vs unflagged segments separately.
+
+| Analysis | File | Query location | Impact | Re-run needed |
+|----------|------|----------------|--------|---------------|
+| v1.2 Brier score / calibration | nfl_calibration_diagnosis.py | line ~138 | Alt-line calibration unknown — only UNDER alts were graded | Yes — W10+ adds OVER alts |
+| Prereg forward test (rec_yds OVER) | nfl_calibration_diagnosis.py | line ~2377 | Near-alt OVER rec_yds rows suppressed — eligible prereg pool truncated | Yes — R3 pool is first clean set |
+| Prereg Brier assessment | nfl_calibration_diagnosis.py | line ~2789 | Same pool truncation | Yes |
+| Performance report (ROI by segment) | fantasy_projections.py | line ~1699 | Alt-line ROI segments incomplete | Yes — report by suppression_rule |
+| Bias prior (rolling segment bias) | fantasy_projections.py | line ~791 | Bias computed on filtered subset; likely negligible (main-only) | Low priority |
+| Dud mixture fit | nfl_dud_mixture.py | line ~45 | Only yardage UNDER alts included; dud probability for OVER unknown | Yes |
+| CV / base-rate model fits | nfl_interim_dispersion.py | lines ~636, ~898 | Same filtered-pool issue | Yes |
+| Injury baseline edge | injury_watcher.py | line ~583 | Minor — avg abs edge across all preds, but pool was truncated | Low priority |
+
+## NFL-12: Re-validate suppression rules on R3 data
+
+**Status**: NOT STARTED — blocked until W11 settles (~2026-11-21)
+
+After 2+ weeks of clean R3 data (W10–W11), re-validate each suppression rule on forward data.
+The rules were derived from R1/R2 data which had suppression + alias bugs; they may not hold on clean data.
+
+| Rule | Rationale (R1/R2 evidence) | Re-validation test |
+|------|---------------------------|-------------------|
+| `alt_over` | -18 to -26% structural ROI from alt OVER vig | R3 alt OVER hit rate vs BE + ROI (N>=50) |
+| `deep_alt_under_rec_pass` | -3.4 to -3.7% ROI, vig eats edge | R3 deep-alt UNDER rec/pass hit rate vs BE (N>=30) |
+| `rb_rush_over_low_conv` | RB rush OVER non-high has poor calibration | R3 RB rush OVER by conviction: hit rate vs BE (N>=30) |
+
+**Decision protocol**: If any rule's R3 forward ROI crosses zero (CI includes positive), promote to OPEN for review. If ROI is clearly negative (CI entirely below zero), confirm KEEP. If N is insufficient, extend to W13.
+
+## NFL-13: Matchup Context Module
+
+**Status**: CLOSED as far as public data allows — 2026-11-07. Volume DEAD across 3 seasons (2023-2025, 1,502 WR1-games). Yardage suppression null with PFR label (UNINFORMATIVE — label r=−0.08) AND null with consensus-elite label (stable, scout-based — 71-86% retention). Forward test (human-reported shadows vs market line) continues as the only remaining path.
+
+`backend/nfl_matchup_context.py` — Reusable per-game matchup module. Display only, no model changes.
+
+| Section | Status | Data source | Notes |
+|---------|--------|-------------|-------|
+| 0. Storage tables | **DONE** | historical.db | `nfl_matchup_team_context`, `nfl_matchup_player_context`, `nfl_cb_wr_evidence`, `nfl_candidate_features`, `nfl_cb_side_tendency`, `nfl_wr_side_tendency`, `nfl_shadow_log` (new — reported shadows from free sources) |
+| 1. Team verified stats | **CORRECTED** | nflverse PBP + FTN | RZ TD% now per-trip (not per-play). Blitz rate shown two ways with N denominator. Pressure source labeled. League averages on every stat. N + 95% CI on all rates/means. LOW-CONFIDENCE flag when N<100. |
+| 2. QB vs blitz | **CORRECTED** | PBP + FTN | N and CI on EPA/drop, comp%, sack rate. LOW-CONFIDENCE flag on small splits. |
+| 3. Separation | **CORRECTED** | NGS receiving | YAC-allowed proxy REPLACED with NGS receiver-week opponent adjustment. opp_effect = avg(receiver_sep_vs_opp - baseline) by position. CIs on both receiver baselines and opp effects. |
+| 4. CB-on-WR proxy | **VALIDATED DEAD** | PBP credited defenders vs BDB tracking | BDB 2023 (14,079 plays): 38.4% top-1 accuracy vs 37.5% random baseline. Man coverage 36.3% (below chance). HHI confirms non-random assignment but proxy can't exploit it with ~2.7 CBs/play. Labeled INFORMATIONAL ONLY. shadow_cb_flag and primary_cb_prob candidate features marked DEAD. |
+| 5. Script/volume | **CORRECTED** | PBP | N and CI on neutral pass rate. N on PROE. LOW-CONFIDENCE flag. |
+| 6. Lab output | **DONE** | historical.db | `matchup_context` key in `build_lab_props()` return. |
+| 7. Hypotheses | **ALL DEAD** | nfl_candidate_features | 8 candidate features ALL DEAD. shadow_cb_flag + primary_cb_prob (proxy dead). Remaining 6 tested (2026-11-07): 1/12 historical, 0/24 forward match predicted direction significantly. Market absorbs all. |
+| 8. CV scope | **CORRECTED** | — | Clarified: BDB is for training/validating CV model, not an in-season substitute for PBP proxy. |
+| As-of computation | **CORRECTED** | — | `through_week = week - 1` always (pre-kickoff data only). Retrospective flag changes labels only, not data window. |
+
+**Follow-ups:**
+- ~~Re-run DET-MIN retrospectives with corrected module~~ — **DONE** (2026-11-07). 2026 W8 + 2025 W9 re-run with through_week=week-1. Leaky rows dropped from historical.db.
+- ~~Run module for current week's games~~ — **DONE** (2026-11-07). 2026 W9 DET @ MIA full Lab panel displayed.
+- ~~Validate CB proxy accuracy on BDB tracking data~~ — **DONE** (2026-11-07). BDB 2023 (14,079 plays, 18 weeks): top-1 38.4% vs 37.5% random. **DEAD** — no predictive value. shadow_cb_flag and primary_cb_prob features killed.
+- Evaluate cost/benefit of PFF matchup data subscription — **PARKED** (2026-11-07). PFF Pro ($199.99/yr) researched but deferred: target-volume test shows zero effect → no reason to pay for matchup data until multi-season BDB results (if ever) reverse the verdict. See Decision Rule below.
+
+### BDB 2023 Ceiling + Outcome Tests (2026-11-07)
+
+**Ceiling test** (true tracking-data matchups, weeks 1..w-1 → predict week w):
+- Cross-game alignment-based: 32.2% (below random 40.1%)
+- Within-game WR-specific: 32.2% (lift +2.3pp)
+- Within-game zone-based: 38.9% (best performer)
+- Route-share MAE: 0.970 (random 0.625)
+- **Interpretation**: With ~2.7 CBs/play, the ceiling for pre-game CB-on-WR prediction is near random. Even perfect tracking data from prior games doesn't help. Zone-based assignment within a game is the only consistent signal.
+
+**Outcome test** (does facing top CB hurt WR production?):
+- vs Top CB: 8.2 yds/target, 69.7% comp, +0.233 EPA (N=3,562)
+- vs Other: 8.2 yds/target, 68.4% comp, +0.208 EPA (N=7,950)
+- Game-clustered bootstrap: yards diff +0.00 [-0.40, +0.38], EPA diff +0.02 [-0.04, +0.09]
+- Shadow effect (N=201): yards -0.21 [-1.83, +1.48], EPA +0.05 [-0.19, +0.25]
+- **Verdict**: Zero detectable outcome effect. Facing the opponent's top CB does not suppress WR production at the per-target level.
+
+### Decisive Round (2026-11-07)
+
+**1. Power analysis (WR1s, N=515 WR1-games, 270 unique games):**
+
+| Metric | Effect (top CB − other) | 95% CI | MDE (80% power) |
+|--------|------------------------|--------|-----------------|
+| Target share | +0.75 pp | [−0.76, +2.28] | 2.18 pp |
+| Targets/game | −0.24 | [−0.73, +0.20] | 0.66 |
+| Rec yards/game | −2.50 | [−8.86, +3.85] | 9.31 |
+
+**−2pp WR1 target-share effect: RULED OUT** (CI lower bound −0.76 pp, above −2.0).
+
+**2a. Elite CB dose-response (29 elite CBs, top quartile EPA/target allowed, min 50 snaps):**
+
+| Metric | Elite CB effect | 95% CI | Poor CB effect | 95% CI |
+|--------|----------------|--------|----------------|--------|
+| Target share | −0.09 pp | [−1.86, +1.65] | −1.41 pp | [−3.17, +0.36] |
+| Targets/game | −0.25 | [−0.80, +0.28] | −0.43 | [−0.95, +0.08] |
+| Rec yards/game | **−10.99** | **[−17.51, −4.55]** | +6.73 | [−1.56, +14.88] |
+
+Per-target breakdown (WR1 targeted plays, **same-season** elite definition): elite CB suppresses yds/target by −2.05 [−2.69, −1.41] and EPA/target by −0.376 [−0.489, −0.256]. BUT: target share is unchanged, and CB matchup prediction is at chance (38.4%), so the outcome effect is **not actionable**.
+
+**⚠ CIRCULARITY WARNING (2026-11-07)**: Same-season EPA definition is mechanical — defining "elite" by EPA allowed then finding they allow less EPA is tautological. See "Circularity Fix" section below.
+
+Dose-response: slope = −1.87 pp per 100% elite exposure, r = −0.047, p = 0.29 — not significant.
+
+**2b. Bracket/safety help (Lamb mechanism, 2+ defenders within 5 yds):**
+- 41.0% of WR1 routes are bracketed (N=11,632 WR1 plays)
+- **Play-level**: −6.10 pp targeting rate when bracketed (real mechanism)
+- **Game-level**: −0.11 pp [−1.69, +1.44] — **fully compensated** (QBs find WR1 on non-bracketed plays)
+- MDE at 80% power: 2.24 pp
+
+**3. Redistribution test (WR1 → WR2/TE):**
+
+| When WR1 faces... | WR2 target share effect | 95% CI | TE1 target share effect | 95% CI |
+|-------------------|------------------------|--------|------------------------|--------|
+| Top CB | −0.15 pp | [−1.64, +1.35] | −0.26 pp | [−1.73, +1.26] |
+| Elite CB | +0.46 pp | [−1.52, +2.38] | +1.19 pp | [−0.75, +3.08] |
+| Heavy bracket | +0.68 pp | [−0.87, +2.24] | +0.10 pp | [−1.35, +1.49] |
+
+No redistribution detected at any level.
+
+**VERDICT — PARK NFL-13**: Volume (target share, targets/game) null at every level tested; −2pp ruled out. Outcome (yards/target) suppressed by elite CBs but not actionable (can't predict matchup). Bracket mechanism real at play level but fully compensated at game level. No redistribution. CB matchup features **DEAD** for props. All 8 candidate features **DEAD** (2 proxy, 6 tested — 0/24 forward tests match predicted direction significantly).
+
+### Candidate Feature Test Results (2026-11-07)
+
+**6 remaining features tested against pre-registered directions** (display-only; no model changes).
+
+**Historical (2023–2025)**: as-of features (data before each game), outcome = player stat vs season-to-date baseline, player FE + opponent pass EPA adjustment, game-clustered SEs. 2,200–3,400 obs per feature.
+
+| Feature | Stat | Pred | β | 95% CI | p | Match |
+|---------|------|------|---|--------|---|-------|
+| opp_blitz_rate | pass_yds | − | **+82.0** | [+20.1, +143.8] | 0.010 | **WRONG*** |
+| opp_blitz_rate | receptions | + | **+0.87** | [+0.18, +1.56] | 0.014 | **YES*** |
+| qb_blitz×opp_blitz | pass_yds | − | −19.2 | [−87.0, +48.7] | 0.578 | null |
+| tgt_shift×opp_blitz | receptions | + | −0.84 | [−5.17, +3.49] | 0.695 | wrong, null |
+| tgt_shift×opp_blitz | rec_yds | + | −24.6 | [−85.6, +36.5] | 0.423 | wrong, null |
+| ngs_sep_baseline | rec_yds | + | −1.64 | [−5.63, +2.35] | 0.404 | wrong, null |
+| ngs_sep_baseline | receptions | + | −0.16 | [−0.40, +0.07] | 0.175 | wrong, null |
+| neutral_pass_rate | pass_yds | + | **−194.4** | [−335.4, −53.5] | 0.006 | **WRONG*** |
+| neutral_pass_rate | rec_yds | + | **−40.0** | [−55.7, −24.3] | <0.001 | **WRONG*** |
+| neutral_pass_rate | receptions | + | **−2.9** | [−4.3, −1.6] | <0.001 | **WRONG*** |
+| opp_proe_allowed | rec_yds | + | −6.1 | [−27.3, +15.1] | 0.573 | wrong, null |
+| opp_proe_allowed | receptions | + | −0.25 | [−1.78, +1.28] | 0.749 | wrong, null |
+
+**Historical verdict**: 1/12 matches predicted direction significantly (opp_blitz→receptions). 4/12 significant in WRONG direction (neutral_pass_rate all 3 stats + opp_blitz→pass_yds). 7/12 null. Neutral pass rate's wrong-direction effect likely selection bias: QBs with high neutral pass rates face better pass defenses → their stat baselines already reflect this.
+
+**Forward (2026 W2–W9)**: outcome = actual − devigged market line / actual − v1.2 projection. 857–3,288 obs per feature. HC1 robust SEs (game-clustered SEs failed for some features due to mixed types).
+
+| Feature | Stat | Pred | β (vs mkt) | p | β (vs v1.2) | p | Match |
+|---------|------|------|-----------|---|------------|---|-------|
+| opp_blitz_rate | pass_yds | − | +84.4 | 0.068 | +76.7 | 0.132 | no |
+| opp_blitz_rate | receptions | + | −0.22 | 0.793 | +0.48 | 0.544 | null |
+| qb_blitz×opp_blitz | pass_yds | − | −35.4 | 0.487 | −20.9 | 0.678 | right, null |
+| tgt_shift×opp_blitz | receptions | + | −6.4 | 0.185 | −8.8 | 0.063 | wrong, null |
+| tgt_shift×opp_blitz | rec_yds | + | −69.8 | 0.341 | −90.5 | 0.216 | wrong, null |
+| ngs_sep_baseline | rec_yds | + | −2.3 | 0.243 | −1.2 | 0.529 | wrong, null |
+| ngs_sep_baseline | receptions | + | −0.08 | 0.619 | −0.08 | 0.618 | wrong, null |
+| neutral_pass_rate | pass_yds | + | −10.3 | 0.770 | +11.5 | 0.737 | null |
+| neutral_pass_rate | rec_yds | + | −13.1 | 0.149 | −6.5 | 0.483 | wrong, null |
+| neutral_pass_rate | receptions | + | −1.3 | 0.189 | −1.4 | 0.169 | wrong, null |
+| opp_proe_allowed | rec_yds | + | +17.5 | 0.493 | +13.4 | 0.629 | right, null |
+| opp_proe_allowed | receptions | + | −0.9 | 0.708 | −2.0 | 0.391 | null |
+
+**Forward verdict**: 0/24 tests significant in predicted direction. All null. The sole historical survivor (opp_blitz→receptions) does not replicate forward (β = −0.22, p = 0.793 vs market).
+
+**OVERALL: ALL 6 CANDIDATE FEATURES DEAD.** No feature shows a consistent, correctly-signed, significant effect across both historical and forward tests. The market already incorporates whatever signal these features carry.
+
+### Multi-Season Pooling Results (2026-11-07)
+
+**Data**: BDB 2023 (2023 season, all-22 tracking, 515 WR1-games) + BDB 2027 (2024/2025 seasons, player_play.csv tabular path, 987 WR1-games). Total: 1,502 WR1-game observations.
+
+**BDB 2027 tracking limitation**: Only 1-2 focus players per play (competition entrant evaluation), NOT all-22. Extracted routes/closest-CB from player_play.csv using per-play primary-CB assignment (highest season-snap CB on each play's defense). Target column only filled for 14% of pass plays (competition-curated subset). Elite/poor CB tiers have only 4 CBs each in 2024/2025 (vs 29 in 2023).
+
+**Test 1 — Top-CB WR1 target share:**
+
+| Season | N | n_high | Effect (pp) | 95% CI |
+|--------|---|--------|-------------|--------|
+| 2023 | 515 | 125 | +0.75 | [−0.76, +2.28] |
+| 2024 | 483 | 201 | +0.33 | [−1.50, +2.10] |
+| 2025 | 504 | 213 | +0.42 | [−1.04, +1.88] |
+
+All 3 seasons independently null. Volume suppression CONFIRMED DEAD.
+
+**Test 1 — Rec yds/game (supplementary):**
+
+| Season | Effect | 95% CI |
+|--------|--------|--------|
+| 2023 | −2.50 | [−8.86, +3.85] |
+| 2024 | **−5.00** | **[−9.37, −0.76]** |
+| 2025 | −1.82 | [−7.31, +3.52] |
+
+2024 yardage suppression is significant and directionally consistent with 2023's elite-CB finding (−10.99). ~~Partial out-of-sample support for the yardage hypothesis.~~ **RETRACTED** — see Circularity Fix below. This finding used same-season top-CB definition; it does not survive prior-season definition.
+
+### Circularity Fix (2026-11-07)
+
+The elite-CB tests defined "elite" from same-season EPA allowed, making the EPA effect **mechanical**. Re-ran all 3 seasons with elite defined from **prior** season's PFR passer-rating-allowed (2022→2023, 2023→2024, 2024→2025), same min-target filter (≥25), bottom 25th percentile.
+
+**Prior-season elite-CB test (PFR passer_rating_allowed → next season BDB data):**
+
+| Season | N | n_elite | yds/tgt | 95% CI | EPA/tgt | 95% CI | rec_yds/g | 95% CI |
+|--------|---|---------|---------|--------|---------|--------|-----------|--------|
+| 2022→2023 | 515 | 41 | +1.12 | [−0.55, +2.68] | +0.045 | [−0.176, +0.268] | +9.65 | [−3.93, +22.50] |
+| 2023→2024 | 485 | 13 | +2.09 | [−0.23, +4.28] | −0.429 | [−1.041, +0.237] | +0.13 | [−7.80, +7.47] |
+| 2024→2025 | 520 | 28 | +2.55 | [+1.17, +3.90] | −0.243 | [−0.490, −0.007] | +29.39 | [+16.03, +41.54] |
+| POOLED | 1,520 | 82 | +2.72 | [+1.61, +3.73] | −0.103 | [−0.272, +0.065] | +23.10 | [+14.23, +31.53] |
+
+**Verdict (raw prior-season)**:
+- **EPA "replication" was circular.** With prior-season definition, pooled EPA is null (−0.103, CI spans zero). The 2023 EPA effect flips to +0.045.
+- **Yardage effects reverse sign.** All 3 seasons show WR1s doing BETTER (not worse) against prior-season elite CBs. Pooled yds/tgt is +2.72 (significant, wrong direction). Pooled rec_yds/game is +23.10 (significant, wrong direction).
+- **Why effects reverse**: Prior-season elite CBs face the best WR1s (selection confound).
+
+### Within-WR Fixed Effects (2026-11-07)
+
+Controls for WR quality confounding: WR fixed effects (each WR vs his own other games) + opponent pass-defense EPA (leave-one-out). Game-clustered SEs.
+
+| Season | N | n_elite | Rec yds/g β [95% CI] | Yds/tgt β [95% CI] | EPA/tgt β [95% CI] |
+|--------|---|---------|----------------------|---------------------|---------------------|
+| 2023 | 515 | 41 | +4.6 [−11.7, +20.9] | +0.09 [−1.9, +2.1] | −0.09 [−0.4, +0.2] |
+| 2024 | 276 | 10 | +1.0 [−9.6, +11.6] | −1.37 [−4.5, +1.8] | −0.30 [−1.2, +0.6] |
+| 2025 | 366 | 28 | **+17.8** [+4.7, +30.8] | −0.79 [−2.7, +1.1] | −0.24 [−0.6, +0.1] |
+| POOLED | 1,157 | 79 | +8.8 [−0.8, +18.5] | −0.51 [−1.8, +0.8] | −0.15 [−0.4, +0.1] |
+
+- **Yds/target**: null in every season and pooled. No within-WR suppression.
+- **EPA/target**: null in every season and pooled. Consistently negative direction but never significant.
+- **Rec yds/game**: null in 2023/2024. 2025 anomaly (+17.8, p=0.01) persists with WR FE (28 obs, likely small-sample or remaining game-script confound). Pooled borderline null (p=0.07, wrong direction).
+- **WR FE absorbed the raw reversal** in 2023 (+9.65 → +4.6) and pooled (+23.1 → +8.8), confirming WR quality was the dominant confound.
+
+**Verdict (after WR FE)**: No evidence of elite-CB yardage suppression at the within-WR level. The per-target measures (yds/target, EPA/target) are the cleanest tests and are definitively null.
+
+### Elite Label Stability (2026-11-07)
+
+PFR passer_rating_allowed year-to-year correlation (CBs qualifying both years, ≥25 targets):
+
+| Pair | N (both years) | r (unweighted) | r (target-weighted) | Elite retention |
+|------|---------------|----------------|---------------------|-----------------|
+| 2021→2022 | 63 | −0.036 | −0.017 | 17% (3/18) |
+| 2022→2023 | 53 | −0.179 | −0.216 | 19% (3/16) |
+| 2023→2024 | 78 | −0.026 | −0.035 | 39% (9/23) |
+
+**Average r = −0.08 (NO stability).** The prior-season "elite" label is essentially noise. 17-39% of elite CBs retain elite status the next year. This means:
+- The null prior-season results are expected regardless of whether a real effect exists — the label is too noisy to detect it.
+- The same-season test was significant because it was tautological, not because the effect is real.
+- We cannot distinguish "no effect" from "effect exists but label is too noisy" with this methodology.
+
+Scripts: `data/bdb/prior_season_elite_cb_test.py`, `data/bdb/within_wr_elite_cb_test.py`.
+
+### Consensus-Elite Label Test (2026-11-07)
+
+The PFR statistical label (passer_rating_allowed) has r=−0.08 year-to-year — essentially noise. Historical tests with that label are **UNINFORMATIVE** (null results expected regardless of whether an effect exists). To resolve: built a stable, scout-based "consensus-elite" label.
+
+**Consensus-elite criteria (union):**
+- All-Pro or Pro Bowl CB in the prior 2 seasons
+- Top-10 CB contract AAV at time of test season
+- First-round draft pick ≤ 4 years into career
+
+**Label properties:**
+
+| Test season | N CBs | Awards | Contract | Draft | Year-to-year retention |
+|-------------|-------|--------|----------|-------|----------------------|
+| 2023 | 36 | 15 | 10 | 22 | — |
+| 2024 | 38 | 15 | 10 | 24 | 86% (31/36 from 2023) |
+| 2025 | 30 | 15 | 10 | 20 | 71% (27/38 from 2024) |
+
+Retention 71-86% vs PFR's 17-39% — a **much more stable label**. If there is a real elite-CB suppression effect, this label should detect it.
+
+**Within-WR FE regression with consensus-elite label:**
+
+| Season | N | n_elite | Rec yds/g β | p | Yds/tgt β | p | EPA/tgt β | p |
+|--------|---|---------|-------------|---|-----------|---|-----------|---|
+| 2023 | 515 | 81 | −2.8 | 0.584 | −0.28 | 0.642 | −0.01 | 0.902 |
+| 2024 | 276 | 40 | +6.0 | 0.278 | −1.53 | 0.335 | −0.60* | 0.008 |
+| 2025 | 366 | 22 | +8.1 | 0.249 | +0.93 | 0.680 | +0.18 | 0.504 |
+| POOLED | 1,157 | 143 | +2.7 | 0.425 | +0.04 | 0.951 | −0.05 | 0.518 |
+
+**Verdict**: Even with a stable label, **all primary measures null**. Rec yds/game null in every season and pooled. Yds/target pooled = +0.04 (effectively zero, p=0.951). EPA/target pooled null (p=0.518). The 2024 EPA anomaly (p=0.008) is 1 of 12 tests (expected ~0.6 false positives at α=0.05) and does not replicate in 2023 or 2025.
+
+**Suppression bound**: Pooled rec yds/game 95% CI = [**−4.0**, +9.5]. This **rules out suppression ≥ 4 yds/game** — less than half the retracted same-season estimate (−10.99). The forward test MDE at N=30 is ~19 yds, far above this bound; expect INCONCLUSIVE even if the true effect is at the upper bound of what public data allows (−4 yds).
+
+**Naive (no WR FE) comparison**: Pooled rec_yds naive is +9.2* (p=0.013) — WR quality confounding confirmed. WR FE absorbs this entirely (+2.7, null).
+
+**Test 4 — Redistribution:**
+- WR2: null in all seasons and pooled
+- TE1: −1.85 pp in 2025 [−3.24, −0.49], pooled −2.05 pp [−2.99, −1.11] — NEGATIVE (opposite of redistribution hypothesis; elite defenses may suppress passing broadly)
+
+**Pipeline**: `data/bdb/multi_season_pipeline.py` — dual-path (tracking for 2023, player_play.csv for BDB 2027).
+
+### Shadow Log (2026-11-07)
+- `nfl_shadow_log` table added to historical.db for manually-entered projected shadows
+- CLI: `--add-shadow DEF CB WR OFF SOURCE DATE --week W` and `--show-shadows --week W`
+- Post-game confirmation: `--confirm-shadow DEF CB WR --week W` / `--deny-shadow DEF CB WR --week W`
+- Source accuracy tracking: `--source-accuracy --season YYYY` (reports confirmed/not-confirmed/pending by source)
+- Lab panel Section 4b displays reported shadows labeled "REPORTED, NOT MODELED"
+- User enters from PFF/RotoBaller/ESPN free previews
+
+### Weekly Shadow Checklist
+| Day | Action |
+|-----|--------|
+| **Thursday** | Enter projected shadows from free articles (PFF, RotoBaller, ESPN) using `--add-shadow` |
+| **Tuesday** | Confirm/deny shadows from completed games using `--confirm-shadow` / `--deny-shadow` |
+
+### Decision Rule (NFL-13) — CLOSED as far as public data allows
+
+Historical tests are **UNINFORMATIVE** with the PFR statistical label (r=−0.08, noise). With a stable consensus-elite label (71-86% retention), **all measures remain null** (pooled yds/tgt +0.04 p=0.951, EPA/tgt −0.05 p=0.518, rec yds/g +2.7 p=0.425). Two independent labels, same answer: no detectable suppression.
+
+- **PFF Pro**: **NOT NEEDED.** Both labels null. No signal to justify subscription.
+- **CV Phase 2**: **CLOSED for CB-matchup question.** Available for other uses (formation classification, alignment detection, route recognition) if scoped separately.
+- **Shadow log**: **ACTIVE** — forward test (human-reported shadows vs market line) continues. This is the only remaining path: if real elite-CB suppression exists but requires play-by-play shadow knowledge (not statistical classification), the market-comparison design will detect it. Prior expectation: null. MDE at N=30 ≈ 19 yds. Expect inconclusive. Weekly checklist required.
+
+### Pre-Registered Forward Test: Elite-CB Shadow → WR1 Yardage (Amended 2026-11-07)
+
+**Status**: ACTIVE from W10 (2026-11-07). Full prereg at `data/bdb/prereg_elite_cb_shadow_test_2025.md`.
+
+**Amendment (2026-11-07, before any W10 game)**: Season corrected from 2025 to 2026. Elite CB list rebuilt from 2025+2026 PFR data (37 CBs, PR ≤ 78.9). WR1 list rebuilt from 2026 PBP using targets/game rate (not total targets) to handle injured WR1s. MDE and playoffs added. Circularity + within-WR FE + label stability findings noted — prior expectation is now null.
+
+**Rationale (updated)**: BDB 2023 decisive round found elite CBs suppress WR1 rec yards by −10.99/game using **same-season** elite definition. However, re-running with **prior-season** PFR passer-rating-allowed definition kills all effects (2023: +9.65, null; 2024: +0.13, null; 2025: +29.39, wrong direction). EPA "replication" was circular. The forward test proceeds as a final check: if there IS a real suppression effect that requires shadow-level information (who covers whom), the market comparison will detect it independently of the circular BDB finding.
+
+**Design**:
+- **Elite CB list**: 37 CBs frozen from 2025 full-season + 2026 W1-W8 PFR Advanced Defense Stats (via nflverse `import_weekly_pfr('def')`). Criteria: `depth_chart_position == 'CB'`, ≥25 coverage targets, passer_rating_allowed ≤ 78.9 (bottom 25th percentile of 148 qualified CBs). Stored in `data/bdb/elite_cb_list_2026.csv` with timestamp 2026-11-07. **No changes to this list during the test.**
+- **WR1 list**: Receiver with highest **targets per game played** (min 3 games) per team through current week (from 2026 nflverse PBP). Rate-based definition handles injured WR1s returning (e.g., PHI DeVonta Smith at 10.25/g replaces Lemon at 5.62/g). Updated weekly; stored in `data/bdb/wr1_per_team_2026.csv`.
+- **Trigger**: A `nfl_shadow_log` entry created before kickoff, where `cb_name` matches a frozen elite CB and `wr_name` is the opponent's WR1 (current leader in targets for the opposing team).
+- **Measures** (all per-observation, game-clustered CIs):
+  1. WR1 actual rec yds − devigged market rec_yds line (primary)
+  2. WR1 actual rec yds − v1.2 projection (does v1.2 already account?)
+  3. WR1 targets vs season average
+  4. WR1 yds/target vs season average
+- **Stored in**: `nfl_elite_cb_shadow_results` table
+- **Evaluation**: `--elite-shadow-test` CLI command; also callable via `evaluate_elite_cb_shadow_test()`
+- **Power**: SD of WR1 rec yds/game = 43.2 (from 2023 data). Estimated SD of (actual − market line) ≈ 36.7 (0.85 × raw SD).
+  - MDE at N=30: **18.8 rec yds** (80% power, α=0.05)
+  - MDE at N=40: 16.3 rec yds
+  - MDE at N=50: 14.6 rec yds
+  - Historical (now-retracted) same-season effect was ~11 yds/game. **Expect INCONCLUSIVE** unless the real effect (if any) is much larger than the circular estimate suggested.
+- **Decision criteria** (report at end of **playoffs**, W19+; was W18):
+  - If CI for diff-vs-market excludes zero (WR1 underperforms): elite-CB shadow has predictive value beyond the market → consider as prop adjustment
+  - If CI spans zero but diff-vs-v1.2 < 0: market already prices it but v1.2 doesn't → v1.2 gap to close
+  - If both CIs span zero: elite-CB shadow not actionable even with perfect shadow info
+- **Observation window**: W10 through end of playoffs (W19+). Regular season W10-W18 + any playoff games with elite-CB shadow triggers.
+- **Minimum N for verdict**: 30 observations (estimated ~4-6 per week × 9 regular + ~2-4 playoff weeks = 36-60+ by end of playoffs)
+- **Display-only**: No changes to the frozen v1.2 model. Shadow log entries tagged with elite-CB status in Lab panel.
+
+**Weekly workflow**:
+1. Thursday: enter shadows via `--add-shadow`. Check elite CB list for matchups.
+2. Sunday/Monday: record WR1 actual stats (rec yds, targets, yds/target).
+3. Tuesday: confirm/deny shadows using `--confirm-shadow` / `--deny-shadow`.
+4. Periodic: run `--elite-shadow-test` to check accumulating results.
+
+### CV Phase 2 Groundwork (2026-11-07) — CLOSED for CB matchup; available for other uses
+- Design doc: `backend/docs/cv_phase2_design.md` (491 lines)
+- BDB labels: ~7.7M player-frame positions, ~14K matchup labels, ~14K formation/route labels
+- Approach: Roboflow sports + YOLOv11 + BoT-SORT for detection/tracking; mkoshkina jersey-number-pipeline for OCR
+- Video sources: HDMI capture of broadcast (best legal option); NFL+/YouTube prohibit automated access; synthetic (Unreal) for pre-training
+- **CB-matchup use case CLOSED**: consensus-elite + PFR label both null; no CV-derived matchup feature to build toward
+- **Remaining uses if scoped separately**: formation classification (shotgun/under-center/etc.), alignment detection (WR splits, box count), route recognition (classification from tracking). These are independent of the CB-matchup question.
+
+## NFL Model Scorecard — DONE (2026-11-07, corrections applied)
+
+Weekly scorecard computing projection accuracy, direction, calibration, and biggest misses from `fantasy_forward_preds`. Backfilled W2, W4-W8 (W3 no data, W9 ungraded).
+
+| # | Item | Status | Notes |
+|---|------|--------|-------|
+| SC-1 | `model_scorecard.py` — compute + store | **DONE** | `weekly_model_scorecard` table in historical.db. Per-segment metrics (stat×pos×model_version×line_depth + `_ALL_` rollups). Accuracy (MAE, median AE, WAPE), direction vs market-implied (edge_pp + CI), calibration (10 p_over buckets), Brier (model vs market, per-model_version), biggest misses (top 10, deduplicated), stale-input flag, direction lean split (over/under). Regime tagging (R1/R2/R3). STD stored as week=0. |
+| SC-2 | API endpoints | **DONE** | `GET /api/scorecard/{sport}` with filter params (season, week, stat_type, position, model_version, line_depth). `POST /api/scorecard/{sport}/compute` for manual compute/backfill. Returns edge CI, lean split, stale metrics. |
+| SC-3 | Frontend Lab tab | **DONE** | "Scorecard" nav item. Dropdowns: week, stat, position, model version, line depth. 4 cards: Accuracy (color-coded delta), Direction vs Market-Implied (edge + CI + lean sub-rows), Calibration (bucket table + per-model Brier breakdown), Biggest Misses (stale-input amber banner). MAE trend chart. |
+| SC-4 | Scheduler integration | **DONE** | Tuesday 1 PM CT scorecard compute + email. Pre-kickoff consensus refresh (Thu 5 PM, Sun 9:30 AM, Mon 5 PM CT) re-pulls Sleeper/ESPN without API cost. |
+| SC-5 | Backfill W2-W9 | **DONE** | 1,288 segment rows across W2, W4-W8 + STD. W3 skipped (no data). W9 skipped (ungraded). |
+| SC-6 | Email summary | **DONE** | Main-line accuracy, direction vs market-implied (edge + CI), per-model Brier, top 5 misses, stale-input summary, STD headline. |
+
+**Season-to-Date (main lines):** N=7,420 | MAE 17.8 (mkt 17.7) | Edge +3.9pp vs market-implied | Brier 0.2908 (mkt 0.2459).
+
+**Per-model Brier (W8):** v1.2_shifted_gamma 0.1890 (✓ beats market) · v0_capped 0.2153 · v0 0.2163. v1.2 eliminated 90-100% tail overconfidence (4 preds vs 818 for v0).
+
+**Rush yds direction (STD, main):** OVER leans 42.6% hit / -7.4pp edge (N=782) — systematic over-projection. UNDER 49.7% / -0.3pp (N=372). RB OVER worst at -8.3pp (N=525).
+
+**Stale-input (W8):** 42 flagged (1.0%), MAE 23.5, direction 27/42. Threshold: |proj - line| > 40% AND > 10 units, line ≥ 5, main lines only.
+
+**Pending:** NBA stub ready (add stat types when 2026-27 grading accumulates, ~Dec 2026).
+
+## Forward Watch — Active Trackers
+
+All items collecting forward data. Each has a decision date and minimum N.
+
+| # | Item | Status | Decision date | Notes |
+|---|------|--------|---------------|-------|
+| FW-1 | NBA S5-2 market comparison | **BLOCKED — threshold mismatch** | Late-Dec 2026 (N≥100 games) | Day 1 = 2026-11-08 (212 rows, 7 games). 193/212 graded. **Model↔market join: 0/193 (0%)**. Unjoin causes: line not posted for player (138, 71%), alt market one-sided/over-only (45, 23%), player not in props (10, 5%). Root cause: `_pick_best_threshold()` maximizes |P-0.5|, always selecting the lowest rung (pts 10.5, reb 3.5, pra 14.5) — far below market-posted main lines for starters. **Action**: must persist predictions at market-posted lines. Also fixed: `player_props.game_date` UTC→CT backfill (704K rows); `creator_tier.py` uses `_utc_to_ct_date()` going forward. Oct 30–Nov 7 LOST. |
+| FW-2 | NFL prereg rec_yds OVER (lognormal) | **COLLECTING** | W14 (~2026-12-05) with interim looks W10/W12 | Three regimes: R1 (W2-W8, suppression bug), R2 (W9 pre-fix), R3 (W10+, clean). Verdict on R3 data only. Coverage 156/156 rec_yds players on main line. **R1 corrected** (2026-11-07f): 13/154 picks were post-kickoff contaminated; clean R1: N=141, WR=66.0%, ROI=+24.7%. **Shadow gamma** (2026-11-08b): `p_over_v12_gamma` stored from W10; post-W14 head-to-head lognormal vs gamma on same predictions. **Amendment 2026-11-08** (pre-W10): Added O'Brien-Fleming interim analysis at W10/W12/W14 (alpha spending 0.0005/0.014/0.045 for two-sided; see `data/prereg_fw2_amendment_20261108.md`). **W2-W8 head-to-head** (2026-11-08): all yardage (main+alt, N=6,432) gamma Brier 0.167 vs lognormal 0.209 (Δ=-0.042, t=-17.6); main-line only (N=2,698) Δ=-0.086; calibration error 0.047 vs 0.172; main-line prereg ROI +13.5% vs -0.4%. All in-sample for base rates (W2-W5 training); W5-W8 OOS improvements *larger*. |
+| FW-2b | NFL prereg rec_yds OVER (shifted-gamma) | **COLLECTING** | W14 (~2026-12-05) with interim looks W10/W12 | **Parallel prereg** registered 2026-11-08 (pre-W10). Uses `p_over_v12_gamma` (shifted-gamma CDF) instead of `p_over` (lognormal). Same design: rec_yds OVER, edge ≥ 5pp vs devigged implied, main-line, method=distributional. Same O'Brien-Fleming schedule. Runs simultaneously with FW-2 on identical predictions — only the P(over) and therefore edge calculation differs. See `data/prereg_fw2b_gamma_20261108.md`. |
+| FW-3 | SGP validation (personal bets) | **PARTIAL** | Pending Pikkit export | 602 bets in bets.db (2024-01-04 → 2026-04-23). 100/589 fully priceable (17%). Overcharge c rises 1.05→1.18 by leg count. Need Pikkit export ~2026-04-24 → today to complete. |
+| FW-4 | Injury edge-at-news collection | **COLLECTING** | N≥50 events (~Jan 2027) | `injury_watcher.py` polls Sleeper every 15 min on game days. 1,417 snapshots in `injury_edge_snapshots`. Tracks teammate prop edge at first post-news fetch vs baseline. |
+| FW-5 | NFL-12 suppression re-validation | **BLOCKED** | After W11 (~2026-11-21) | Re-validate `alt_over`, `deep_alt_under_rec_pass`, `rb_rush_over_low_conv` on R3 data. Need N≥30-50 per rule. |
+| FW-6 | R3 re-runs (8 analyses) | **BLOCKED** | ~2026-11-21 (W10+W11 settled) | Brier, prereg, performance report, bias prior, dud mixture, CV fits, injury baseline. See "Analyses Needing Re-Run" section. |
+| FW-7 | NFL-13 elite-CB shadow forward test | **COLLECTING** | End of playoffs (W19+, ~Feb 2027) | Market-comparison design. 37 frozen elite CBs. MDE ~19 yds at N=30. Expect INCONCLUSIVE. Weekly shadow log entries. |
+| FW-8 | NBA S5-3 forward weeks | **ACTIVE** | Late-Dec 2026 (N≥100 games) | 2026-27 season underway. Day 1 = 2026-11-08 (212 rows: 97 scout + 115 pre-tip, 7 games). Nov 8 graded: 193/212 (6 players unmatched: Sabonis, Hardy, Markkanen, Powell, Prince, Missi). Two code bugs fixed (datetime shadowing + missing _fetch_market_lines). Four infrastructure fixes deployed 2026-11-09: git hash capture, health status display, db_backup retry, per-game tip freeze. Market anchors missing (fixtures empty) — model-only fallback. |
+| FW-9 | Lognormal vs gamma weekly update | **ACTIVE** | OBF interim W10/W12/W14 | `backend/h2h_pover_analysis.py` — re-run after each week grades. Compare `p_over` (lognormal) vs `p_over_v12_gamma` (shifted-gamma) Brier on R3 data. Apply OBF boundaries (W10: \|z\|>3.471, W12: \|z\|>2.454, W14: \|z\|>2.004). Baseline W2-W8: **all yardage (main+alt, N=6,432) Δ=-0.042 (t=-17.6)**; **main-line only (N=2,698) Δ=-0.086**. Use main-line as primary metric (matches prereg population). |
+
+## Cleanup Reminders
+
+| Item | Action | Deadline |
+|------|--------|----------|
+| `data/git_mirror_backup_20261105_1817` | Delete (pre-scrub backup; no longer needed after git-filter-repo confirmed clean) | 2026-11-19 |
+| INFRA-1: Archive odds data | Move off-season sport rows to `props_archive.db` | No urgency — 17.8 GB free, ~14-month runway |

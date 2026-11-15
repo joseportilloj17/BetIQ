@@ -10,8 +10,12 @@ Methodology:
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
+import sqlite3
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 from scout.base import GameInfo, ScoutedProp, PROJECTION_VERSION
 from scout.projection_engine import (
@@ -23,6 +27,8 @@ from scout.projection_engine import (
     project_win_probability,
 )
 import scout.data_sources as ds
+
+logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -44,6 +50,88 @@ _SPREAD_LINES = [
 ]
 
 _MIN_EMIT_PROB = 0.45
+
+
+_BETS_DB = os.path.join(os.path.dirname(__file__), "..", "..", "data", "bets.db")
+
+_PREFERRED_BOOKS = ["pinnacle", "draftkings", "fanduel", "betmgm", "betrivers"]
+
+
+def _fetch_market_lines(game: GameInfo) -> Optional[dict]:
+    """Extract market spread and total from fixtures.bookmakers JSON.
+
+    Returns {"market_spread": float, "market_total": float, "book": str}
+    or None if unavailable.
+    """
+    try:
+        conn = sqlite3.connect(os.path.abspath(_BETS_DB))
+        row = conn.execute(
+            "SELECT bookmakers FROM fixtures WHERE id = ?",
+            (game.game_id,),
+        ).fetchone()
+        if not row or not row[0]:
+            conn.close()
+            return None
+        bookmakers = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        conn.close()
+    except Exception as exc:
+        logger.warning("[nba_team_markets] _fetch_market_lines DB error: %s", exc)
+        return None
+
+    if not bookmakers:
+        return None
+
+    spread_val = None
+    total_val = None
+    book_used = None
+
+    # Try preferred books first, then any available
+    ordered = []
+    for pref in _PREFERRED_BOOKS:
+        bk = next((b for b in bookmakers if b.get("key") == pref), None)
+        if bk:
+            ordered.append(bk)
+    for bk in bookmakers:
+        if bk not in ordered:
+            ordered.append(bk)
+
+    for bk in ordered:
+        for mkt in bk.get("markets", []):
+            key = mkt.get("key", "")
+            outcomes = mkt.get("outcomes", [])
+            if key == "spreads" and spread_val is None:
+                # Home team spread
+                for o in outcomes:
+                    name = o.get("name", "")
+                    if name == game.home_team and o.get("point") is not None:
+                        try:
+                            spread_val = float(o["point"])
+                            if book_used is None:
+                                book_used = bk.get("key")
+                        except (TypeError, ValueError):
+                            pass
+            elif key == "totals" and total_val is None:
+                for o in outcomes:
+                    if o.get("name") == "Over" and o.get("point") is not None:
+                        try:
+                            total_val = float(o["point"])
+                            if book_used is None:
+                                book_used = bk.get("key")
+                        except (TypeError, ValueError):
+                            pass
+
+        if spread_val is not None and total_val is not None:
+            break
+
+    if spread_val is None and total_val is None:
+        return None
+
+    result = {"book": book_used or "unknown"}
+    if spread_val is not None:
+        result["market_spread"] = spread_val
+    if total_val is not None:
+        result["market_total"] = total_val
+    return result
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

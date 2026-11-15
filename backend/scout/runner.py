@@ -13,10 +13,14 @@ Flow:
 from __future__ import annotations
 
 import json
+import logging
+import traceback
 from datetime import datetime, timezone
 from typing import List
 
 from scout.base import GameInfo, ScoutedProp
+
+logger = logging.getLogger(__name__)
 
 # ── Schema ─────────────────────────────────────────────────────────────────────
 
@@ -222,6 +226,34 @@ _MKT_TO_SIM = {
     "player_assists": "AST", "player_threes": "FG3M",
     "player_steals": "STL", "player_blocks": "BLK",
     "player_pra": "PRA",
+    "player_points_rebounds_assists": "PRA",
+}
+
+# Odds API market_key → nba_forward_preds stat_type mapping
+# Handles alternate-market keys and the PRA market name difference
+_MKT_KEY_TO_STAT = {
+    "player_points": "player_points",
+    "player_points_alternate": "player_points",
+    "player_rebounds": "player_rebounds",
+    "player_rebounds_alternate": "player_rebounds",
+    "player_assists": "player_assists",
+    "player_assists_alternate": "player_assists",
+    "player_threes": "player_threes",
+    "player_steals": "player_steals",
+    "player_blocks": "player_blocks",
+    "player_points_rebounds_assists": "player_pra",
+}
+
+# Market keys that are alternate lines (not the main market)
+_ALT_MARKET_KEYS = {
+    "player_points_alternate",
+    "player_rebounds_alternate",
+    "player_assists_alternate",
+}
+
+# Normalize Odds-API team names → ESPN team names for game matching
+_TEAM_NORM = {
+    "Los Angeles Clippers": "LA Clippers",
 }
 
 _NBA_FP_DDL = """
@@ -257,7 +289,15 @@ CREATE TABLE IF NOT EXISTS nba_forward_preds (
     graded_at TEXT,
     is_reconstructed INTEGER DEFAULT 0,
     player_name_norm TEXT,
-    bdl_player_id INTEGER
+    bdl_player_id INTEGER,
+    market_key TEXT,
+    line_depth TEXT,
+    best_price REAL,
+    best_book TEXT,
+    devig_implied REAL,
+    devig_method TEXT,
+    n_books INTEGER,
+    no_market INTEGER DEFAULT 0
 )
 """
 
@@ -318,11 +358,21 @@ def _ensure_nba_forward_preds_table():
                 "ON nba_forward_preds(game_id, player_name, stat_type)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_nfp_ungraded "
                 "ON nba_forward_preds(game_date) WHERE actual_hit IS NULL")
-    # Add bdl_player_id column if table existed before this column was added
-    try:
-        con.execute("ALTER TABLE nba_forward_preds ADD COLUMN bdl_player_id INTEGER")
-    except Exception:
-        pass  # column already exists
+    # Add columns if table existed before they were added
+    for _col, _type in [("bdl_player_id", "INTEGER"),
+                        ("data_error", "TEXT"),
+                        ("market_key", "TEXT"),
+                        ("line_depth", "TEXT"),
+                        ("best_price", "REAL"),
+                        ("best_book", "TEXT"),
+                        ("devig_implied", "REAL"),
+                        ("devig_method", "TEXT"),
+                        ("n_books", "INTEGER"),
+                        ("no_market", "INTEGER DEFAULT 0")]:
+        try:
+            con.execute(f"ALTER TABLE nba_forward_preds ADD COLUMN {_col} {_type}")
+        except Exception:
+            pass  # column already exists
     # Alias table for Odds API ↔ BDL name mismatches
     con.execute(_NBA_ALIAS_DDL)
     for alias, canonical, bdl_id in _SEED_ALIASES:
@@ -372,6 +422,231 @@ def _resolve_bdl_player_id(con, player_name: str, game_date: str) -> int | None:
     return None
 
 
+def _get_market_lines_for_game(
+    game_date: str,
+    home_team: str,
+    away_team: str,
+) -> list[dict]:
+    """Query player_props for all market-posted lines for a game.
+
+    Returns list of dicts with keys: player_name, market_key, stat_type,
+    line_depth, point, over_price, under_price, best_book, n_books,
+    devig_implied, devig_method.
+
+    Groups by (player_name, stat_type, point) across bookmakers.
+    For two-sided lines, devig via multiplicative removal.
+    For one-sided alts, store raw implied prob with method='one_sided_raw'.
+    """
+    import os
+    import sqlite3
+
+    hist_path = os.path.join(os.path.dirname(__file__), "..", "..", "data",
+                             "historical.db")
+    hist_path = os.path.normpath(hist_path)
+    con = sqlite3.connect(hist_path, timeout=30)
+    con.execute("PRAGMA busy_timeout = 30000")
+    con.row_factory = sqlite3.Row
+
+    # Normalize team names: Odds API → ESPN
+    norm_home = _TEAM_NORM.get(home_team, home_team)
+    norm_away = _TEAM_NORM.get(away_team, away_team)
+
+    # Fetch latest snapshot per (bookmaker, market_key, player_name, over_under, point)
+    rows = con.execute("""
+        SELECT p1.player_name, p1.market_key, p1.point, p1.over_under,
+               p1.price, p1.bookmaker
+        FROM player_props p1
+        JOIN (SELECT bookmaker, market_key, player_name, over_under, point,
+                     MAX(fetched_at) AS max_fa
+              FROM player_props
+              WHERE sport_key = 'basketball_nba'
+                AND game_date = ?
+                AND (home_team = ? OR home_team = ?)
+              GROUP BY bookmaker, market_key, player_name, over_under, point
+             ) p2
+          ON p1.bookmaker   = p2.bookmaker
+         AND p1.market_key  = p2.market_key
+         AND p1.player_name = p2.player_name
+         AND p1.over_under  = p2.over_under
+         AND p1.point       = p2.point
+         AND p1.fetched_at  = p2.max_fa
+        WHERE p1.sport_key = 'basketball_nba'
+          AND p1.game_date = ?
+          AND (p1.home_team = ? OR p1.home_team = ?)
+    """, (game_date, home_team, norm_home,
+          game_date, home_team, norm_home)).fetchall()
+
+    # If no rows matched on home_team, try away_team (in case team order differs)
+    if not rows:
+        rows = con.execute("""
+            SELECT p1.player_name, p1.market_key, p1.point, p1.over_under,
+                   p1.price, p1.bookmaker
+            FROM player_props p1
+            JOIN (SELECT bookmaker, market_key, player_name, over_under, point,
+                         MAX(fetched_at) AS max_fa
+                  FROM player_props
+                  WHERE sport_key = 'basketball_nba'
+                    AND game_date = ?
+                    AND (away_team = ? OR away_team = ?)
+                  GROUP BY bookmaker, market_key, player_name, over_under, point
+                 ) p2
+              ON p1.bookmaker   = p2.bookmaker
+             AND p1.market_key  = p2.market_key
+             AND p1.player_name = p2.player_name
+             AND p1.over_under  = p2.over_under
+             AND p1.point       = p2.point
+             AND p1.fetched_at  = p2.max_fa
+            WHERE p1.sport_key = 'basketball_nba'
+              AND p1.game_date = ?
+              AND (p1.away_team = ? OR p1.away_team = ?)
+        """, (game_date, away_team, norm_away,
+              game_date, away_team, norm_away)).fetchall()
+
+    con.close()
+
+    if not rows:
+        return []
+
+    # Group by (player_name, market_key, point) → collect best over/under prices
+    from collections import defaultdict
+    grouped = defaultdict(lambda: {"over_prices": [], "under_prices": [],
+                                   "books": set()})
+    for r in rows:
+        key = (r["player_name"], r["market_key"], r["point"])
+        price = r["price"]
+        if price is None or price <= 0:
+            continue
+        grouped[key]["books"].add(r["bookmaker"])
+        if r["over_under"] == "over":
+            grouped[key]["over_prices"].append((price, r["bookmaker"]))
+        elif r["over_under"] == "under":
+            grouped[key]["under_prices"].append((price, r["bookmaker"]))
+
+    # ── Pass 1: compute per-(player, stat_type, book) overround from main lines ─
+    #    Used to devig one-sided alt lines.
+    # overround_map[(player, stat_type, book)] = total_implied (e.g. 1.05)
+    overround_map: dict[tuple, float] = {}
+    # Also track per-(stat_type, book) as fallback
+    overround_by_stat_book: dict[tuple, list] = defaultdict(list)
+
+    for (player_name, market_key, point), data in grouped.items():
+        stat_type = _MKT_KEY_TO_STAT.get(market_key)
+        if stat_type is None:
+            continue
+        if market_key in _ALT_MARKET_KEYS:
+            continue  # only main lines contribute overround
+        over_prices = data["over_prices"]
+        under_prices = data["under_prices"]
+        if not over_prices or not under_prices:
+            continue
+        # Per-book overround: use each book's own over+under for the most accurate margin
+        book_prices: dict[str, dict] = {}
+        for price, book in over_prices:
+            book_prices.setdefault(book, {})["over"] = price
+        for price, book in under_prices:
+            book_prices.setdefault(book, {})["under"] = price
+        for book, bp in book_prices.items():
+            if "over" in bp and "under" in bp:
+                total_imp = 1.0 / bp["over"] + 1.0 / bp["under"]
+                key = (player_name, stat_type, book)
+                # Keep the overround closest to 1.0 (least vig) if multiple main lines
+                if key not in overround_map or abs(total_imp - 1.0) < abs(overround_map[key] - 1.0):
+                    overround_map[key] = total_imp
+                overround_by_stat_book[(stat_type, book)].append(total_imp)
+
+    # Precompute median overround per (stat_type, book) as last-resort fallback
+    median_overround: dict[tuple, float] = {}
+    for (st, bk), vals in overround_by_stat_book.items():
+        sv = sorted(vals)
+        n = len(sv)
+        median_overround[(st, bk)] = sv[n // 2] if n % 2 else (sv[n//2 - 1] + sv[n//2]) / 2
+
+    # Global fallback: median across all main lines
+    all_overrounds = [v for vals in overround_by_stat_book.values() for v in vals]
+    global_median_overround = 1.05  # safe default
+    if all_overrounds:
+        sv = sorted(all_overrounds)
+        n = len(sv)
+        global_median_overround = sv[n // 2] if n % 2 else (sv[n//2 - 1] + sv[n//2]) / 2
+
+    # ── Pass 2: build results with devig ─────────────────────────────────────
+    results = []
+    for (player_name, market_key, point), data in grouped.items():
+        stat_type = _MKT_KEY_TO_STAT.get(market_key)
+        if stat_type is None or stat_type not in _MKT_TO_SIM:
+            continue
+
+        line_depth = "alt" if market_key in _ALT_MARKET_KEYS else "main"
+
+        over_prices = data["over_prices"]
+        under_prices = data["under_prices"]
+
+        best_over = max(over_prices, key=lambda x: x[0]) if over_prices else None
+        best_under = max(under_prices, key=lambda x: x[0]) if under_prices else None
+
+        if best_over and best_under:
+            # Two-sided: multiplicative devig
+            imp_over = 1.0 / best_over[0]
+            imp_under = 1.0 / best_under[0]
+            total_imp = imp_over + imp_under
+            devig_over = imp_over / total_imp
+            devig_method = "multiplicative"
+            if best_over[0] >= best_under[0]:
+                best_price = best_over[0]
+                best_book = best_over[1]
+                side = "over"
+                devig_implied = devig_over
+            else:
+                best_price = best_under[0]
+                best_book = best_under[1]
+                side = "under"
+                devig_implied = 1.0 - devig_over
+        elif best_over:
+            # One-sided over: borrow overround from main line
+            best_price = best_over[0]
+            best_book = best_over[1]
+            side = "over"
+            raw_imp = 1.0 / best_over[0]
+            # Look up borrowed overround: player/stat/book → stat/book → global
+            borrowed = overround_map.get((player_name, stat_type, best_book))
+            if borrowed is None:
+                borrowed = median_overround.get((stat_type, best_book))
+            if borrowed is None:
+                borrowed = global_median_overround
+            devig_implied = raw_imp / borrowed
+            devig_method = "borrowed_margin"
+        elif best_under:
+            best_price = best_under[0]
+            best_book = best_under[1]
+            side = "under"
+            raw_imp = 1.0 / best_under[0]
+            borrowed = overround_map.get((player_name, stat_type, best_book))
+            if borrowed is None:
+                borrowed = median_overround.get((stat_type, best_book))
+            if borrowed is None:
+                borrowed = global_median_overround
+            devig_implied = raw_imp / borrowed
+            devig_method = "borrowed_margin"
+        else:
+            continue
+
+        results.append({
+            "player_name": player_name,
+            "market_key": market_key,
+            "stat_type": stat_type,
+            "line_depth": line_depth,
+            "point": point,
+            "side": side,
+            "best_price": round(best_price, 4),
+            "best_book": best_book,
+            "n_books": len(data["books"]),
+            "devig_implied": round(devig_implied, 6),
+            "devig_method": devig_method,
+        })
+
+    return results
+
+
 def _persist_nba_forward_preds(
     props: List[ScoutedProp],
     sim,
@@ -384,7 +659,12 @@ def _persist_nba_forward_preds(
 ) -> int:
     """Write NBA sim predictions to nba_forward_preds in historical.db.
 
-    One row per player × stat × line × snapshot.  Never rewritten.
+    Stores one row per player × stat × market-posted line × snapshot.
+    Queries player_props for all lines the market posted for this game,
+    then computes sim P(over)/P(under) at each line.
+
+    Falls back to ScoutedProp thresholds for players in the sim but not
+    in player_props (ensuring at least one row per sim player×stat).
     """
     if sim is None or not props:
         return 0
@@ -408,6 +688,21 @@ def _persist_nba_forward_preds(
                 "ON nba_forward_preds(game_id, player_name, stat_type)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_nfp_ungraded "
                 "ON nba_forward_preds(game_date) WHERE actual_hit IS NULL")
+    # Migrate columns if table pre-dates them (matches _ensure_nba_forward_preds_table)
+    for _col, _type in [("bdl_player_id", "INTEGER"),
+                        ("data_error", "TEXT"),
+                        ("market_key", "TEXT"),
+                        ("line_depth", "TEXT"),
+                        ("best_price", "REAL"),
+                        ("best_book", "TEXT"),
+                        ("devig_implied", "REAL"),
+                        ("devig_method", "TEXT"),
+                        ("n_books", "INTEGER"),
+                        ("no_market", "INTEGER DEFAULT 0")]:
+        try:
+            con.execute(f"ALTER TABLE nba_forward_preds ADD COLUMN {_col} {_type}")
+        except Exception:
+            pass  # column already exists
 
     # Config hash: identifies the exact sim configuration
     inj_sorted = sorted((injury_statuses or {}).items())
@@ -415,42 +710,105 @@ def _persist_nba_forward_preds(
     config_hash = hashlib.md5(cfg.encode()).hexdigest()[:12]
 
     inj_json = json.dumps(injury_statuses) if injury_statuses else None
-    now_str = datetime.now(timezone.utc).isoformat()
+    now_utc = datetime.now(timezone.utc)
+    now_str = now_utc.isoformat()
     # NBA uses ET dates — convert UTC commence_time to ET for matching game_logs
+    _tip_utc = None
     try:
         from zoneinfo import ZoneInfo
         _et = ZoneInfo("America/New_York")
-        _tip = datetime.fromisoformat(
+        _tip_utc = datetime.fromisoformat(
             game.commence_time.replace("Z", "+00:00"))
-        game_date = _tip.astimezone(_et).strftime("%Y-%m-%d")
+        game_date = _tip_utc.astimezone(_et).strftime("%Y-%m-%d")
     except Exception:
         game_date = (game.commence_time or "")[:10]
+
+    # Per-game tip freeze: never write predictions after the game has tipped
+    if _tip_utc is not None and now_utc > _tip_utc:
+        logger.warning("[scout.runner] FREEZE: skipping nba_forward_preds for "
+                       "%s (tip %s, now %s)",
+                       game.game_id, _tip_utc.isoformat(), now_str)
+        con.close()
+        return 0
 
     # Pre-build alias lookup (Odds API name → bdl_player_id) for this batch
     _alias_cache: dict[str, int | None] = {}
 
-    count = 0
+    # Build set of sim-available players (for matching market names)
+    sim_players = set(sim._player_idx.keys())
+
+    # Load alias table for Odds API → sim name resolution
+    alias_to_sim: dict[str, str] = {}  # odds_api_name → sim_name
+    try:
+        alias_rows = con.execute(
+            "SELECT alias_name, canonical_name FROM nba_player_alias"
+        ).fetchall()
+        for a_name, c_name in alias_rows:
+            alias_to_sim[a_name] = c_name
+    except Exception:
+        pass
+
+    def _resolve_sim_name(odds_api_name: str) -> str | None:
+        """Resolve an Odds API player name to a sim player name."""
+        if odds_api_name in sim_players:
+            return odds_api_name
+        if odds_api_name in alias_to_sim:
+            canon = alias_to_sim[odds_api_name]
+            if canon in sim_players:
+                return canon
+        # Normalized match
+        norm = _normalize_player_name(odds_api_name)
+        for sp in sim_players:
+            if _normalize_player_name(sp) == norm:
+                return sp
+        return None
+
+    # ── Query market-posted lines from player_props ──
+    market_lines = _get_market_lines_for_game(
+        game_date, game.home_team, game.away_team
+    )
+
+    # Build a lookup: ScoutedProp player_name → ScoutedProp (for fallback metadata)
+    prop_lookup: dict[str, ScoutedProp] = {}
     for p in props:
-        if p.sport != "NBA":
+        if p.sport == "NBA":
+            prop_lookup[p.player_name] = p
+
+    # Track which (sim_name, stat_type) combos were stored from market lines
+    stored_from_market: set[tuple[str, str]] = set()
+
+    count = 0
+
+    # ── Primary path: store one row per market-posted line ──
+    for mkt in market_lines:
+        sim_name = _resolve_sim_name(mkt["player_name"])
+        if sim_name is None:
             continue
-        sim_stat = _MKT_TO_SIM.get(p.market_type)
-        if sim_stat is None or p.player_name not in sim._player_idx:
+        sim_stat = _MKT_TO_SIM.get(mkt["stat_type"])
+        if sim_stat is None:
             continue
+
         try:
-            sp_over = sim.p_over(p.player_name, sim_stat, p.threshold)
-            sp_under = sim.p_under(p.player_name, sim_stat, p.threshold)
-            arr = sim._get(p.player_name, sim_stat)
-            avail = sim._player_available(p.player_name)
+            sp_over = sim.p_over(sim_name, sim_stat, mkt["point"])
+            sp_under = sim.p_under(sim_name, sim_stat, mkt["point"])
+            arr = sim._get(sim_name, sim_stat)
+            avail = sim._player_available(sim_name)
             n_avail = int(avail.sum())
             median_val = float(np.median(arr[avail])) if n_avail > 0 else None
         except (KeyError, Exception):
             continue
 
-        # Resolve bdl_player_id (cached per player within this batch)
-        pname = p.player_name
-        if pname not in _alias_cache:
-            _alias_cache[pname] = _resolve_bdl_player_id(con, pname, game_date)
-        bdl_pid = _alias_cache[pname]
+        # Determine side based on sim probability (over if P(over) >= 0.5)
+        side = "over" if sp_over >= 0.5 else "under"
+
+        # Get ScoutedProp metadata if available (for blend_projected, etc.)
+        sp = prop_lookup.get(sim_name)
+
+        # Resolve bdl_player_id
+        if sim_name not in _alias_cache:
+            _alias_cache[sim_name] = _resolve_bdl_player_id(
+                con, mkt["player_name"], game_date)
+        bdl_pid = _alias_cache[sim_name]
 
         con.execute("""
             INSERT INTO nba_forward_preds (
@@ -462,8 +820,78 @@ def _persist_nba_forward_preds(
                 model_version, config_hash, n_draws,
                 hours_to_tip, snapshot_type, created_at,
                 player_injury_status, injury_context_json,
-                is_reconstructed, player_name_norm, bdl_player_id
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                is_reconstructed, player_name_norm, bdl_player_id,
+                market_key, line_depth, best_price, best_book,
+                devig_implied, devig_method, n_books
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            game_date, game.game_id, game.home_team, game.away_team,
+            market_total, market_spread,
+            sim_name,
+            sp.player_id if sp else None,
+            sp.team if sp else "",
+            mkt["stat_type"],
+            mkt["point"], side,
+            round(sp_over, 6), round(sp_under, 6),
+            round(median_val, 2) if median_val is not None else None,
+            sp.projected_value if sp else None,
+            sp.hit_probability if sp else None,
+            sp.projection_version if sp else "sim_only",
+            config_hash, sim.n_draws,
+            hours_to_tip, snapshot_type, now_str,
+            (injury_statuses or {}).get(sim_name),
+            inj_json,
+            0,
+            _normalize_player_name(sim_name),
+            bdl_pid,
+            mkt["market_key"], mkt["line_depth"],
+            mkt["best_price"], mkt["best_book"],
+            mkt["devig_implied"], mkt["devig_method"],
+            mkt["n_books"],
+        ))
+        count += 1
+        stored_from_market.add((sim_name, mkt["stat_type"]))
+
+    # ── Fallback: for sim players with no market lines, store at ScoutedProp threshold ──
+    for p in props:
+        if p.sport != "NBA":
+            continue
+        sim_stat = _MKT_TO_SIM.get(p.market_type)
+        if sim_stat is None or p.player_name not in sim._player_idx:
+            continue
+        if (p.player_name, p.market_type) in stored_from_market:
+            continue  # already stored from market lines
+
+        try:
+            sp_over = sim.p_over(p.player_name, sim_stat, p.threshold)
+            sp_under = sim.p_under(p.player_name, sim_stat, p.threshold)
+            arr = sim._get(p.player_name, sim_stat)
+            avail = sim._player_available(p.player_name)
+            n_avail = int(avail.sum())
+            median_val = float(np.median(arr[avail])) if n_avail > 0 else None
+        except (KeyError, Exception):
+            continue
+
+        if p.player_name not in _alias_cache:
+            _alias_cache[p.player_name] = _resolve_bdl_player_id(
+                con, p.player_name, game_date)
+        bdl_pid = _alias_cache[p.player_name]
+
+        con.execute("""
+            INSERT INTO nba_forward_preds (
+                game_date, game_id, home_team, away_team,
+                market_total, market_spread,
+                player_name, player_id, team, stat_type,
+                line, side, sim_p_over, sim_p_under, sim_median,
+                blend_projected, blend_hit_prob,
+                model_version, config_hash, n_draws,
+                hours_to_tip, snapshot_type, created_at,
+                player_injury_status, injury_context_json,
+                is_reconstructed, player_name_norm, bdl_player_id,
+                market_key, line_depth, best_price, best_book,
+                devig_implied, devig_method, n_books,
+                no_market
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             game_date, p.game_id, p.home_team, p.away_team,
             market_total, market_spread,
@@ -479,8 +907,24 @@ def _persist_nba_forward_preds(
             0,
             _normalize_player_name(p.player_name),
             bdl_pid,
+            None, "fallback",  # market_key, line_depth
+            None, None,        # best_price, best_book
+            None, None,        # devig_implied, devig_method
+            None,              # n_books
+            1,                 # no_market
         ))
         count += 1
+
+    mkt_count = len(stored_from_market)
+    fallback_count = count - sum(1 for _ in [])  # will log separately
+    if market_lines:
+        logger.info("[scout.runner] S5-2: %d market lines found, %d stored "
+                    "(from %d player×stat combos)",
+                    len(market_lines), count, mkt_count)
+    else:
+        logger.warning("[scout.runner] S5-2: 0 market lines found for %s on %s "
+                       "— using fallback thresholds only (%d rows)",
+                       game.game_id, game_date, count)
 
     con.commit()
     con.close()
@@ -893,11 +1337,12 @@ def run_daily_scout(engine, db) -> dict:
                             print(f"[scout.runner] S5-2: {_fp} forward preds "
                                   f"written for {_a}@{_h}")
                 except Exception as fp_exc:
-                    print(f"[scout.runner] S5-2 forward preds error: {fp_exc}")
+                    logger.error("[scout.runner] S5-2 forward preds error: %s\n%s",
+                                 fp_exc, traceback.format_exc())
             except Exception as exc:
                 err = f"NBA game {game.game_id}: {exc}"
                 errors.append(err)
-                print(f"[scout.runner] {err}")
+                logger.error("[scout.runner] %s\n%s", err, traceback.format_exc())
                 try:
                     db.rollback()
                 except Exception:
@@ -905,9 +1350,62 @@ def run_daily_scout(engine, db) -> dict:
         total_props    += nba_count
         by_sport["NBA"] = nba_count
         print(f"[scout.runner] NBA: {len(nba_games)} games → {nba_count} props")
+
+        # S5-2 outcome check: count actual rows in nba_forward_preds for today
+        _nfp_today = 0
+        _nfp_pretip = 0
+        if nba_games:
+            try:
+                import sqlite3 as _sq
+                _hp = os.path.normpath(os.path.join(
+                    os.path.dirname(__file__), "..", "..", "data", "historical.db"))
+                _hc = _sq.connect(_hp, timeout=5)
+                _today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                _nfp_today = _hc.execute(
+                    "SELECT COUNT(*) FROM nba_forward_preds "
+                    "WHERE game_date=? AND snapshot_type='scout'",
+                    (_today,)).fetchone()[0]
+                _nfp_pretip = _hc.execute(
+                    "SELECT COUNT(*) FROM nba_forward_preds "
+                    "WHERE game_date=? AND snapshot_type='pre_tip'",
+                    (_today,)).fetchone()[0]
+                _hc.close()
+            except Exception:
+                pass
+            print(f"[scout.runner] S5-2: {_nfp_today} scout + {_nfp_pretip} "
+                  f"pre_tip forward preds for {len(nba_games)} games")
+        # Dedicated pipeline_health entry: rows = actual forward preds written
+        try:
+            from pipeline_health import record_run as _rec_nfp
+            _rec_nfp("nba_forward_preds",
+                     rows_written=_nfp_today,
+                     errors=0 if _nfp_today > 0 else 1,
+                     error_details=(f"{len(nba_games)} games but 0 forward preds"
+                                    if nba_games and _nfp_today == 0 else None),
+                     games_exist=len(nba_games) > 0)
+        except Exception:
+            pass
+        # Record NBA scout health
+        try:
+            from pipeline_health import record_run
+            _nba_errs = [e for e in errors if "NBA" in e]
+            record_run("nba_scout",
+                       rows_written=nba_count,
+                       errors=len(_nba_errs),
+                       error_details="; ".join(_nba_errs[:3]) if _nba_errs else None,
+                       games_exist=len(nba_games) > 0)
+        except Exception:
+            pass
     except Exception as exc:
         errors.append(f"NBA fetch: {exc}")
-        print(f"[scout.runner] NBA fetch error: {exc}")
+        logger.error("[scout.runner] NBA fetch error: %s\n%s", exc, traceback.format_exc())
+        try:
+            from pipeline_health import record_run
+            record_run("nba_scout", errors=1,
+                       error_details=f"NBA fetch: {exc}",
+                       games_exist=None)
+        except Exception:
+            pass
 
     # ── MLB ────────────────────────────────────────────────────────────────────
     try:

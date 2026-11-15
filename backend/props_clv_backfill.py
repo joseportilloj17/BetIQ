@@ -132,6 +132,20 @@ def _get_commence_times(game_dates: list[str]) -> dict[str, str]:
             with urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read())
                 remaining = resp.headers.get("x-requests-remaining")
+                used_last = resp.headers.get("x-requests-last")
+
+            # Log credits to historical.db credits_log table
+            # Use x-requests-last (per-request cost) to match creator_tier._get() pattern
+            remaining_int = int(remaining) if remaining and str(remaining).isdigit() else None
+            used_last_int = int(used_last) if used_last and str(used_last).isdigit() else None
+            try:
+                from creator_tier import _log_credits
+                _log_credits(
+                    f"/v4/historical/sports/baseball_mlb/events?date={gd}",
+                    used_last_int, remaining_int,
+                )
+            except Exception:
+                pass  # fire-and-forget
 
             events_data = data.get("data", [])
             for ev in events_data:
@@ -226,6 +240,20 @@ def _fetch_closing_props(events: list[dict], commence_times: dict[str, str],
             with urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read())
                 remaining = resp.headers.get("x-requests-remaining")
+                used_last = resp.headers.get("x-requests-last")
+
+            # Log credits to historical.db credits_log table
+            # Use x-requests-last (per-request cost) to match creator_tier._get() pattern
+            remaining_int = int(remaining) if remaining and str(remaining).isdigit() else None
+            used_last_int = int(used_last) if used_last and str(used_last).isdigit() else None
+            try:
+                from creator_tier import _log_credits
+                _log_credits(
+                    f"/v4/historical/sports/baseball_mlb/events/{eid}/odds",
+                    used_last_int, remaining_int,
+                )
+            except Exception:
+                pass  # fire-and-forget
 
             api_ts = data.get("timestamp", "")
             odds_data = data.get("data", data)

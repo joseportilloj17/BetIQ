@@ -27,8 +27,58 @@ Endpoints:
 """
 from __future__ import annotations
 
+import logging
+import logging.handlers
 import os
+
+# ── Logging setup (before any other imports) ──────────────────────────────────
+_LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_FILE = os.path.join(_LOG_DIR, "betiq_app.log")
+
+_root_logger = logging.getLogger()
+if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in _root_logger.handlers):
+    _file_handler = logging.handlers.RotatingFileHandler(
+        _LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8",
+    )
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    _root_logger.addHandler(_file_handler)
+    if _root_logger.level == logging.WARNING or _root_logger.level == 0:
+        _root_logger.setLevel(logging.INFO)
+
+import subprocess as _sp
 import uuid
+
+# ── Version guard: capture git commit at startup ─────────────────────────────
+def _read_git_commit() -> tuple[str, str]:
+    """Read git commit from .git/HEAD + refs (no subprocess dependency)."""
+    repo = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+    git_dir = os.path.join(repo, ".git")
+    try:
+        head = open(os.path.join(git_dir, "HEAD")).read().strip()
+        if head.startswith("ref: "):
+            ref_path = os.path.join(git_dir, head[5:])
+            full = open(ref_path).read().strip()
+        else:
+            full = head  # detached HEAD
+        return full[:7], full
+    except Exception:
+        pass
+    # Fallback: try /usr/bin/git (absolute path, no PATH dependency)
+    try:
+        full = _sp.check_output(
+            ["/usr/bin/git", "rev-parse", "HEAD"],
+            cwd=repo, stderr=_sp.DEVNULL,
+        ).decode().strip()
+        return full[:7], full
+    except Exception:
+        return "unknown", "unknown"
+
+_STARTUP_COMMIT, _STARTUP_COMMIT_FULL = _read_git_commit()
+logging.getLogger(__name__).info("Server starting — git commit %s", _STARTUP_COMMIT)
 import json
 from datetime import datetime
 from typing import Optional, List
@@ -6894,6 +6944,203 @@ def best_props(event_id: str, market_key: str = Query("pitcher_strikeouts")):
             "props": ct.get_best_props(event_id, market_key)}
 
 
+@app.get("/api/lab/props")
+def lab_props(
+    season: Optional[int] = None,
+    week: Optional[int] = None,
+    include_weather: bool = True,
+):
+    """
+    NFL Lab: all player props with v1.2 projections, injury redistribution,
+    weather badges. Shows ALL players with a posted line or prediction —
+    players without a projection get a 'no projection' badge.
+    """
+    import lab_props as lp
+    return lp.build_lab_props(season, week, include_weather)
+
+
+@app.get("/api/scorecard/{sport}")
+def scorecard_get(
+    sport: str,
+    season: int = 2026,
+    week: Optional[int] = None,
+    stat_type: Optional[str] = None,
+    position: Optional[str] = None,
+    model_version: Optional[str] = None,
+    line_depth: Optional[str] = None,
+):
+    """Weekly model scorecard: accuracy, direction, calibration, biggest misses."""
+    import model_scorecard as ms
+    rows = ms.get_scorecard(sport.upper(), season, week=week,
+                            stat_type=stat_type, position=position,
+                            model_version=model_version, line_depth=line_depth)
+    return {"sport": sport.upper(), "season": season, "rows": rows}
+
+
+@app.post("/api/scorecard/{sport}/compute")
+def scorecard_compute(sport: str, body: dict):
+    """Compute scorecard for a week or backfill all graded weeks."""
+    import model_scorecard as ms
+    season = body.get("season", 2026)
+    if body.get("backfill"):
+        results = ms.backfill_scorecards(sport.upper(), season)
+        return {"status": "ok", "results": {str(k): v for k, v in results.items()}}
+    week = body.get("week")
+    if not week:
+        return {"error": "Provide 'week' or 'backfill': true"}
+    n = ms.compute_weekly_scorecard(sport.upper(), season, week, force=True)
+    n_std = ms.compute_season_to_date(sport.upper(), season, week)
+    return {"status": "ok", "week_segments": n, "std_segments": n_std}
+
+
+@app.get("/api/scorecard/{sport}/predictions")
+def scorecard_predictions(
+    sport: str,
+    season: int = 2026,
+    week: Optional[int] = None,
+    stat_type: Optional[str] = None,
+    position: Optional[str] = None,
+    model_version: Optional[str] = None,
+    line_depth: Optional[str] = "main",
+    team: Optional[str] = None,
+    opponent: Optional[str] = None,
+    stale_only: bool = False,
+    direction: Optional[str] = None,
+    miss_abs_min: Optional[float] = None,
+    miss_abs_max: Optional[float] = None,
+    sort_col: str = "abs_model_miss",
+    sort_dir: str = "desc",
+    limit: int = 50,
+    offset: int = 0,
+):
+    """Per-prediction detail table with server-side pagination and filtering."""
+    import sqlite3
+    _HIST_DB = os.path.join(os.path.dirname(__file__), "..", "data", "historical.db")
+    conn = sqlite3.connect(os.path.abspath(_HIST_DB))
+    conn.row_factory = sqlite3.Row
+
+    clauses = ["actual_value IS NOT NULL", "data_error IS NULL", "season = ?"]
+    params: list = [season]
+
+    if week is not None:
+        clauses.append("week = ?")
+        params.append(week)
+    if stat_type and stat_type != "_ALL_":
+        clauses.append("stat_type = ?")
+        params.append(stat_type)
+    if position and position != "_ALL_":
+        clauses.append("position = ?")
+        params.append(position)
+    if model_version and model_version != "_ALL_":
+        clauses.append("model_version = ?")
+        params.append(model_version)
+    if line_depth and line_depth != "_ALL_":
+        clauses.append("line_depth = ?")
+        params.append(line_depth)
+    if team:
+        clauses.append("team = ?")
+        params.append(team)
+    if opponent:
+        clauses.append("opponent = ?")
+        params.append(opponent)
+
+    # Default method filter
+    clauses.append("method = 'distributional'")
+
+    where = " AND ".join(clauses)
+
+    # Stale filter (computed in SQL)
+    stale_expr = """(prop_line >= 5
+        AND ABS(consensus_mean - prop_line) > 0.40 * prop_line
+        AND ABS(consensus_mean - prop_line) > 10)"""
+    if stale_only:
+        clauses_stale = clauses + [stale_expr]
+        where = " AND ".join(clauses_stale)
+
+    # Build main query with computed columns
+    sql = f"""
+        SELECT player_name, team, opponent, stat_type, position,
+               consensus_mean, consensus_median, prop_line, actual_value,
+               (consensus_mean - actual_value) AS model_miss,
+               (prop_line - actual_value) AS line_miss,
+               ABS(consensus_mean - actual_value) AS abs_model_miss,
+               CASE WHEN ABS(consensus_mean - actual_value) < ABS(prop_line - actual_value) THEN 1 ELSE 0 END AS beat_line,
+               {stale_expr} AS is_stale,
+               line_depth, model_version, week
+        FROM fantasy_forward_preds
+        WHERE {where}
+    """
+
+    # Direction filter: model too high or too low
+    if direction == "over":
+        sql += " AND consensus_mean > actual_value"
+    elif direction == "under":
+        sql += " AND consensus_mean < actual_value"
+
+    # Miss range filters
+    if miss_abs_min is not None:
+        sql += f" AND ABS(consensus_mean - actual_value) >= {float(miss_abs_min)}"
+    if miss_abs_max is not None:
+        sql += f" AND ABS(consensus_mean - actual_value) <= {float(miss_abs_max)}"
+
+    # Count total
+    count_sql = f"SELECT COUNT(*) FROM ({sql})"
+    total = conn.execute(count_sql, params).fetchone()[0]
+
+    # Sort
+    allowed_sorts = {"abs_model_miss", "model_miss", "line_miss", "beat_line",
+                     "player_name", "stat_type", "actual_value", "prop_line",
+                     "consensus_mean", "week"}
+    if sort_col not in allowed_sorts:
+        sort_col = "abs_model_miss"
+    sort_dir_sql = "DESC" if sort_dir.lower() == "desc" else "ASC"
+    sql += f" ORDER BY {sort_col} {sort_dir_sql} LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    result_rows = []
+    for r in rows:
+        result_rows.append({
+            "player_name": r["player_name"],
+            "team": r["team"],
+            "opponent": r["opponent"],
+            "stat_type": r["stat_type"],
+            "position": r["position"],
+            "consensus_mean": r["consensus_mean"],
+            "consensus_median": r["consensus_median"],
+            "prop_line": r["prop_line"],
+            "actual_value": r["actual_value"],
+            "model_miss": round(r["model_miss"], 2) if r["model_miss"] is not None else None,
+            "line_miss": round(r["line_miss"], 2) if r["line_miss"] is not None else None,
+            "abs_model_miss": round(r["abs_model_miss"], 2) if r["abs_model_miss"] is not None else None,
+            "beat_line": bool(r["beat_line"]),
+            "is_stale": bool(r["is_stale"]),
+            "line_depth": r["line_depth"],
+            "model_version": r["model_version"],
+            "week": r["week"],
+        })
+
+    return {"total": total, "rows": result_rows}
+
+
+@app.get("/api/scorecard/{sport}/teams")
+def scorecard_teams(sport: str, season: int = 2026):
+    """Distinct team values from forward_preds for dropdown population."""
+    import sqlite3
+    _HIST_DB = os.path.join(os.path.dirname(__file__), "..", "data", "historical.db")
+    conn = sqlite3.connect(os.path.abspath(_HIST_DB))
+    rows = conn.execute("""
+        SELECT DISTINCT team FROM fantasy_forward_preds
+        WHERE season = ? AND team IS NOT NULL AND team != ''
+              AND LENGTH(team) <= 4
+        ORDER BY team
+    """, (season,)).fetchall()
+    conn.close()
+    return {"teams": [r[0] for r in rows]}
+
+
 @app.get("/api/weather")
 def game_weather(
     home_team:    str,
@@ -7009,11 +7256,31 @@ def health():
         db_ok, db_detail = _verify_db_write_health()
     except Exception:
         pass
+    # Version check: running commit vs current HEAD on disk
+    _disk_commit, _ = _read_git_commit()
+    _version_match = (_STARTUP_COMMIT != "unknown"
+                      and _disk_commit != "unknown"
+                      and _STARTUP_COMMIT == _disk_commit)
+    # Dirty-tree check: uncommitted changes mean commit hash is misleading
+    _tree_dirty = False
+    try:
+        _porcelain = _sp.check_output(
+            ["/usr/bin/git", "status", "--porcelain"],
+            cwd=os.path.normpath(os.path.join(os.path.dirname(__file__), "..")),
+            stderr=_sp.DEVNULL, timeout=5,
+        ).decode().strip()
+        _tree_dirty = len(_porcelain) > 0
+    except Exception:
+        pass
     return {
-        "status": "ok" if db_ok else "degraded",
+        "status": "ok" if (db_ok and _version_match) else "degraded",
         "time": datetime.utcnow().isoformat(),
         "scheduler": sched.get_state()["running"],
         "db_write_health": db_detail,
+        "git_commit_running": _STARTUP_COMMIT,
+        "git_commit_disk": _disk_commit,
+        "version_match": _version_match,
+        "working_tree_dirty": _tree_dirty,
     }
 
 

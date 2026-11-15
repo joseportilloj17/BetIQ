@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 _HERE     = os.path.dirname(__file__)
 _DATA_DIR = os.path.join(_HERE, "..", "data")
 _HIST_DB  = os.path.join(_DATA_DIR, "historical.db")
+_NFL_DB   = os.path.join(_DATA_DIR, "nfl.db")
+
+# Team abbreviation aliases: fantasy sources → nfl_games canonical
+_TEAM_ALIAS = {"LAR": "LA"}
+_TEAM_ALIAS_REV = {v: k for k, v in _TEAM_ALIAS.items()}
 
 # ── Stat-to-prop mapping ──────────────────────────────────────────────────────
 # Maps fantasy component stat names → TheOddsAPI player prop market keys.
@@ -52,10 +57,10 @@ STAT_TO_PROP = {
 
 # Alt market keys — same stats but alternate lines (full ladder)
 STAT_TO_ALT_PROP = {
-    "pass_yds":  "player_pass_yds_alternate",
-    "rush_yds":  "player_rush_yds_alternate",
-    "rec_yds":   "player_reception_yds_alternate",
-    # No alt markets for pass_tds or receptions currently
+    "pass_yds":    "player_pass_yds_alternate",
+    "rush_yds":    "player_rush_yds_alternate",
+    "rec_yds":     "player_reception_yds_alternate",
+    "receptions":  "player_receptions_alternate",
 }
 
 # Canonical stat types we track (subset of what sources provide)
@@ -310,13 +315,53 @@ def fetch_espn_projections(season: int, week: int) -> list[dict]:
 def _normalize_player_name(name: str) -> str:
     """Normalize player name for matching across sources.
 
-    Strip suffixes (Jr., III, II), lowercase, collapse whitespace.
+    Strip periods from initials (A.J. → AJ), strip suffixes (Jr., III, II),
+    lowercase, collapse whitespace.
     """
     import re
     name = name.strip().lower()
-    name = re.sub(r'\s+(jr\.?|sr\.?|ii+|iv|v)$', '', name)
+    # Strip periods from initials: "a.j." → "aj", "d.k." → "dk"
+    name = name.replace(".", "")
+    # Strip apostrophes/backticks: "Tre'" → "Tre", "D'Andre" → "DAndre"
+    name = name.replace("'", "").replace("'", "").replace("`", "")
+    name = re.sub(r'\s+(jr|sr|ii+|iv|v)$', '', name)
     name = re.sub(r'\s+', ' ', name)
     return name
+
+
+# ── NFL alias resolution ─────────────────────────────────────────────────────
+
+_NFL_ALIASES: dict[str, str] | None = None  # Lazy-loaded cache
+
+
+def _load_nfl_aliases() -> dict[str, str]:
+    """Load NFL alias table. Returns {normalized_alias → normalized_canonical}."""
+    global _NFL_ALIASES
+    if _NFL_ALIASES is not None:
+        return _NFL_ALIASES
+
+    _NFL_ALIASES = {}
+    if not os.path.exists(os.path.abspath(_HIST_DB)):
+        return _NFL_ALIASES
+
+    try:
+        conn = sqlite3.connect(os.path.abspath(_HIST_DB))
+        rows = conn.execute(
+            "SELECT alias_name, canonical_name FROM nfl_player_alias"
+        ).fetchall()
+        conn.close()
+        for alias, canonical in rows:
+            _NFL_ALIASES[_normalize_player_name(alias)] = _normalize_player_name(canonical)
+    except Exception:
+        pass
+    return _NFL_ALIASES
+
+
+def _resolve_nfl_name(name: str) -> str:
+    """Resolve a player name through NFL aliases. Returns normalized name."""
+    norm = _normalize_player_name(name)
+    aliases = _load_nfl_aliases()
+    return aliases.get(norm, norm)
 
 
 def build_consensus(all_projections: list[list[dict]]) -> dict:
@@ -350,7 +395,7 @@ def build_consensus(all_projections: list[list[dict]]) -> dict:
 
     for source_projections in all_projections:
         for proj in source_projections:
-            norm_name = _normalize_player_name(proj["player_name"])
+            norm_name = _resolve_nfl_name(proj["player_name"])
             if norm_name not in player_data:
                 player_data[norm_name] = {
                     "display_name": proj["player_name"],
@@ -382,10 +427,17 @@ def build_consensus(all_projections: list[list[dict]]) -> dict:
             else:
                 sd_val = 0.0
 
+            vals_sorted = sorted(vals)
+            if n % 2 == 1:
+                median_val = vals_sorted[n // 2]
+            else:
+                median_val = (vals_sorted[n // 2 - 1] + vals_sorted[n // 2]) / 2
+
             stats_out[stat_type] = {
                 "values": vals,
                 "sources": sdata["sources"],
                 "mean": round(mean_val, 2),
+                "median": round(median_val, 2),
                 "min": round(min_val, 2),
                 "max": round(max_val, 2),
                 "sd": round(sd_val, 2),
@@ -401,6 +453,54 @@ def build_consensus(all_projections: list[list[dict]]) -> dict:
             }
 
     return consensus
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Game schedule helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_game_schedule(nfl_season: int, week: int) -> dict:
+    """
+    Build team→game lookup from nfl_games (nfl.db).
+
+    Returns: {team_abbr: {"game_id": str, "kickoff_utc": str (ISO 8601)}}
+    Uses canonical FFP team abbreviations (LAR not LA).
+    gametime is ET in nfl_games; converted to UTC here.
+    """
+    from zoneinfo import ZoneInfo
+    nfl_db = os.path.abspath(_NFL_DB)
+    if not os.path.exists(nfl_db):
+        logger.warning("[Schedule] nfl.db not found at %s", nfl_db)
+        return {}
+
+    conn = sqlite3.connect(nfl_db)
+    rows = conn.execute("""
+        SELECT game_id, game_date, gametime, home_team, away_team
+        FROM nfl_games
+        WHERE season = ? AND week = ? AND game_type = 'REG'
+    """, (nfl_season, week)).fetchall()
+    conn.close()
+
+    et = ZoneInfo("America/New_York")
+    utc = ZoneInfo("UTC")
+    schedule = {}
+    for gid, gdate, gtime, home, away in rows:
+        if not gtime:
+            continue
+        try:
+            kick_et = datetime.strptime(f"{gdate} {gtime}", "%Y-%m-%d %H:%M")
+            kick_et = kick_et.replace(tzinfo=et)
+            kick_utc = kick_et.astimezone(utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            kick_utc = None
+
+        info = {"game_id": gid, "kickoff_utc": kick_utc}
+        # Map both teams — use FFP-style abbreviations
+        for team_raw in (home, away):
+            ffp_team = _TEAM_ALIAS_REV.get(team_raw, team_raw)
+            schedule[ffp_team] = info
+
+    return schedule
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -457,7 +557,8 @@ def _fetch_current_nfl_prop_lines() -> dict:
             continue
         seen.add(dedup_key)
 
-        norm = _normalize_player_name(pname)
+        # Resolve through alias table before normalizing
+        norm = _resolve_nfl_name(pname)
         if norm not in props:
             props[norm] = {}
 
@@ -513,7 +614,8 @@ def _build_player_baselines(season: int, current_week: int,
             WHERE season = ? AND week >= ? AND week < ?
             GROUP BY player_name, stat_type
         """, (season, max(1, current_week - lookback_weeks), current_week)).fetchall()
-    except Exception:
+    except Exception as exc:
+        logger.warning("Player baselines query failed: %s", exc)
         return {}
     finally:
         conn.close()
@@ -549,7 +651,8 @@ def _build_player_variances(season: int, current_week: int) -> dict[str, dict[st
             WHERE season = ? AND week < ?
             ORDER BY player_name, stat_type, week
         """, (season, current_week)).fetchall()
-    except Exception:
+    except Exception as exc:
+        logger.warning("Player variances query failed: %s", exc)
         return {}
     finally:
         conn.close()
@@ -645,7 +748,8 @@ def _build_tendency_adjustments(prop_lines: dict) -> dict:
             WHERE sport_key = 'americanfootball_nfl'
               AND game_date >= date('now', '-1 day')
         """).fetchall()
-    except Exception:
+    except Exception as exc:
+        logger.warning("Prop lines query failed: %s", exc)
         return {}
     finally:
         conn.close()
@@ -749,6 +853,7 @@ def _compute_segment_bias(season: int | None = None,
                    COUNT(*) as n
             FROM fantasy_forward_preds
             WHERE actual_value IS NOT NULL AND is_push = 0
+              AND data_error IS NULL
         """
         params: list = []
         if season is not None:
@@ -774,6 +879,33 @@ def _compute_segment_bias(season: int | None = None,
         biases[(stat, pos)] = round(shrunk, 2)
 
     return biases
+
+
+def _suppression_rule(gap: dict) -> str | None:
+    """Compute the structural suppression rule for a gap dict.
+
+    Returns None if the gap is not suppressed, or a string tag:
+      'alt_over'                — near/deep alt OVER (structural vig)
+      'deep_alt_under_rec_pass' — deep alt UNDER rec/pass (vig eats edge)
+      'rb_rush_over_low_conv'   — RB rush OVER non-high conviction
+    """
+    depth = gap.get("line_depth", "main")
+    p_ov = gap.get("p_over", 0) or 0
+    dist_dir = "over" if p_ov > 0.5 else "under"
+    stat = gap.get("stat", "")
+    pos = gap.get("position", "")
+    conv = gap.get("conviction_bucket") or _conviction_bucket(gap.get("edge_vs_market"))
+
+    if depth != "main":
+        if dist_dir == "over":
+            return "alt_over"
+        if depth == "deep_alt" and dist_dir == "under" and stat in ("rec_yds", "pass_yds"):
+            return "deep_alt_under_rec_pass"
+
+    if stat == "rush_yds" and pos == "RB" and dist_dir == "over" and conv != "high":
+        return "rb_rush_over_low_conv"
+
+    return None
 
 
 def find_prop_gaps(consensus: dict, prop_lines: dict | None = None,
@@ -812,6 +944,19 @@ def find_prop_gaps(consensus: dict, prop_lines: dict | None = None,
     if prop_lines is None:
         prop_lines = _fetch_current_nfl_prop_lines()
 
+    # Pre-load v1.2 shifted gamma params for distributional median + shadow P(over)
+    # NOTE: Production P(over) stays lognormal (frozen for prereg).
+    # Shadow p_over_v12_gamma is stored separately for post-W14 comparison.
+    from nfl_interim_dispersion import (
+        get_interim_cv, get_v12_base_rate,
+        gamma_params_shifted, p_over_line_gamma_shifted,
+        load_cached_params, load_v12_base_rates,
+    )
+    load_cached_params()
+    load_v12_base_rates()
+
+    _gamma_attempts = 0
+    _gamma_failures = 0
     gaps = []
     for norm_name, cdata in consensus.items():
         if norm_name not in prop_lines:
@@ -896,6 +1041,8 @@ def find_prop_gaps(consensus: dict, prop_lines: dict | None = None,
             gap_reason = _tag_gap_reason(mean, baseline)
 
             # Distributional P(over line) — use consensus mean as center.
+            # FROZEN: P(over) uses lognormal for yardage (prereg continuity).
+            # Do NOT change P(over) logic until after W14 verdict (~2026-12-05).
             dist_type = _STAT_DISTRIBUTION.get(stat_type, "lognormal")
 
             # Positional-norm CV (default when no per-player data)
@@ -922,14 +1069,43 @@ def find_prop_gaps(consensus: dict, prop_lines: dict | None = None,
             if sigma_adj != 1.0:
                 est_var *= sigma_adj ** 2  # variance scales as sigma^2
 
+            # P(over) — lognormal for yardage, negbin for counts (FROZEN)
             if dist_type == "lognormal":
                 mu_ln, sigma_ln = _lognormal_params(max(mean, 0.1), est_var)
                 dist_params = {"mu": mu_ln, "sigma": sigma_ln}
             else:
                 mu_nb, r_nb = _negbin_params(max(mean, 0.01), est_var)
                 dist_params = {"mu": mu_nb, "r": r_nb}
-
             p_ov = p_over_line(line, mean, dist_params, dist_type)
+
+            # Shadow P(over) — shifted gamma v1.2 for yardage (stored separately,
+            # production p_over untouched). For counts, no gamma alternative exists.
+            p_ov_v12_gamma = None
+            if stat_type in _YARDAGE_STATS_GAMMA_MEDIAN:
+                _gamma_attempts += 1
+                cv_g = get_interim_cv(stat_type, pos, mean, use_v12=True)
+                br_g = get_v12_base_rate(stat_type, pos)
+                try:
+                    p_ov_v12_gamma = round(
+                        p_over_line_gamma_shifted(line, mean, cv_g, br_g), 4
+                    )
+                except Exception as _gex:
+                    _gamma_failures += 1
+                    logger.warning("Gamma P(over) failed for %s %.1f: %s",
+                                   stat_type, line, _gex)
+
+            # Distributional median — shifted gamma for yardage (v1.2 ppf 0.5)
+            if stat_type in _YARDAGE_STATS_GAMMA_MEDIAN:
+                cv = get_interim_cv(stat_type, pos, mean, use_v12=True)
+                base_rate = get_v12_base_rate(stat_type, pos)
+                g_shape, g_scale = gamma_params_shifted(mean, cv, base_rate)
+                median_dist_params = {
+                    "gamma_shape": g_shape, "gamma_scale": g_scale,
+                    "cv": cv, "base_rate": base_rate,
+                }
+                dist_median = _distributional_median(mean, median_dist_params, "shifted_gamma")
+            else:
+                dist_median = _distributional_median(mean, dist_params, dist_type)
 
             # De-vig implied probability for over
             over_price = prop_info.get("over_price")
@@ -938,13 +1114,21 @@ def find_prop_gaps(consensus: dict, prop_lines: dict | None = None,
 
             # Edge: P(over) - implied P(over) when direction is over,
             #        implied P(under) - P(under) when direction is under
+            # Uses lognormal p_over (frozen for FW-2 prereg).
             if devigged is not None:
                 if direction == "over":
                     edge_vs_market = p_ov - devigged
                 else:
-                    edge_vs_market = (1 - devigged) - (1 - p_ov)  # = p_ov - devigged (same)
+                    edge_vs_market = (1 - devigged) - (1 - p_ov)
             else:
                 edge_vs_market = None
+
+            # Gamma edge (separate, for decision layer / display)
+            if devigged is not None and p_ov_v12_gamma is not None:
+                edge_gamma = p_ov_v12_gamma - devigged if direction == "over" \
+                    else (1 - devigged) - (1 - p_ov_v12_gamma)
+            else:
+                edge_gamma = None
 
             # ── No-bet threshold ──
             # Skip props where edge is below the minimum (no-bet zone).
@@ -959,6 +1143,7 @@ def find_prop_gaps(consensus: dict, prop_lines: dict | None = None,
                 "stat": stat_type,
                 "prop_market": prop_key,
                 "consensus_mean": mean,
+                "consensus_median": sdata["median"],
                 "consensus_sd": sd,
                 "n_sources": n,
                 "prop_line": line,
@@ -973,11 +1158,18 @@ def find_prop_gaps(consensus: dict, prop_lines: dict | None = None,
                 "gap_reason": gap_reason,
                 "line_depth": "main",
                 "var_deviation": round(var_deviation, 3),
+                "distributional_median": round(dist_median, 2),
+                "p_over_v12_gamma": p_ov_v12_gamma,
+                "p_over_distribution": dist_type,
+                "edge_gamma": round(edge_gamma, 4) if edge_gamma is not None else None,
+                "dist_direction_gamma": ("over" if (p_ov_v12_gamma or p_ov or 0) > 0.5 else "under")
+                    if p_ov_v12_gamma is not None else None,
                 "tendency_adj": round(tendency_adj, 3),
                 "bias_correction": round(bias_correction, 2),
                 "over_price": over_price,
                 "under_price": under_price,
             })
+            gaps[-1]["suppression_rule"] = _suppression_rule(gaps[-1])
 
             # ── Alt-line ladder evaluation ──
             # Evaluate each alt line using the SAME fitted distribution
@@ -989,8 +1181,10 @@ def find_prop_gaps(consensus: dict, prop_lines: dict | None = None,
                         alt_line = alt_entry.get("point")
                         if alt_line is None or alt_line < min_line:
                             continue
+                        # Alt at same point as main is allowed — UNIQUE key
+                        # includes line_depth so they coexist.
 
-                        # P(over alt_line) from the SAME distribution
+                        # P(over alt_line) from the SAME distribution as main
                         alt_p_ov = p_over_line(alt_line, mean, dist_params, dist_type)
 
                         # Alt lines typically only have over price
@@ -1043,10 +1237,30 @@ def find_prop_gaps(consensus: dict, prop_lines: dict | None = None,
                         alt_gap = mean - alt_line
                         alt_abs_gap = abs(alt_gap)
 
+                        # Gamma P(over) for alt line (compute before edge)
+                        alt_p_ov_v12_gamma = None
+                        if stat_type in _YARDAGE_STATS_GAMMA_MEDIAN:
+                            _gamma_attempts += 1
+                            try:
+                                alt_p_ov_v12_gamma = round(
+                                    p_over_line_gamma_shifted(alt_line, mean, cv_g, br_g), 4
+                                )
+                            except Exception as _gex:
+                                _gamma_failures += 1
+                                logger.warning("Alt gamma P(over) failed for %s %.1f: %s",
+                                               stat_type, alt_line, _gex)
+
+                        # Edge uses lognormal p_over (frozen for FW-2)
                         if alt_devigged is not None:
                             alt_edge = alt_p_ov - alt_devigged
                         else:
                             alt_edge = None
+
+                        # Gamma edge (separate, for decision layer)
+                        if alt_devigged is not None and alt_p_ov_v12_gamma is not None:
+                            alt_edge_gamma = alt_p_ov_v12_gamma - alt_devigged
+                        else:
+                            alt_edge_gamma = None
 
                         # BE from actual alt over odds (alt props are over-only)
                         alt_be = None
@@ -1073,6 +1287,7 @@ def find_prop_gaps(consensus: dict, prop_lines: dict | None = None,
                             "stat": stat_type,
                             "prop_market": alt_prop_key,
                             "consensus_mean": mean,
+                            "consensus_median": sdata["median"],
                             "consensus_sd": sd,
                             "n_sources": n,
                             "prop_line": alt_line,
@@ -1087,15 +1302,38 @@ def find_prop_gaps(consensus: dict, prop_lines: dict | None = None,
                             "gap_reason": gap_reason,
                             "line_depth": depth,
                             "var_deviation": round(var_deviation, 3),
+                            "distributional_median": round(dist_median, 2),
+                            "p_over_v12_gamma": alt_p_ov_v12_gamma,
+                            "p_over_distribution": dist_type,
+                            "edge_gamma": round(alt_edge_gamma, 4) if alt_edge_gamma is not None else None,
+                            "dist_direction_gamma": ("over" if (alt_p_ov_v12_gamma or alt_p_ov or 0) > 0.5 else "under")
+                                if alt_p_ov_v12_gamma is not None else None,
                             "alt_be_pct": alt_be,
                             "alt_vig_pct": alt_vig_pct,
                             "over_price": alt_over_price,
                             "under_price": alt_under_price,
                         })
+                        gaps[-1]["suppression_rule"] = _suppression_rule(gaps[-1])
 
     # Sort: main lines first, then near_alt, then deep_alt; within each tier by z-score desc
     _depth_order = {"main": 0, "near_alt": 1, "deep_alt": 2}
     gaps.sort(key=lambda x: (_depth_order.get(x.get("line_depth", "main"), 9), -x["z_score"]))
+
+    # Gamma failure tracking — attach to result for caller health check
+    if _gamma_attempts > 0:
+        _gamma_fail_rate = _gamma_failures / _gamma_attempts
+        if _gamma_failures > 0:
+            logger.warning("Gamma P(over) failures: %d/%d (%.1f%%)",
+                           _gamma_failures, _gamma_attempts, _gamma_fail_rate * 100)
+        # Stash on function for caller to read
+        find_prop_gaps._gamma_stats = {
+            "attempts": _gamma_attempts,
+            "failures": _gamma_failures,
+            "fail_rate": round(_gamma_fail_rate, 4),
+        }
+    else:
+        find_prop_gaps._gamma_stats = {"attempts": 0, "failures": 0, "fail_rate": 0.0}
+
     return gaps
 
 
@@ -1174,6 +1412,8 @@ def _ensure_tables():
             alt_be_pct REAL,                  -- BE from actual alt odds (wider vig)
             alt_vig_pct REAL,                 -- overround on this specific line
             var_deviation REAL,               -- player CV vs positional norm (>0 = boom/bust)
+            suppression_rule TEXT,            -- NULL = active pick; non-NULL = structural filter name
+            data_error TEXT,                  -- NULL = clean; non-NULL = contamination reason
             -- grading fields (filled after settlement)
             actual_value REAL,
             is_win INTEGER,                   -- 1=win, 0=loss, NULL=unsettled
@@ -1181,9 +1421,167 @@ def _ensure_tables():
             roi REAL,                         -- net of vig: (payout-1) if win, -1 if loss
             graded_at TEXT,
             created_at TEXT NOT NULL,
-            UNIQUE(season, week, player_name, stat_type, method, prop_line)
+            UNIQUE(season, week, player_name, stat_type, method, prop_line, line_depth)
         )
     """)
+
+    # ── Schema migrations (idempotent) ──
+    for col, coltype in [
+        ("game_id", "TEXT"),
+        ("model_version", "TEXT"),
+        ("devig_method", "TEXT"),
+        ("suppression_rule", "TEXT"),
+        ("data_error", "TEXT"),
+        ("team", "TEXT"),
+        ("opponent", "TEXT"),
+        ("consensus_median", "REAL"),
+        ("kickoff_utc", "TEXT"),
+        ("original_created_at", "TEXT"),
+        ("distributional_median", "REAL"),
+        ("p_over_v12_gamma", "REAL"),
+        ("p_over_distribution", "TEXT"),
+        ("edge_gamma", "REAL"),
+        ("dist_direction_gamma", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE fantasy_forward_preds ADD COLUMN {col} {coltype}")
+        except Exception:
+            pass  # column already exists
+
+    # ── UNIQUE key migration: add line_depth to key (idempotent) ──
+    # Old key: (season, week, player_name, stat_type, method, prop_line)
+    # New key: (season, week, player_name, stat_type, method, prop_line, line_depth)
+    # Check current key by inspecting the index.
+    idx_info = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='fantasy_forward_preds'"
+    ).fetchone()
+    needs_rekey = (idx_info and idx_info[0]
+                   and "UNIQUE(season, week, player_name, stat_type, method, prop_line)" in idx_info[0]
+                   and "line_depth)" not in idx_info[0])
+    if needs_rekey:
+        logger.info("[Migration] Rebuilding fantasy_forward_preds UNIQUE key to include line_depth")
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS _ffp_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    season INTEGER NOT NULL,
+                    week INTEGER NOT NULL,
+                    player_name TEXT NOT NULL,
+                    position TEXT,
+                    stat_type TEXT NOT NULL,
+                    stat_category TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    consensus_mean REAL,
+                    consensus_sd REAL,
+                    n_sources INTEGER,
+                    prop_line REAL NOT NULL,
+                    prop_over_price REAL,
+                    prop_under_price REAL,
+                    direction TEXT NOT NULL,
+                    p_over REAL,
+                    devigged_implied REAL,
+                    edge_vs_market REAL,
+                    z_score REAL,
+                    gap_reason TEXT,
+                    conviction_bucket TEXT,
+                    line_depth TEXT,
+                    alt_be_pct REAL,
+                    alt_vig_pct REAL,
+                    var_deviation REAL,
+                    suppression_rule TEXT,
+                    data_error TEXT,
+                    actual_value REAL,
+                    is_win INTEGER,
+                    is_push INTEGER,
+                    roi REAL,
+                    graded_at TEXT,
+                    created_at TEXT NOT NULL,
+                    game_id TEXT,
+                    model_version TEXT,
+                    devig_method TEXT,
+                    UNIQUE(season, week, player_name, stat_type, method, prop_line, line_depth)
+                );
+                INSERT OR IGNORE INTO _ffp_new
+                    SELECT id, season, week, player_name, position,
+                           stat_type, stat_category, method,
+                           consensus_mean, consensus_sd, n_sources,
+                           prop_line, prop_over_price, prop_under_price,
+                           direction, p_over, devigged_implied, edge_vs_market,
+                           z_score, gap_reason, conviction_bucket,
+                           line_depth, alt_be_pct, alt_vig_pct, var_deviation,
+                           suppression_rule, data_error,
+                           actual_value, is_win, is_push, roi, graded_at,
+                           created_at, game_id, model_version, devig_method
+                    FROM fantasy_forward_preds;
+                DROP TABLE fantasy_forward_preds;
+                ALTER TABLE _ffp_new RENAME TO fantasy_forward_preds;
+            """)
+            logger.info("[Migration] UNIQUE key migration complete")
+        except Exception as exc:
+            logger.error("[Migration] UNIQUE key migration failed: %s", exc)
+
+    # NFL player alias table — maps variant names across sources
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS nfl_player_alias (
+            alias_name     TEXT NOT NULL,
+            canonical_name TEXT NOT NULL,
+            source         TEXT DEFAULT 'manual',
+            PRIMARY KEY (alias_name)
+        )
+    """)
+
+    # Seed known mismatches between Odds API and Sleeper/ESPN names.
+    # Periods (A.J. vs AJ) and suffixes (Jr., III) are now handled by
+    # _normalize_player_name, so only TRUE name-variant aliases go here.
+    # (alias_name, canonical_name) — alias is the Odds API or one source's
+    # variant, canonical is the other source's name.
+    _NFL_SEED_ALIASES = [
+        # First-name abbreviations / nicknames
+        ("Gabe Davis", "Gabriel Davis"),
+        ("Josh Palmer", "Joshua Palmer"),
+        ("Matt Hibner", "Matthew Hibner"),
+        # Nickname → full name
+        ("Chig Okonkwo", "Chigoziem Okonkwo"),
+        ("Scotty Miller", "Scott Miller"),
+        ("Mike Evans", "Michael Evans"),
+    ]
+    for alias, canonical in _NFL_SEED_ALIASES:
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO nfl_player_alias (alias_name, canonical_name, source) "
+                "VALUES (?, ?, 'seed')", (alias, canonical))
+        except Exception:
+            pass
+
+    # Append-only snapshot table — captures consensus state at each refresh window
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fantasy_forward_preds_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_ts TEXT NOT NULL,
+            snapshot_label TEXT,
+            season INTEGER NOT NULL,
+            week INTEGER NOT NULL,
+            player_name TEXT NOT NULL,
+            position TEXT,
+            team TEXT,
+            stat_type TEXT NOT NULL,
+            consensus_mean REAL,
+            consensus_median REAL,
+            consensus_sd REAL,
+            n_sources INTEGER,
+            prop_line REAL NOT NULL,
+            p_over REAL,
+            devigged_implied REAL,
+            line_depth TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ffps_week ON fantasy_forward_preds_snapshots(season, week)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ffps_ts ON fantasy_forward_preds_snapshots(snapshot_ts)")
+    except Exception:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -1295,18 +1693,24 @@ def _conviction_bucket(edge_pp: float) -> str:
     return "high"
 
 
-def store_forward_predictions(season: int, week: int, gaps: list[dict]):
+def store_forward_predictions(season: int, week: int, gaps: list[dict],
+                              game_schedule: dict | None = None):
     """
     Store forward predictions from pipeline gaps for later grading.
 
     For yardage stats: stores distributional method (primary).
     For count stats: stores BOTH distributional AND mean_direction methods.
     Alt lines: stored with line_depth, alt_be_pct, alt_vig_pct.
+
+    Per-game freeze: if game_schedule is provided, rows for games whose
+    kickoff_utc < now are skipped (never overwrite pre-kickoff predictions
+    for games already in progress).
     """
     _ensure_tables()
     conn = sqlite3.connect(os.path.abspath(_HIST_DB))
     now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     inserted = 0
+    skipped_kickoff = 0
 
     for g in gaps:
         stat = g["stat"]
@@ -1320,29 +1724,52 @@ def store_forward_predictions(season: int, week: int, gaps: list[dict]):
         dist_direction = "over" if (p_ov or 0) > 0.5 else "under"
         conv = _conviction_bucket(edge)
 
-        # ── Structural suppression filters ──
-        # These segments are proven structural losers (vig > edge).
-        # Suppress from forward predictions to avoid polluting the signal.
-        pos = g.get("position", "")
-        suppress = False
+        # Gamma decision-layer columns (separate from frozen lognormal columns)
+        edge_gamma = g.get("edge_gamma")
+        dist_direction_gamma = g.get("dist_direction_gamma")
 
-        # 1. near-alt and deep-alt OVER: -18 to -26% ROI, structural vig
-        if line_depth in ("near_alt", "deep_alt") and dist_direction == "over":
-            suppress = True
+        # Team/opponent/game_id from gap data + schedule lookup
+        team = g.get("team") or None
+        game_id = g.get("game_id")
+        kickoff_utc = g.get("kickoff_utc")
+        opponent = g.get("opponent")
 
-        # 2. rush OVER RB on main line: gate to high-conviction only
-        #    (consensus overestimates RB rushing +8.5 yds, 45% WR overall)
-        if (line_depth == "main" and stat == "rush_yds"
-                and dist_direction == "over" and pos == "RB"
-                and conv != "high"):
-            suppress = True
+        # Enrich from game_schedule if not already set
+        if team and game_schedule and team in game_schedule:
+            sched = game_schedule[team]
+            if not game_id:
+                game_id = sched.get("game_id")
+            if not kickoff_utc:
+                kickoff_utc = sched.get("kickoff_utc")
 
-        # 3. deep-alt UNDER for rec/pass: -3.4 to -3.7% ROI, vig eats edge
-        if line_depth == "deep_alt" and dist_direction == "under" and stat in ("rec_yds", "pass_yds"):
-            suppress = True
+        # Derive opponent from game_id if still missing
+        if not opponent and game_id and team:
+            parts = game_id.split("_")
+            if len(parts) >= 4:
+                away, home = parts[2], parts[3]
+                # Reverse-alias nfl_games abbreviation to FFP style
+                away_ffp = _TEAM_ALIAS_REV.get(away, away)
+                home_ffp = _TEAM_ALIAS_REV.get(home, home)
+                opponent = home_ffp if team == away_ffp else away_ffp
 
-        if suppress:
+        # ── Per-game freeze: skip games already kicked off ──
+        if kickoff_utc and now > kickoff_utc:
+            skipped_kickoff += 1
             continue
+
+        consensus_median = g.get("consensus_median")
+        distributional_median = g.get("distributional_median")
+
+        sup_rule = g.get("suppression_rule")
+
+        # Preserve original_created_at: if row already exists, keep its created_at
+        existing_created = conn.execute("""
+            SELECT created_at FROM fantasy_forward_preds
+            WHERE season=? AND week=? AND player_name=? AND stat_type=?
+              AND method=? AND prop_line=? AND line_depth=?
+        """, (season, week, g["player"], stat, "distributional",
+              g["prop_line"], line_depth)).fetchone()
+        original_created = existing_created[0] if existing_created else now
 
         try:
             conn.execute("""
@@ -1352,8 +1779,13 @@ def store_forward_predictions(season: int, week: int, gaps: list[dict]):
                  prop_line, prop_over_price, prop_under_price,
                  direction, p_over, devigged_implied, edge_vs_market,
                  z_score, gap_reason, conviction_bucket,
-                 line_depth, alt_be_pct, alt_vig_pct, var_deviation, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 line_depth, alt_be_pct, alt_vig_pct, var_deviation,
+                 suppression_rule, team, opponent, consensus_median,
+                 game_id, kickoff_utc, original_created_at, distributional_median,
+                 p_over_v12_gamma, p_over_distribution, model_version,
+                 edge_gamma, dist_direction_gamma,
+                 created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (season, week, g["player"], g["position"], stat, stat_cat,
                   "distributional", g["consensus_mean"], g["consensus_sd"],
                   g["n_sources"], g["prop_line"],
@@ -1361,7 +1793,12 @@ def store_forward_predictions(season: int, week: int, gaps: list[dict]):
                   dist_direction, p_ov, devigged, edge,
                   g.get("z_score"), g.get("gap_reason"), conv,
                   line_depth, g.get("alt_be_pct"), g.get("alt_vig_pct"),
-                  g.get("var_deviation"), now))
+                  g.get("var_deviation"), sup_rule, team, opponent, consensus_median,
+                  game_id, kickoff_utc, original_created, distributional_median,
+                  g.get("p_over_v12_gamma"), g.get("p_over_distribution"),
+                  "v1.2_shifted_gamma",
+                  edge_gamma, dist_direction_gamma,
+                  now))
             inserted += 1
         except Exception as exc:
             logger.warning("[Forward] Failed to store dist pred %s/%s/%.1f: %s",
@@ -1370,6 +1807,15 @@ def store_forward_predictions(season: int, week: int, gaps: list[dict]):
         # For count stats on MAIN lines, ALSO store mean-direction prediction
         if stat_cat == "count" and line_depth == "main":
             mean_dir = g["direction"]
+            # Check existing created_at for mean_direction row
+            existing_md = conn.execute("""
+                SELECT created_at FROM fantasy_forward_preds
+                WHERE season=? AND week=? AND player_name=? AND stat_type=?
+                  AND method=? AND prop_line=? AND line_depth=?
+            """, (season, week, g["player"], stat, "mean_direction",
+                  g["prop_line"], "main")).fetchone()
+            original_md = existing_md[0] if existing_md else now
+
             try:
                 conn.execute("""
                     INSERT OR REPLACE INTO fantasy_forward_preds
@@ -1378,15 +1824,26 @@ def store_forward_predictions(season: int, week: int, gaps: list[dict]):
                      prop_line, prop_over_price, prop_under_price,
                      direction, p_over, devigged_implied, edge_vs_market,
                      z_score, gap_reason, conviction_bucket,
-                     line_depth, alt_be_pct, alt_vig_pct, var_deviation, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     line_depth, alt_be_pct, alt_vig_pct, var_deviation,
+                     suppression_rule, team, opponent, consensus_median,
+                     game_id, kickoff_utc, original_created_at, distributional_median,
+                     p_over_v12_gamma, p_over_distribution, model_version,
+                     edge_gamma, dist_direction_gamma,
+                     created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (season, week, g["player"], g["position"], stat, stat_cat,
                       "mean_direction", g["consensus_mean"], g["consensus_sd"],
                       g["n_sources"], g["prop_line"],
                       g.get("over_price"), g.get("under_price"),
                       mean_dir, p_ov, devigged, edge,
                       g.get("z_score"), g.get("gap_reason"), conv,
-                      "main", None, None, g.get("var_deviation"), now))
+                      "main", None, None, g.get("var_deviation"),
+                      sup_rule, team, opponent, consensus_median,
+                      game_id, kickoff_utc, original_md, distributional_median,
+                      g.get("p_over_v12_gamma"), g.get("p_over_distribution"),
+                      "v1.2_shifted_gamma",
+                      edge_gamma, dist_direction_gamma,
+                      now))
                 inserted += 1
             except Exception as exc:
                 logger.warning("[Forward] Failed to store mean pred %s/%s: %s",
@@ -1394,7 +1851,52 @@ def store_forward_predictions(season: int, week: int, gaps: list[dict]):
 
     conn.commit()
     conn.close()
+    if skipped_kickoff:
+        logger.info("[Forward] Skipped %d predictions for games already kicked off",
+                    skipped_kickoff)
     logger.info("[Forward] Stored %d predictions for %d week %d", inserted, season, week)
+    return inserted
+
+
+def store_snapshot(season: int, week: int, label: str | None = None):
+    """
+    Append current fantasy_forward_preds state to the snapshots table.
+
+    Called after each consensus refresh (store_forward_predictions).
+    Append-only: every call creates new rows — no REPLACE.
+    Grading uses the last snapshot with snapshot_ts < kickoff_utc per game
+    (see grade_forward_predictions).
+    """
+    _ensure_tables()
+    conn = sqlite3.connect(os.path.abspath(_HIST_DB))
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    rows = conn.execute("""
+        SELECT player_name, position, team, stat_type,
+               consensus_mean, consensus_median, consensus_sd, n_sources,
+               prop_line, p_over, devigged_implied, line_depth
+        FROM fantasy_forward_preds
+        WHERE season = ? AND week = ? AND actual_value IS NULL
+    """, (season, week)).fetchall()
+
+    inserted = 0
+    for r in rows:
+        conn.execute("""
+            INSERT INTO fantasy_forward_preds_snapshots
+            (snapshot_ts, snapshot_label, season, week,
+             player_name, position, team, stat_type,
+             consensus_mean, consensus_median, consensus_sd, n_sources,
+             prop_line, p_over, devigged_implied, line_depth, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (now, label, season, week,
+              r[0], r[1], r[2], r[3],
+              r[4], r[5], r[6], r[7],
+              r[8], r[9], r[10], r[11], now))
+        inserted += 1
+
+    conn.commit()
+    conn.close()
+    logger.info("[Snapshot] Stored %d rows for %d W%d label=%s", inserted, season, week, label)
     return inserted
 
 
@@ -1423,10 +1925,42 @@ def grade_forward_predictions(season: int, week: int) -> dict:
         SELECT id, player_name, stat_type, stat_category, method,
                prop_line, prop_over_price, prop_under_price,
                direction, p_over, devigged_implied, edge_vs_market,
-               gap_reason, conviction_bucket, line_depth, var_deviation
+               gap_reason, conviction_bucket, line_depth, var_deviation,
+               kickoff_utc, created_at, consensus_mean
         FROM fantasy_forward_preds
         WHERE season = ? AND week = ? AND is_win IS NULL
     """, (season, week)).fetchall()
+
+    # ── Snapshot-based consensus resolution ──
+    # For rows where created_at > kickoff_utc (post-kickoff refresh overwrote),
+    # restore consensus values from the last pre-kickoff snapshot.
+    snapshot_restored = 0
+    for pred in preds:
+        ko = pred["kickoff_utc"]
+        ca = pred["created_at"]
+        if not ko or not ca or ca <= ko:
+            continue
+        # Main table was written after kickoff — find last pre-kickoff snapshot
+        snap = conn.execute("""
+            SELECT consensus_mean, consensus_sd, p_over, devigged_implied
+            FROM fantasy_forward_preds_snapshots
+            WHERE season = ? AND week = ? AND player_name = ?
+              AND stat_type = ? AND prop_line = ? AND line_depth = ?
+              AND snapshot_ts < ?
+            ORDER BY snapshot_ts DESC LIMIT 1
+        """, (season, week, pred["player_name"], pred["stat_type"],
+              pred["prop_line"], pred["line_depth"], ko)).fetchone()
+        if snap:
+            conn.execute("""
+                UPDATE fantasy_forward_preds
+                SET consensus_mean = ?, consensus_sd = ?,
+                    p_over = ?, devigged_implied = ?
+                WHERE id = ?
+            """, (snap[0], snap[1], snap[2], snap[3], pred["id"]))
+            snapshot_restored += 1
+    if snapshot_restored:
+        conn.commit()
+        logger.info("[Grade] Restored %d rows from pre-kickoff snapshots", snapshot_restored)
 
     if not preds:
         conn.close()
@@ -1606,6 +2140,7 @@ def forward_report(season: int, weeks: list[int] | None = None) -> dict:
                season, week
         FROM fantasy_forward_preds
         WHERE season = ? AND is_win IS NOT NULL
+          AND data_error IS NULL
     """
     params: list = [season]
 
@@ -1836,12 +2371,14 @@ def forward_report(season: int, weeks: list[int] | None = None) -> dict:
 # Distribution choices by stat type:
 #   - TDs (pass_tds, rush_tds, rec_tds):  NegBin (overdispersed counts)
 #   - Receptions:                         NegBin (overdispersed counts)
-#   - Yardage (pass_yds, rush_yds, rec_yds): Lognormal (positive, right-skewed)
+#   - Yardage (pass_yds, rush_yds, rec_yds): Lognormal for P(over) (FROZEN),
+#     shifted gamma for distributional median (v1.2).
 #
-# Variance estimation: per-player from game logs with shrinkage toward
-# position/usage-tier averages when individual N is small.
+# P(over) is frozen as lognormal for the prereg (through W14, ~2026-12-05).
+# distributional_median uses shifted gamma ppf(0.5) from nfl_interim_dispersion.
+# See CLAUDE.md "NFL Prereg Freeze" and OPEN_ITEMS.md entry 2026-11-08a.
 
-# Stat type → distribution family
+# Stat type → distribution family for P(over) (frozen as lognormal for yardage)
 _STAT_DISTRIBUTION = {
     "pass_yds":   "lognormal",
     "rush_yds":   "lognormal",
@@ -1849,6 +2386,9 @@ _STAT_DISTRIBUTION = {
     "pass_tds":   "negbin",
     "receptions": "negbin",
 }
+
+# Yardage stats that get shifted gamma median (v1.2)
+_YARDAGE_STATS_GAMMA_MEDIAN = {"pass_yds", "rush_yds", "rec_yds"}
 
 # Minimum games for per-player variance (below this, shrink heavily)
 _MIN_GAMES_INDIVIDUAL = 4
@@ -1992,6 +2532,47 @@ def p_over_line(line: float, mean: float, dist_params: dict,
             return float(1.0 - sp_stats.nbinom.cdf(k, n=r, p=p))
 
     return 0.5  # fallback
+
+
+def _distributional_median(mean: float, dist_params: dict, dist_type: str) -> float:
+    """
+    Compute the 50th percentile (median) of the fitted distribution.
+
+    shifted_gamma: scipy gamma.ppf(0.5) with shape/scale from gamma_params_shifted.
+    negbin: scipy ppf(0.5).
+    lognormal: fallback (legacy, not used by v1.2).
+    """
+    from scipy import stats as sp_stats
+    from math import log, exp
+
+    if dist_type == "shifted_gamma":
+        # v1.2: gamma with scale calibrated to base-rate P(over)
+        shape = dist_params.get("gamma_shape")
+        scale = dist_params.get("gamma_scale")
+        if shape and scale and shape > 0 and scale > 0:
+            return float(sp_stats.gamma.ppf(0.5, a=shape, scale=scale))
+        # Fallback: mean-parameterized gamma
+        cv = dist_params.get("cv", 0.5)
+        from nfl_interim_dispersion import gamma_params
+        sh, sc = gamma_params(mean, cv)
+        return float(sp_stats.gamma.ppf(0.5, a=sh, scale=sc))
+
+    elif dist_type == "lognormal":
+        # Legacy fallback — not used by v1.2 pipeline
+        sigma = dist_params["sigma"]
+        sigma_sq = sigma ** 2
+        mu_adj = log(max(mean, 0.1)) - sigma_sq / 2
+        return float(exp(mu_adj))
+
+    elif dist_type == "negbin":
+        r = dist_params["r"]
+        mu = max(mean, 0.01)
+        if r >= 500:
+            return float(sp_stats.poisson.ppf(0.5, mu=mu))
+        p = r / (r + mu)
+        return float(sp_stats.nbinom.ppf(0.5, n=r, p=p))
+
+    return float(mean)  # fallback
 
 
 def _devig_implied_prob(over_price: float | None, under_price: float | None) -> float | None:
@@ -2452,19 +3033,41 @@ def run_weekly_pipeline(season: int | None = None, week: int | None = None,
             if abs(bias) >= 1.0:
                 print(f"    {stat} {bpos}: {bias:+.1f}")
 
-    gaps = find_prop_gaps(consensus, prop_lines, player_baselines=baselines,
-                          player_variances=player_vars,
-                          tendency_adjustments=tendency_adj,
-                          segment_biases=segment_biases,
-                          min_edge_pp=0.05)
-    if gaps:
-        store_consensus(season, week, gaps)
-        # Store forward predictions for later grading
-        n_fwd = store_forward_predictions(season, week, gaps)
-        print(f"  [Forward] Stored {n_fwd} predictions for grading")
+    # Build game schedule for kickoff freeze + game_id enrichment
+    nfl_season = season  # FFP season matches NFL season (both 2026)
+    game_sched = _build_game_schedule(nfl_season, week)
+    if game_sched:
+        print(f"  [Schedule] {len(game_sched)} teams with kickoff times")
+
+    # Run UNFILTERED first: store v1.2 predictions for ALL matched players
+    # (Lab needs every player with a prop+consensus, regardless of edge size)
+    all_gaps = find_prop_gaps(consensus, prop_lines, min_abs_gap=0.0,
+                              player_baselines=baselines,
+                              player_variances=player_vars,
+                              tendency_adjustments=tendency_adj,
+                              segment_biases=segment_biases,
+                              min_edge_pp=0.0)
+    if all_gaps:
+        store_consensus(season, week, all_gaps)
+        # Store forward predictions — per-game freeze skips kicked-off games
+        n_fwd = store_forward_predictions(season, week, all_gaps,
+                                          game_schedule=game_sched)
+        print(f"  [Forward] Stored {n_fwd} predictions "
+              f"({len(set(g['player'] for g in all_gaps))} players)")
+        # Capture timestamped snapshot for consensus drift tracking
+        n_snap = store_snapshot(season, week, label="pipeline")
+        print(f"  [Snapshot] {n_snap} rows captured")
+
+    # Filtered view: only actionable gaps (for display / ranking).
+    # Suppression filter applied HERE (pick layer), not in grading/calibration.
+    gaps = [g for g in all_gaps
+            if g["abs_gap"] >= 1.0
+            and (g.get("edge_vs_market") is None
+                 or abs(g["edge_vs_market"]) >= 0.05)
+            and g.get("suppression_rule") is None]
 
     # 4. Format summary
-    n_matched = len(set(g["player"] for g in gaps))
+    n_matched = len(set(g["player"] for g in all_gaps))
     n_tight = len([g for g in gaps if g["n_sources"] >= 2 and g["consensus_sd"] > 0])
 
     print(f"\n  === RESULTS: {len(gaps)} gaps found ({n_matched} players matched to props) ===")

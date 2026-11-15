@@ -371,6 +371,20 @@ def pull_closing_odds(games: dict[str, dict],
                 status = resp.status
                 remaining = resp.headers.get("x-requests-remaining")
                 used = resp.headers.get("x-requests-used")
+                used_last = resp.headers.get("x-requests-last")
+
+            # Log credits to historical.db credits_log table
+            # Use x-requests-last (per-request cost) to match creator_tier._get() pattern
+            remaining_int = int(remaining) if remaining and str(remaining).isdigit() else None
+            used_last_int = int(used_last) if used_last and str(used_last).isdigit() else None
+            try:
+                from creator_tier import _log_credits
+                _log_credits(
+                    f"/v4/historical/sports/baseball_mlb/events/{fid}/odds",
+                    used_last_int, remaining_int,
+                )
+            except Exception:
+                pass  # fire-and-forget — never block backfill
 
             # Parse the response
             game_odds = _parse_closing_response(data)

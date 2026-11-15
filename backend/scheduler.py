@@ -12,12 +12,16 @@ The scheduler is also started automatically when FastAPI starts
 (via startup hook in main.py) in daemon mode.
 """
 from __future__ import annotations
+import logging
 import os
 import time
+import traceback
 import threading
 import argparse
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 from database import SessionLocal, init_db, DB_WRITE_LOCK
 from auto_settle import run_auto_settle, RETRAIN_STATE, check_retrain_status
@@ -238,11 +242,11 @@ def _run_cycle(auto_retrain: bool = True) -> dict:
                         from auto_settle import run_auto_settle as _ras
                         _ras(db, days_back=1, auto_retrain=True)
                     except Exception as _ras_exc:
-                        print(f"[Scheduler] auto_settle failed silently: {_ras_exc}")
+                        logger.error("[Scheduler] auto_settle failed: %s\n%s", _ras_exc, traceback.format_exc())
             result["live_bets_checked"]  = len(live_results)
             result["live_bets_settled"]  = len(settled_now)
         except Exception as exc:
-            print(f"[LiveMonitor] Error in live bet resolution: {exc}")
+            logger.error("[LiveMonitor] Error in live bet resolution: %s\n%s", exc, traceback.format_exc())
             result["live_monitor_error"] = str(exc)
 
         return result
@@ -271,6 +275,7 @@ def _run_nightly_odds_update() -> dict:
                   f"missing={missing} date={result.get('date', '?')}")
             results[sport] = result
         except Exception as exc:
+            logger.error("[Scheduler] Nightly %s odds error: %s\n%s", sport, exc, traceback.format_exc())
             print(f"[Scheduler] Nightly {sport} odds error: {exc}")
             results[sport] = {"error": str(exc)}
     return results
@@ -305,6 +310,7 @@ def _run_nightly_ats_update() -> dict:
               f"updated={result.get('updated', 0)}")
         return result
     except Exception as exc:
+        logger.error("[Scheduler] Nightly ATS update error: %s\n%s", exc, traceback.format_exc())
         print(f"[Scheduler] Nightly ATS update error: {exc}")
         return {"date": yesterday, "error": str(exc)}
 
@@ -337,9 +343,10 @@ def _run_nightly_mlb_update() -> dict:
             pi_result = backfill_pi_ratings("MLB", "2026-03-27")
             print(f"[Scheduler] Pi ratings updated: {pi_result.get('games_processed', 0)} games")
         except Exception as _pi_exc:
-            print(f"[Scheduler] Pi rating update warning: {_pi_exc}")
+            logger.warning("[Scheduler] Pi rating update warning: %s\n%s", _pi_exc, traceback.format_exc())
         return result
     except Exception as exc:
+        logger.error("[Scheduler] Nightly MLB update error: %s\n%s", exc, traceback.format_exc())
         print(f"[Scheduler] Nightly MLB update error: {exc}")
         return {"date": yesterday, "error": str(exc)}
 
@@ -384,6 +391,7 @@ def _run_nightly_nhl_update() -> dict:
               f"fetched={result.get('fetched', 0)}  updated={result.get('updated', 0)}")
         return result
     except Exception as exc:
+        logger.error("[Scheduler] Nightly NHL update error: %s\n%s", exc, traceback.format_exc())
         print(f"[Scheduler] Nightly NHL update error: {exc}")
         return {"date": yesterday, "error": str(exc)}
 
@@ -651,8 +659,8 @@ def _should_run_weekly_retrain(now: datetime) -> bool:
             # Sync in-memory to prevent repeated disk reads
             _scheduler_state["last_weekly_retrain"] = today_str
             return False
-    except Exception:
-        pass
+    except Exception as _e:
+        logger.debug("[Scheduler] Weekly retrain state check: %s", _e)
     return True
 
 
@@ -686,11 +694,11 @@ def _should_run_monthly_negbin_retrain() -> bool:
                 print(f"[Scheduler] Restart detected — negbin_retrain already ran for {month_str}")
                 _con.close()
                 return False
-        except Exception:
-            pass  # table may not exist yet
+        except Exception as _e:
+            logger.debug("[Scheduler] negbin_retrain_log check (table may not exist): %s", _e)
         _con.close()
-    except Exception:
-        pass
+    except Exception as _e:
+        logger.debug("[Scheduler] negbin retrain state DB check: %s", _e)
     return True
 
 
@@ -1008,6 +1016,11 @@ def _run_daily_scout() -> dict:
         total   = result.get("total_props", 0)
         by_sport = result.get("by_sport", {})
         print(f"[Scheduler] Scout run complete: {total} props — {by_sport}")
+        try:
+            from pipeline_health import record_run as _rec_ph
+            _rec_ph("nfl_scout", rows_written=total)
+        except Exception:
+            pass
 
         # Backfill scout grades on legs that were generated before scout data existed
         try:
@@ -1033,6 +1046,11 @@ def _run_daily_scout() -> dict:
         return result
     except Exception as exc:
         _notify("BetIQ Scout", f"Scout run FAILED: {exc}")
+        try:
+            from pipeline_health import record_run as _rec_ph
+            _rec_ph("nfl_scout", errors=1, error_details=str(exc))
+        except Exception:
+            pass
         return {"error": str(exc)}
 
 
@@ -1079,6 +1097,11 @@ def _run_injury_refresh() -> dict:
             db.close()
         total = sum(result.get("records_saved", {}).values())
         print(f"[Scheduler] Injury refresh: {total} records saved for {result.get('game_date')}")
+        try:
+            from pipeline_health import record_run as _rec_ph
+            _rec_ph("injury_watcher", rows_written=total)
+        except Exception:
+            pass
         # NBA forward log: fetch official PDF report and log snapshot
         try:
             _log_nba_injury_forward()
@@ -1086,7 +1109,12 @@ def _run_injury_refresh() -> dict:
             print(f"[Scheduler] NBA injury forward-log error (non-fatal): {_nba_exc}")
         return result
     except Exception as exc:
-        print(f"[Scheduler] Injury refresh error: {exc}")
+        logger.error("[Scheduler] Injury refresh error: %s\n%s", exc, traceback.format_exc())
+        try:
+            from pipeline_health import record_run as _rec_ph
+            _rec_ph("injury_watcher", errors=1, error_details=str(exc))
+        except Exception:
+            pass
         return {"error": str(exc)}
 
 
@@ -1405,10 +1433,20 @@ def _run_daily_mock_generate() -> dict:
         finally:
             db.close()
         print(f"[Scheduler] Mock generate: generated={result.get('generated', 0)}")
+        try:
+            from pipeline_health import record_run as _rec_ph
+            _rec_ph("mock_bet_generate", rows_written=result.get("generated", 0))
+        except Exception:
+            pass
         result.update(picks_result)
         return result
     except Exception as exc:
-        print(f"[Scheduler] Mock generate error: {exc}")
+        logger.error("[Scheduler] Mock generate error: %s\n%s", exc, traceback.format_exc())
+        try:
+            from pipeline_health import record_run as _rec_ph
+            _rec_ph("mock_bet_generate", errors=1, error_details=str(exc))
+        except Exception:
+            pass
         return {"error": str(exc), **picks_result}
 
 
@@ -1474,7 +1512,13 @@ def _run_daily_mock_settle() -> dict:
             result = mb.settle_mock_bets(db)
         finally:
             db.close()
-        print(f"[Scheduler] Mock settle: settled={result.get('settled', 0)}")
+        _settled_n = result.get("settled", 0)
+        print(f"[Scheduler] Mock settle: settled={_settled_n}")
+        try:
+            from pipeline_health import record_run as _rec_ph
+            _rec_ph("mock_bet_settle", rows_written=_settled_n)
+        except Exception:
+            pass
         # Record settle timestamp BEFORE regime update so a regime failure
         # never prevents the watchdog from seeing settlement as recent.
         _scheduler_state["settle_last_ran_ct"] = _now_ct()
@@ -1526,7 +1570,12 @@ def _run_daily_mock_settle() -> dict:
             print(f"[Scheduler] NBA injury settle error (non-fatal): {_nis}")
         return result
     except Exception as exc:
-        print(f"[Scheduler] Mock settle error: {exc}")
+        logger.error("[Scheduler] Mock settle error: %s\n%s", exc, traceback.format_exc())
+        try:
+            from pipeline_health import record_run as _rec_ph
+            _rec_ph("mock_bet_settle", errors=1, error_details=str(exc))
+        except Exception:
+            pass
         return {"error": str(exc)}
 
 
@@ -3851,22 +3900,34 @@ def _run_db_maintenance() -> dict:
             # (confirmed root cause of recurring bets.db corruption Oct 2026).
             # PASSIVE is always safe — it checkpoints whatever it can without
             # blocking readers. If WAL grows large, it's harmless.
-            try:
-                wal_result = con.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
-                wal_pages = wal_result[1] if wal_result else 0
-                checkpointed = wal_result[2] if wal_result else 0
-                remaining = wal_pages - checkpointed if wal_pages and checkpointed else 0
-                result["wal_passive"] = {"total": wal_pages, "checkpointed": checkpointed}
-                if remaining > 100:
-                    print(f"[DB-Maintenance] WAL: PASSIVE left {remaining} pages "
-                          f"(will checkpoint on next cycle, NOT escalating)")
-                else:
-                    print(f"[DB-Maintenance] bets.db WAL checkpoint: ok "
-                          f"({checkpointed}/{wal_pages} pages)")
-            except Exception as wal_exc:
-                result["wal_error"] = str(wal_exc)
-                print(f"[DB-Maintenance] ALERT: bets.db WAL checkpoint "
-                      f"failed: {wal_exc}")
+            # Retry WAL checkpoint with backoff on lock errors
+            _wal_ok = False
+            for _wal_attempt in range(3):
+                try:
+                    wal_result = con.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                    wal_pages = wal_result[1] if wal_result else 0
+                    checkpointed = wal_result[2] if wal_result else 0
+                    remaining = wal_pages - checkpointed if wal_pages and checkpointed else 0
+                    result["wal_passive"] = {"total": wal_pages, "checkpointed": checkpointed}
+                    if remaining > 100:
+                        print(f"[DB-Maintenance] WAL: PASSIVE left {remaining} pages "
+                              f"(will checkpoint on next cycle, NOT escalating)")
+                    else:
+                        print(f"[DB-Maintenance] bets.db WAL checkpoint: ok "
+                              f"({checkpointed}/{wal_pages} pages)")
+                    _wal_ok = True
+                    break
+                except Exception as wal_exc:
+                    if _wal_attempt < 2 and "locked" in str(wal_exc).lower():
+                        _backoff = 2 ** (_wal_attempt + 1)  # 2s, 4s
+                        print(f"[DB-Maintenance] WAL checkpoint locked, "
+                              f"retry {_wal_attempt + 1}/3 in {_backoff}s")
+                        time.sleep(_backoff)
+                    else:
+                        result["wal_warning"] = str(wal_exc)
+                        print(f"[DB-Maintenance] WAL checkpoint failed "
+                              f"(non-fatal): {wal_exc}")
+                        break
 
             con.commit()
             con.close()
@@ -4099,6 +4160,51 @@ def _run_prop_health_check() -> dict:
     except Exception as exc:
         result["error"] = str(exc)
         print(f"[PropHealth] ERROR: {exc}")
+    return result
+
+
+def _run_nfl_lab_coverage_check() -> dict:
+    """Daily QA: compare Lab coverage vs posted prop lines per game×market.
+
+    Alerts when any game×market drops below 95% coverage.
+    Runs after NFL prop pipeline completes.
+    """
+    result = {"status": "ok", "alerts": []}
+    try:
+        import lab_props as lp
+        lab = lp.build_lab_props(include_weather=False)
+        coverage = lab.get("coverage", {})
+        per_gm = coverage.get("per_game_market", [])
+
+        n_below = 0
+        for entry in per_gm:
+            if entry["coverage_pct"] < 0.95:
+                n_below += 1
+                result["alerts"].append(
+                    f"{entry['game_id']} {entry['stat_type']}: "
+                    f"{entry['coverage_pct']:.0%} ({entry['n_covered']}/{entry['n_posted']})")
+
+        result["n_games"] = coverage.get("n_games", 0)
+        result["n_displayed"] = coverage.get("n_players_displayed", 0)
+        result["n_no_projection"] = coverage.get("n_no_projection_players", 0)
+        result["n_below_threshold"] = n_below
+
+        if n_below > 0:
+            _notify("BetIQ NFL Lab Coverage",
+                    f"{n_below} game×market(s) below 95% coverage")
+            result["status"] = "alert"
+            print(f"[LabCoverage] ALERT: {n_below} cells below 95%")
+        else:
+            print(f"[LabCoverage] OK: {coverage.get('n_players_displayed', 0)} players, "
+                  f"all game×market cells ≥95%")
+
+        # Log QA issues from Lab
+        qa = lab.get("qa_issues", [])
+        if qa:
+            result["qa_issues"] = len(qa)
+    except Exception as exc:
+        result["error"] = str(exc)
+        print(f"[LabCoverage] ERROR: {exc}")
     return result
 
 
@@ -4829,21 +4935,48 @@ def _loop(interval_mins: int, auto_retrain: bool):
                 _scheduler_state[state_key]             = now_utc.isoformat() if store_ts else today_ct
                 _scheduler_state[state_key + "_result"] = result
             except Exception as _exc:
+                logger.error("[Scheduler] ERROR in %s: %s\n%s", name, _exc, traceback.format_exc())
                 print(f"[Scheduler] ERROR in {name}: {_exc}")
                 _scheduler_state[state_key + "_result"] = {"error": str(_exc)}
 
         _dispatch("nightly_odds",        _should_run_nightly_odds,          _run_nightly_odds_update,       "last_odds_update")
         _dispatch("nightly_ats",         _should_run_nightly_ats,           _run_nightly_ats_update,        "last_ats_update")
 
+        # Record nightly maintenance health — aggregate errors from nightly jobs
+        try:
+            _nm_results = {k: _scheduler_state.get(f"last_{k}_result", {})
+                           for k in ("odds_update", "ats_update")}
+            _nm_errors = sum(1 for r in _nm_results.values() if isinstance(r, dict) and "error" in r)
+            _nm_details = "; ".join(f"{k}: {r['error']}" for k, r in _nm_results.items()
+                                    if isinstance(r, dict) and "error" in r) or None
+            if any(_scheduler_state.get(f"last_{k}") == today_ct
+                   for k in ("odds_update", "ats_update")):
+                from pipeline_health import record_run as _rec_nm
+                _rec_nm("nightly_maintenance", rows_written=1 if _nm_errors == 0 else 0,
+                        errors=_nm_errors, error_details=_nm_details)
+        except Exception:
+            pass
+
         # S5-2: Grade NBA forward preds after game logs are updated
         try:
             if _scheduler_state.get("last_ats_update") == today_ct:
                 from scout.runner import grade_nba_forward_preds
                 _grade = grade_nba_forward_preds()
-                if _grade.get("graded", 0) > 0:
+                _nba_graded = _grade.get("graded", 0)
+                if _nba_graded > 0:
                     print(f"[Scheduler] S5-2 grading: {_grade}")
+                try:
+                    from pipeline_health import record_run as _rec_ph
+                    _rec_ph("nba_grading", rows_written=_nba_graded)
+                except Exception:
+                    pass
         except Exception as _exc:
             _notify("BetIQ S5-2", f"Grading error: {_exc}", sound="Basso")
+            try:
+                from pipeline_health import record_run as _rec_ph
+                _rec_ph("nba_grading", errors=1, error_details=str(_exc))
+            except Exception:
+                pass
 
         _dispatch("nightly_mlb",         _should_run_nightly_mlb,           _run_nightly_mlb_update,        "last_mlb_update")
         _dispatch("nightly_nhl",         _should_run_nightly_nhl,           _run_nightly_nhl_update,        "last_nhl_update")
@@ -5007,11 +5140,22 @@ def _loop(interval_mins: int, auto_retrain: bool):
             if _should_run_pretip_props():
                 from scout.runner import run_pretip_nba_forward_preds
                 _fp_result = run_pretip_nba_forward_preds()
-                if _fp_result.get("rows", 0) > 0:
+                _pretip_rows = _fp_result.get("rows", 0)
+                if _pretip_rows > 0:
                     print(f"[Scheduler] S5-2 pre-tip forward preds: "
-                          f"{_fp_result['games']} games, {_fp_result['rows']} rows")
+                          f"{_fp_result['games']} games, {_pretip_rows} rows")
+                try:
+                    from pipeline_health import record_run as _rec_ph
+                    _rec_ph("nba_pretip", rows_written=_pretip_rows)
+                except Exception:
+                    pass
         except Exception as _exc:
             _notify("BetIQ S5-2", f"Pre-tip forward preds error: {_exc}", sound="Basso")
+            try:
+                from pipeline_health import record_run as _rec_ph
+                _rec_ph("nba_pretip", errors=1, error_details=str(_exc))
+            except Exception:
+                pass
 
         try:
             if _should_run_best_lines():
@@ -5058,8 +5202,118 @@ def _loop(interval_mins: int, auto_retrain: bool):
                     "n_matched": fp_result.get("n_matched", 0),
                 }
                 print(f"[Scheduler] Fantasy projections: {fp_result.get('n_gaps', 0)} gaps found")
+                # Check gamma calc failure rate — DEGRADED if >1%
+                _fp_gamma_errors = 0
+                _fp_gamma_details = None
+                try:
+                    from fantasy_projections import find_prop_gaps as _fpg
+                    _gs = getattr(_fpg, "_gamma_stats", {})
+                    if _gs.get("fail_rate", 0) > 0.01:
+                        _fp_gamma_errors = _gs["failures"]
+                        _fp_gamma_details = (
+                            f"Gamma P(over) failures: {_gs['failures']}/{_gs['attempts']} "
+                            f"({_gs['fail_rate']*100:.1f}%)"
+                        )
+                        logger.warning("[Scheduler] %s", _fp_gamma_details)
+                except Exception:
+                    pass
+                try:
+                    from pipeline_health import record_run as _rec_ph
+                    _rec_ph("nfl_fantasy_pipeline",
+                            rows_written=fp_result.get("n_stored", 0),
+                            errors=_fp_gamma_errors,
+                            error_details=_fp_gamma_details,
+                            games_exist=fp_result.get("n_matched", 0) > 0)
+                except Exception:
+                    pass
+                # Outcome-based check: count actual rows in fantasy_forward_preds
+                try:
+                    import sqlite3 as _sq_nfl
+                    from pipeline_health import record_run as _rec_nfl_fp
+                    _nfl_hp = os.path.normpath(os.path.join(
+                        os.path.dirname(__file__), "..", "data", "historical.db"))
+                    _nfl_hc = _sq_nfl.connect(_nfl_hp, timeout=5)
+                    _nfl_week = fp_result.get("week")
+                    _nfl_season = fp_result.get("season")
+                    _nfl_fp_rows = 0
+                    if _nfl_week and _nfl_season:
+                        _nfl_fp_rows = _nfl_hc.execute(
+                            "SELECT COUNT(*) FROM fantasy_forward_preds "
+                            "WHERE season=? AND week=?",
+                            (_nfl_season, _nfl_week)).fetchone()[0]
+                    _nfl_hc.close()
+                    _nfl_has_games = fp_result.get("n_matched", 0) > 0
+                    _rec_nfl_fp("nfl_forward_preds",
+                                rows_written=_nfl_fp_rows,
+                                errors=0 if _nfl_fp_rows > 0 else 1,
+                                error_details=(f"Week {_nfl_week}: 0 forward preds in table"
+                                               if _nfl_has_games and _nfl_fp_rows == 0 else None),
+                                games_exist=_nfl_has_games)
+                    print(f"[Scheduler] NFL forward preds outcome: {_nfl_fp_rows} rows "
+                          f"in fantasy_forward_preds (S{_nfl_season} W{_nfl_week})")
+                except Exception as _exc_nfl_fp:
+                    logger.warning("[Scheduler] NFL forward preds outcome check: %s", _exc_nfl_fp)
         except Exception as _exc:
             print(f"[Scheduler] ERROR in fantasy_projections: {_exc}")
+            import traceback as _tb_fp
+            logger.error("[Scheduler] fantasy_projections: %s\n%s", _exc, _tb_fp.format_exc())
+            try:
+                from pipeline_health import record_run as _rec_ph
+                _rec_ph("nfl_fantasy_pipeline", errors=1,
+                        error_details=str(_exc), games_exist=None)
+            except Exception:
+                pass
+
+        # Pre-kickoff consensus refresh — multi-window, per-window guard keys.
+        # Each window fires independently; snapshots captured for consensus drift tracking.
+        # | Day | Time (CT) | Label           | Purpose                     |
+        # |-----|-----------|-----------------|------------------------------|
+        # | Thu | 5:00 PM   | pregame_thu     | TNF                         |
+        # | Sun | 9:00 AM   | pregame_sun     | Early window                |
+        # | Sun | 1:45 PM   | inactives_1pm   | Late-window inactives       |
+        # | Sun | 6:00 PM   | snf_6pm         | SNF                         |
+        # | Mon | 5:00 PM   | pregame_mon     | MNF                         |
+        try:
+            ct_now_r = _now_ct()
+            _is_nfl_r = ct_now_r.month >= 9 or ct_now_r.month <= 1
+            _dow = ct_now_r.weekday()  # 0=Mon ... 6=Sun
+            _hr = ct_now_r.hour
+            _mn = ct_now_r.minute
+
+            # Define refresh windows: (weekday, hour, minute, label)
+            _refresh_windows = [
+                (3, 17, 0,  "pregame_thu"),    # Thursday 5:00 PM
+                (6,  9, 0,  "pregame_sun"),    # Sunday 9:00 AM
+                (6, 13, 45, "inactives_1pm"),  # Sunday 1:45 PM
+                (6, 18, 0,  "snf_6pm"),        # Sunday 6:00 PM
+                (0, 17, 0,  "pregame_mon"),    # Monday 5:00 PM
+            ]
+
+            for _w_dow, _w_hr, _w_mn, _w_label in _refresh_windows:
+                if _dow != _w_dow:
+                    continue
+                if (_hr, _mn) < (_w_hr, _w_mn):
+                    continue
+                _guard_key = f"last_fantasy_refresh_{today_ct}_{_w_label}"
+                if _scheduler_state.get(_guard_key):
+                    continue
+                if not _is_nfl_r:
+                    continue
+                from fantasy_projections import run_weekly_pipeline as _run_fp_refresh, \
+                    store_snapshot as _store_snap, get_current_nfl_week as _get_week_r
+                _rfp = _run_fp_refresh(fetch_props=False)
+                _scheduler_state[_guard_key] = True
+                _n_gaps = _rfp.get("n_gaps", 0)
+                print(f"[Scheduler] Pre-kickoff refresh [{_w_label}]: {_n_gaps} gaps updated")
+                # Capture labeled snapshot
+                try:
+                    _snap_s, _snap_w = _get_week_r()
+                    _snap_n = _store_snap(_snap_s, _snap_w, label=_w_label)
+                    print(f"[Scheduler] Snapshot [{_w_label}]: {_snap_n} rows")
+                except Exception as _snap_exc:
+                    print(f"[Scheduler] Snapshot [{_w_label}] failed: {_snap_exc}")
+        except Exception as _exc:
+            print(f"[Scheduler] ERROR in pre-kickoff refresh: {_exc}")
 
         # Fantasy forward grading — grade last week's predictions on Tuesdays (after MNF settles)
         try:
@@ -5074,8 +5328,88 @@ def _loop(interval_mins: int, auto_retrain: bool):
                 _scheduler_state["last_fantasy_grade"] = today_ct
                 _graded = _grade_result.get("graded", 0)
                 print(f"[Scheduler] Fantasy forward grade: week {_grade_week}, {_graded} predictions graded")
+                try:
+                    from pipeline_health import record_run as _rec_ph
+                    _rec_ph("nfl_grading", rows_written=_graded)
+                except Exception:
+                    pass
         except Exception as _exc:
-            print(f"[Scheduler] ERROR in fantasy forward grading: {_exc}")
+            logger.error("[Scheduler] ERROR in fantasy forward grading: %s\n%s", _exc, traceback.format_exc())
+            try:
+                from pipeline_health import record_run as _rec_ph
+                _rec_ph("nfl_grading", errors=1, error_details=str(_exc))
+            except Exception:
+                pass
+
+        # Model Scorecard — compute + email after grading on Tuesdays 1 PM CT
+        try:
+            ct_now_sc = _now_ct()
+            _is_nfl_sc = ct_now_sc.month >= 9 or ct_now_sc.month <= 1
+            _sc_ran_today = _scheduler_state.get("last_scorecard_nfl") == today_ct
+            if _is_nfl_sc and ct_now_sc.weekday() == 1 and not _sc_ran_today and ct_now_sc.hour >= 13:
+                from model_scorecard import compute_weekly_scorecard as _sc_compute, \
+                    compute_season_to_date as _sc_std, format_email_summary as _sc_email
+                from fantasy_projections import get_current_nfl_week as _get_week_sc
+                _sc_s, _sc_w = _get_week_sc()
+                _sc_grade_week = max(1, _sc_w - 1)
+                _sc_n = _sc_compute("NFL", _sc_s, _sc_grade_week, force=True)
+                _sc_std_n = _sc_std("NFL", _sc_s, _sc_grade_week)
+                _scheduler_state["last_scorecard_nfl"] = today_ct
+                print(f"[Scheduler] Model scorecard NFL W{_sc_grade_week}: {_sc_n} week + {_sc_std_n} STD segments")
+                try:
+                    from pipeline_health import record_run as _rec_sc
+                    _rec_sc("model_scorecard", rows_written=_sc_n + _sc_std_n)
+                except Exception:
+                    pass
+                # Email scorecard summary
+                try:
+                    _sc_body = _sc_email("NFL", _sc_s, _sc_grade_week)
+                    # Append pipeline health block to scorecard email
+                    try:
+                        from pipeline_health import format_health_email_block as _fmt_health
+                        _sc_body += "\n\n---\n\n" + _fmt_health(24)
+                    except Exception:
+                        pass
+                    from researcher.delivery import send_email as _sc_send
+                    _sc_send(f"NFL Model Scorecard — Week {_sc_grade_week}", _sc_body)
+                    print(f"[Scheduler] Scorecard email sent for W{_sc_grade_week}")
+                except Exception as _email_exc:
+                    logger.error("[Scheduler] Scorecard email failed: %s\n%s", _email_exc, traceback.format_exc())
+        except Exception as _exc:
+            logger.error("[Scheduler] ERROR in model scorecard: %s\n%s", _exc, traceback.format_exc())
+            try:
+                from pipeline_health import record_run as _rec_sc
+                _rec_sc("model_scorecard", errors=1, error_details=str(_exc))
+            except Exception:
+                pass
+
+        # ── Daily pipeline health email — 8 AM CT ─────────────────────────────
+        try:
+            ct_now_he = _now_ct()
+            _he_ran_today = _scheduler_state.get("last_health_email") == today_ct
+            if not _he_ran_today and ct_now_he.hour >= 8:
+                from pipeline_health import format_health_email_block, get_health_summary
+                _he_summary = get_health_summary(24)
+                _he_body = format_health_email_block(24)
+                # Count pipelines with issues
+                _he_bad = [s for s in _he_summary if s["status"] in ("DOWN", "DEGRADED", "STALE")]
+                _he_subj = "BetIQ Daily Health"
+                if _he_bad:
+                    _he_subj += f" — {len(_he_bad)} issue(s)"
+                else:
+                    _he_subj += " — All OK"
+                from researcher.delivery import send_email as _he_send
+                _he_send(_he_subj, _he_body)
+                _scheduler_state["last_health_email"] = today_ct
+                print(f"[Scheduler] Daily health email sent: {len(_he_summary)} pipelines, "
+                      f"{len(_he_bad)} with issues")
+                # Fire macOS alert if anything is DOWN
+                _he_down = [s for s in _he_summary if s["status"] == "DOWN"]
+                if _he_down:
+                    _notify("BetIQ Health", f"{len(_he_down)} pipeline(s) DOWN", sound="Basso")
+        except Exception as _exc:
+            logger.error("[Scheduler] Daily health email error: %s\n%s", _exc, traceback.format_exc())
+            print(f"[Scheduler] ERROR in daily health email: {_exc}")
 
         # v1.2 prediction coverage check — once/day Wed-Sun 11 AM CT during NFL season
         try:
@@ -5097,6 +5431,19 @@ def _loop(interval_mins: int, auto_retrain: bool):
                           f"{len(_pc_result['missing'])} games missing predictions")
         except Exception as _exc:
             print(f"[Scheduler] ERROR in pred_coverage_check: {_exc}")
+
+        # NFL Lab coverage QA — once/day Wed-Sun 12 PM CT during NFL season
+        try:
+            ct_now_lc = _now_ct()
+            _is_nfl_lc = ct_now_lc.month >= 9 or ct_now_lc.month <= 1
+            _is_check_day_lc = ct_now_lc.weekday() in (2, 3, 4, 5, 6)  # Wed-Sun
+            _lc_ran_today = _scheduler_state.get("last_lab_coverage_check") == today_ct
+            if _is_nfl_lc and _is_check_day_lc and not _lc_ran_today and ct_now_lc.hour >= 12:
+                _lc_result = _run_nfl_lab_coverage_check()
+                _scheduler_state["last_lab_coverage_check"] = today_ct
+                _scheduler_state["last_lab_coverage_result"] = _lc_result
+        except Exception as _exc:
+            print(f"[Scheduler] ERROR in lab_coverage_check: {_exc}")
 
         # Researcher — daily news + synthesis (runs once after 9 AM CT)
         try:
@@ -5134,6 +5481,8 @@ def _loop(interval_mins: int, auto_retrain: bool):
             ct_now_iw = _now_ct()
             _is_nfl_season_iw = ct_now_iw.month >= 9 or ct_now_iw.month <= 1
             _is_game_day_iw = ct_now_iw.weekday() in (0, 3, 4, 5, 6)  # Mon,Thu,Fri,Sat,Sun
+            _iw_ch = 0
+            _iw_tr = 0
             if _is_nfl_season_iw and _is_game_day_iw and ct_now_iw.hour >= 10:
                 _last_iw = _scheduler_state.get("last_injury_watch_poll")
                 _iw_ok = True
@@ -5156,25 +5505,25 @@ def _loop(interval_mins: int, auto_retrain: bool):
                     print(f"[Scheduler] InjuryWatcher heartbeat {_iw_ts} UTC — "
                           f"{_iw_ch} changes, {_iw_tr} triggers"
                           + (f" ({_iw_result['credits']} credits)" if _iw_tr > 0 else ""))
-            # End-of-day alert: if it's 11 PM CT on a game day and we had
-            # zero triggered changes all day, something is wrong
-            if ct_now_iw.hour == 23 and _scheduler_state.get("iw_alerted_today") != today_ct:
-                _iw_day_triggers = _scheduler_state.get("iw_triggers_today", 0)
-                if _iw_ch > 0:
-                    _scheduler_state["iw_triggers_today"] = _iw_day_triggers + _iw_tr
-                if _scheduler_state.get("iw_triggers_today", 0) == 0:
-                    print(f"[InjuryWatcher] ALERT: 0 triggered changes on game day "
-                          f"{today_ct}. Check trigger_prop_fetch() and Sleeper API.")
-                _scheduler_state["iw_alerted_today"] = today_ct
-            elif ct_now_iw.hour < 23:
-                # Accumulate daily trigger count
-                if _iw_tr > 0:
-                    _scheduler_state["iw_triggers_today"] = (
-                        _scheduler_state.get("iw_triggers_today", 0) + _iw_tr)
-                # Reset counter on new day
-                if _scheduler_state.get("iw_count_date") != today_ct:
-                    _scheduler_state["iw_count_date"] = today_ct
-                    _scheduler_state["iw_triggers_today"] = _iw_tr
+                # End-of-day alert: if it's 11 PM CT on a game day and we had
+                # zero triggered changes all day, something is wrong
+                if ct_now_iw.hour == 23 and _scheduler_state.get("iw_alerted_today") != today_ct:
+                    _iw_day_triggers = _scheduler_state.get("iw_triggers_today", 0)
+                    if _iw_ch > 0:
+                        _scheduler_state["iw_triggers_today"] = _iw_day_triggers + _iw_tr
+                    if _scheduler_state.get("iw_triggers_today", 0) == 0:
+                        print(f"[InjuryWatcher] ALERT: 0 triggered changes on game day "
+                              f"{today_ct}. Check trigger_prop_fetch() and Sleeper API.")
+                    _scheduler_state["iw_alerted_today"] = today_ct
+                elif ct_now_iw.hour < 23:
+                    # Accumulate daily trigger count
+                    if _iw_tr > 0:
+                        _scheduler_state["iw_triggers_today"] = (
+                            _scheduler_state.get("iw_triggers_today", 0) + _iw_tr)
+                    # Reset counter on new day
+                    if _scheduler_state.get("iw_count_date") != today_ct:
+                        _scheduler_state["iw_count_date"] = today_ct
+                        _scheduler_state["iw_triggers_today"] = _iw_tr
         except Exception as _iw_exc:
             print(f"[Scheduler] ERROR in injury_watch_poll: {_iw_exc}")
 
@@ -5185,8 +5534,26 @@ def _loop(interval_mins: int, auto_retrain: bool):
                 _db_maint_result = _run_db_maintenance()
                 _scheduler_state["last_db_maintenance_result"] = _db_maint_result
                 print(f"[Scheduler] DB maintenance: {_db_maint_result}")
+                try:
+                    from pipeline_health import record_run as _rec_ph
+                    # Check for actual failure keys (not string "error" in key names)
+                    _fail_keys = [k for k in _db_maint_result
+                                  if k.endswith("_error") and k != "wal_warning"]
+                    _db_ok = len(_fail_keys) == 0
+                    _rec_ph("db_backup", rows_written=1 if _db_ok else 0,
+                            errors=len(_fail_keys) if not _db_ok else 0,
+                            error_details="; ".join(
+                                f"{k}: {_db_maint_result[k]}" for k in _fail_keys
+                            ) if _fail_keys else None)
+                except Exception:
+                    pass
         except Exception as _maint_exc:
-            print(f"[Scheduler] ERROR in db_maintenance: {_maint_exc}")
+            logger.error("[Scheduler] ERROR in db_maintenance: %s\n%s", _maint_exc, traceback.format_exc())
+            try:
+                from pipeline_health import record_run as _rec_ph
+                _rec_ph("db_backup", errors=1, error_details=str(_maint_exc))
+            except Exception:
+                pass
 
         # ── Credit Tripwire (3 AM CT, after maintenance): detect unexplained usage ──
         try:

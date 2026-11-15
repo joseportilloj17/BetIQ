@@ -9260,6 +9260,7 @@ def get_top_picks_calibration(db: Session, days: int = 30) -> dict:
         from sqlalchemy import text as _text
 
         # ── Parlay-level rows — use the shared SQLAlchemy session ──────────────
+        # Exclude bets that have any legs flagged excluded_from_metrics
         parlay_raw = db.execute(
             _text("""
             SELECT
@@ -9267,16 +9268,44 @@ def get_top_picks_calibration(db: Session, days: int = 30) -> dict:
                 mb.model_confidence_avg,
                 mb.amount,
                 mb.status,
-                mb.actual_profit
+                mb.actual_profit,
+                mb.sport,
+                mb.bet_type,
+                date(mb.generated_at) AS gen_date
             FROM mock_bets mb
             WHERE mb.source = 'top_picks_page'
               AND mb.status IN ('SETTLED_WIN', 'SETTLED_LOSS')
               AND date(mb.generated_at) >= :since
+              AND COALESCE(mb.has_excluded_legs, 0) = 0
             ORDER BY mb.generated_at
             """),
             {"since": since_str},
         ).fetchall()
         parlay_rows = [dict(r._mapping) for r in parlay_raw]
+
+        # ── Sample rows for "show 3 examples" display ─────────────────────────
+        sample_raw = db.execute(
+            _text("""
+            SELECT
+                mb.sport,
+                mb.n_legs,
+                ROUND(mb.predicted_win_prob, 1) AS pred_wp,
+                ROUND(mb.theoretical_parlay_odds, 2) AS odds,
+                ROUND(mb.amount, 2) AS stake,
+                mb.status,
+                ROUND(mb.actual_profit, 2) AS profit,
+                date(mb.generated_at) AS gen_date
+            FROM mock_bets mb
+            WHERE mb.source = 'top_picks_page'
+              AND mb.status IN ('SETTLED_WIN', 'SETTLED_LOSS')
+              AND date(mb.generated_at) >= :since
+              AND COALESCE(mb.has_excluded_legs, 0) = 0
+            ORDER BY mb.generated_at DESC
+            LIMIT 3
+            """),
+            {"since": since_str},
+        ).fetchall()
+        sample_rows = [dict(r._mapping) for r in sample_raw]
 
         # ── Leg-level rows ─────────────────────────────────────────────────────
         leg_raw = db.execute(
@@ -9581,6 +9610,57 @@ def get_top_picks_calibration(db: Session, days: int = 30) -> dict:
 
     interpretation = " ".join(interp_parts) if interp_parts else "Insufficient data."
 
+    # ── Metadata: sport breakdown, date range, bet types, CI ──────────────────
+    from collections import Counter
+    sport_counts = Counter()
+    bet_type_counts = Counter()
+    date_min = None
+    date_max = None
+    for r in parlay_rows:
+        sp = r.get("sport", "unknown") or "unknown"
+        # Multi-sport parlays have pipe-separated sports — split and count each
+        for s in sp.split(" | "):
+            sport_counts[s.strip()] += 1
+        bt = r.get("bet_type", "unknown") or "unknown"
+        bet_type_counts[bt] += 1
+        gd = r.get("gen_date")
+        if gd:
+            if date_min is None or gd < date_min:
+                date_min = gd
+            if date_max is None or gd > date_max:
+                date_max = gd
+
+    # ROI bootstrap CI (bet-level, simple percentile)
+    roi_ci = None
+    if n_settled >= 10 and total_staked > 0:
+        import numpy as np
+        rng = np.random.default_rng(42)
+        profits = np.array([r["actual_profit"] or 0.0 for r in parlay_rows])
+        stakes = np.array([r["amount"] or 0.0 for r in parlay_rows])
+        boot_rois = []
+        for _ in range(2000):
+            idx = rng.integers(0, n_settled, size=n_settled)
+            s_profit = profits[idx].sum()
+            s_stake = stakes[idx].sum()
+            if s_stake > 0:
+                boot_rois.append(s_profit / s_stake * 100)
+        if boot_rois:
+            roi_ci = {
+                "lo": round(float(np.percentile(boot_rois, 2.5)), 1),
+                "hi": round(float(np.percentile(boot_rois, 97.5)), 1),
+            }
+
+    metadata = {
+        "sports": dict(sport_counts.most_common()),
+        "bet_types": dict(bet_type_counts),
+        "date_range": {"from": date_min, "to": date_max},
+        "roi_ci_95": roi_ci,
+        "odds_basis": "theoretical_parlay (product of individual leg bookmaker prices)",
+        "stake_method": "25% Kelly on $500 bankroll",
+        "sample_type": "out_of_sample (forward/prospective)",
+        "excludes": "has_excluded_legs, excluded_from_metrics legs",
+    }
+
     return {
         "n_settled":            n_settled,
         "n_legs":               n_legs_total,
@@ -9598,6 +9678,8 @@ def get_top_picks_calibration(db: Session, days: int = 30) -> dict:
             "leg_win_rate_pct": leg_wr,
             "leg_brier_score":  leg_brier,
         },
+        "sample_rows":    sample_rows,
+        "metadata":       metadata,
         "interpretation": interpretation,
         "data_warning":   data_warning,
     }
