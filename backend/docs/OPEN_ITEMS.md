@@ -1392,9 +1392,9 @@ All items collecting forward data. Each has a decision date and minimum N.
 | FW-1 | NBA S5-2 market comparison | **BLOCKED — threshold mismatch** | Late-Dec 2026 (N≥100 games) | Day 1 = 2026-11-08 (212 rows, 7 games). 193/212 graded. **Model↔market join: 0/193 (0%)**. Unjoin causes: line not posted for player (138, 71%), alt market one-sided/over-only (45, 23%), player not in props (10, 5%). Root cause: `_pick_best_threshold()` maximizes |P-0.5|, always selecting the lowest rung (pts 10.5, reb 3.5, pra 14.5) — far below market-posted main lines for starters. **Action**: must persist predictions at market-posted lines. Also fixed: `player_props.game_date` UTC→CT backfill (704K rows); `creator_tier.py` uses `_utc_to_ct_date()` going forward. Oct 30–Nov 7 LOST. |
 | FW-2 | NFL prereg rec_yds OVER (lognormal) | **COLLECTING** | W14 (~2026-12-05) with interim looks W10/W12 | Three regimes: R1 (W2-W8, suppression bug), R2 (W9 pre-fix), R3 (W10+, clean). Verdict on R3 data only. Coverage 156/156 rec_yds players on main line. **R1 corrected** (2026-11-07f): 13/154 picks were post-kickoff contaminated; clean R1: N=141, WR=66.0%, ROI=+24.7%. **Shadow gamma** (2026-11-08b): `p_over_v12_gamma` stored from W10; post-W14 head-to-head lognormal vs gamma on same predictions. **Amendment 2026-11-08** (pre-W10): Added O'Brien-Fleming interim analysis at W10/W12/W14 (alpha spending 0.0005/0.014/0.045 for two-sided; see `data/prereg_fw2_amendment_20261108.md`). **W2-W8 head-to-head** (2026-11-08): all yardage (main+alt, N=6,432) gamma Brier 0.167 vs lognormal 0.209 (Δ=-0.042, t=-17.6); main-line only (N=2,698) Δ=-0.086; calibration error 0.047 vs 0.172; main-line prereg ROI +13.5% vs -0.4%. All in-sample for base rates (W2-W5 training); W5-W8 OOS improvements *larger*. |
 | FW-2b | NFL prereg rec_yds OVER (shifted-gamma) | **COLLECTING** | W14 (~2026-12-05) with interim looks W10/W12 | **Parallel prereg** registered 2026-11-08 (pre-W10). Uses `p_over_v12_gamma` (shifted-gamma CDF) instead of `p_over` (lognormal). Same design: rec_yds OVER, edge ≥ 5pp vs devigged implied, main-line, method=distributional. Same O'Brien-Fleming schedule. Runs simultaneously with FW-2 on identical predictions — only the P(over) and therefore edge calculation differs. See `data/prereg_fw2b_gamma_20261108.md`. |
-| FW-2c | NFL low-line OVER (shifted-gamma) | **COLLECTING — BET** | W14 (~2026-12-05) with OBF interim W10/W12/W14 | Registered 2026-11-15 pre-W10 kickoff. See definition below. **OVER only** — UNDER ROI -28.6% (N=28). Live bets placed from W10. |
-| FW-2d | NFL QB rush_yds (shifted-gamma) | **COLLECTING — TRACK ONLY** | W14 (~2026-12-05) with OBF interim W10/W12/W14 | Registered 2026-11-15 pre-W10. See definition below. Both sides; UNDER stronger (+32.2%) but OVER not significant (+16.0%). Track only until W14 verdict. |
-| FW-2e | NFL edge >15pp non-low non-QB-rush (shifted-gamma) | **COLLECTING — TRACK ONLY** | W14 (~2026-12-05) with OBF interim W10/W12/W14 | Registered 2026-11-15 pre-W10. See definition below. Diverse composition (rec_yds 62, receptions 52, rush_yds 51). Track only — high edge might be model artifact despite +15.9% ROI. |
+| FW-2c | NFL low-line OVER (shifted-gamma) | **COLLECTING — BET** | W14 (~2026-12-05) with OBF interim W10/W12/W14 | Registered 2026-11-15 pre-W10 kickoff. See definition below. **OVER only** — UNDER ROI -28.6% (N=28). Live bets placed from W10. **W10 result**: 81.5% WR (22/27), +45.3% ROI. Season (W2-W10): N=202, 71.3% WR, +26.0% ROI [+14.2%, +37.1%] — significant. |
+| FW-2d | NFL QB rush_yds (shifted-gamma) | **COLLECTING — BET** | W14 (~2026-12-05) with OBF interim W10/W12/W14 | Registered 2026-11-15 pre-W10. See definition below. Both sides; UNDER stronger (+32.2%) but OVER not significant (+16.0%). **Amended to BET** per user decision (2026-11-15). Live bets placed from W10 (combined with FW-2c in 5u cap). **W10 result**: 60.0% WR (12/20), +14.4% ROI. Season (W2-W10): N=105, 64.8% WR, +22.4% ROI [+4.4%, +40.4%] — significant. |
+| FW-2e | NFL edge >15pp non-low non-QB-rush (shifted-gamma) | **COLLECTING — TRACK ONLY** | W14 (~2026-12-05) with OBF interim W10/W12/W14 | Registered 2026-11-15 pre-W10. See definition below. Diverse composition (rec_yds 62, receptions 52, rush_yds 51). Track only — high edge might be model artifact despite +15.9% ROI. **W10 result**: 45.5% WR (15/33), -15.5% ROI. Season (W2-W10): N=192, 58.3% WR, +7.0% ROI [-5.6%, +19.7%] — NOT significant. Track-only validated. |
 | FW-3 | SGP validation (personal bets) | **PARTIAL** | Pending Pikkit export | 602 bets in bets.db (2024-01-04 → 2026-04-23). 100/589 fully priceable (17%). Overcharge c rises 1.05→1.18 by leg count. Need Pikkit export ~2026-04-24 → today to complete. |
 | FW-4 | Injury edge-at-news collection | **COLLECTING** | N≥50 events (~Jan 2027) | `injury_watcher.py` polls Sleeper every 15 min on game days. 1,417 snapshots in `injury_edge_snapshots`. Tracks teammate prop edge at first post-news fetch vs baseline. |
 | FW-5 | NFL-12 suppression re-validation | **BLOCKED** | After W11 (~2026-11-21) | Re-validate `alt_over`, `deep_alt_under_rec_pass`, `rb_rush_over_low_conv` on R3 data. Need N≥30-50 per rule. |
@@ -1478,6 +1478,38 @@ All items collecting forward data. Each has a decision date and minimum N.
 | (d) Rest 3-15pp | 1736→709 | +4.6% | [-3.3%, +12.5%] | no |
 
 **Action**: all forward analyses (h2h, FW-2 R1, scorecard, ladder) must be re-run on deduped data. Prior figures are superseded.
+
+**Re-run completed 2026-11-15 10:30 CT** (all on deduped DB):
+- **H2H gamma vs lognormal**: gamma still dominates (Brier 0.1674 vs 0.2093, Δ=-0.042, t=-17.6). Main-line only (N=1030): gamma Brier 0.2473 vs LN 0.3289. Calibration MAE: gamma 0.047 vs LN 0.172. All weeks gamma-better. Unchanged conclusion.
+- **FW-2 R1 (rec_yds OVER prereg)**: N=140 graded (W7-W8, 26 games). HR=66.4% [57.1%, 76.1%], ROI=+25.6% [+8.1%, +43.7%]. All R1 regime (suppression+alias bugs). R2/R3 not yet graded. 6 more weeks needed.
+- **Scorecard backfill**: 1,626 segments across 7 periods. STD main-line: MAE=11.94, Direction=57.5% (vs 51.4% market), Brier(model)=0.2699, Brier(mkt)=0.2433, Bias=-0.92, Right-side rate=57.4%, N=3,916.
+- **Ladder**: model beats market at select rungs (QB rung -3, +1, +11, +12; RB rung +0, +17, +29, +31). No systematic ladder advantage — model-better rungs are scattered, not concentrated at near-main.
+
+**W9+W10 grading + scorecard update completed 2026-11-15 23:35 CT**:
+- W9 graded: 10,275 total (1,352 main). W10 graded: 6,960 total (550 main, 13/14 games — LAC@BAL MNF excluded).
+- Scorecard computed for W9, W10, STD refreshed through W10.
+- STD (W2-W10, main): N=5,775, MAE=11.67, Dir=56.4% (mkt 51.4%), Brier=0.277 (mkt 0.245), Bias=-0.50.
+- **Updated season calibration (W2-W10, edge≥3pp, price≤+100)**:
+
+| Category | N | Games | WR | ROI | 95% CI | Sig? |
+|---|---|---|---|---|---|---|
+| (a) QB rush | 105 | 74 | 64.8% | +22.4% | [+4.4%, +40.4%] | YES |
+| (b) Low lines | 202 | 75 | 71.3% | +26.0% | [+14.2%, +37.1%] | YES |
+| (c) Edge >15pp | 192 | 84 | 58.3% | +7.0% | [-5.6%, +19.7%] | no (was borderline) |
+| (d) Rest 3-15pp | 913 | 102 | 56.5% | +4.5% | [-1.9%, +11.0%] | no |
+
+- W10 FW-2c (low-line OVER): 81.5% WR (22/27), +45.3% ROI. W10 FW-2d (QB rush): 60.0% WR (12/20), +14.4% ROI.
+- W10 live bets (FW-2c+2d combined): 3/5 settled, +1.64u. 1 pending (Love rush_yds — Sleeper data gap).
+- (c) edge >15pp dropped from borderline significant to non-significant — validates track-only decision.
+- Jordan Love rush_yds actual missing from Sleeper — data gap to investigate.
+
+## Tested Hypotheses — Null Results
+
+Record null results here so they are not re-tested ad hoc. Each entry has a re-test condition; do not re-run before that condition is met.
+
+| Date | Hypothesis | Result | Re-test condition |
+|------|-----------|--------|-------------------|
+| 2026-11-15 | Team persistence in model direction accuracy | **NULL**. Split-half r ≈ 0 (odd/even: r=-0.052; W2-W6 vs W7-W10: r=+0.095). Top-8 OOS Δ ROI -0.8% [-14.0%, +11.5%]. Null after category × stat × price-band mix control (adjusted r=+0.101 early/late, +0.013 odd/even). Stability features (HR volatility, target concentration CV, rush volume std) all null. Decision: no team filters. | After W18 with full season (same split-half + OOS method, pre-specified). |
 
 ## Cleanup Reminders
 

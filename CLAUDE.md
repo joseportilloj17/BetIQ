@@ -48,6 +48,9 @@
 - **After deploying new pipeline code**, confirm rows in the target table from the next scheduled run before marking the feature as live.  Check the morning after, not the same session.
 - **A fix to a scheduled path isn't done until the server is restarted and the running commit matches.**  Code on disk doesn't help if the running process is still using the old version.  After any deploy, verify via `/api/health` that `git_commit_running == git_commit_disk`.
 
+## Null-Result Logging
+- **Record null results of tested hypotheses in OPEN_ITEMS** under "Tested Hypotheses — Null Results" with the date, method summary, and a pre-specified re-test condition.  Do not re-run a null hypothesis ad hoc before its re-test condition is met.  This prevents wasting cycles on already-closed questions and ensures re-tests use fresh data with a pre-committed design.
+
 ## Session Discipline
 - **Commit and push at the end of every session.**  Uncommitted changes on disk make the version hash meaningless.  The health email flags a dirty working tree, but the fix is to not leave one.
 - **Pre-registration freezes always reference a tagged, pushed commit.**  Tag format: `s5-4-freeze-YYYY-MM-DD`.  The tag must exist on `origin` so anyone can `git checkout` the exact frozen code.  Never freeze to an unpushed or uncommitted state.
