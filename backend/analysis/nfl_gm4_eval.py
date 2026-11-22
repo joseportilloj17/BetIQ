@@ -54,8 +54,8 @@ def _ci(x, n=4000, seed=1):
     return [round(float(np.percentile(bs, 2.5)), 3), round(float(np.percentile(bs, 97.5)), 3)]
 
 
-def evaluate():
-    pr = pd.read_csv(gm4.PRED_PATH)
+def evaluate(pred_path=None, out_path=None):
+    pr = pd.read_csv(pred_path or gm4.PRED_PATH)
     op = openers()
     pr["open_spread_home"] = [op.get((s, w, h, a), (np.nan,))[0] for s, w, h, a in zip(pr.season, pr.week, pr.home, pr.away)]
     pr["open_total"] = [op.get((s, w, h, a), (np.nan, np.nan))[1] for s, w, h, a in zip(pr.season, pr.week, pr.home, pr.away)]
@@ -91,10 +91,13 @@ def evaluate():
         out["take_gate_passed"] = bool(wf["m1_ci95"] and wf["m1_ci95"][0] > 0 and (ho["m1_clv_pts"] or -1) > 0
                                        and (wf["m2_hit_at_open"] or 0) > BE * 100)
         res["markets"][mk] = out
-    with open(OUT, "w") as f:
+    with open(out_path or OUT, "w") as f:
         json.dump(res, f, indent=1)
     return res
 
 
 if __name__ == "__main__":
-    print(json.dumps(evaluate(), indent=1))
+    if "--gm41" in sys.argv:
+        print(json.dumps(evaluate(gm4.PRED_PATH_41, OUT.replace("gm4_eval", "gm41_eval")), indent=1))
+    else:
+        print(json.dumps(evaluate(), indent=1))

@@ -109,7 +109,9 @@ def expected_epa(r, team, opp, qb, is_home):
     return pr * e_pass + (1 - pr) * e_rush, plays, e_pass, e_rush, qv
 
 
-def game_features(seasons=(2021, 2022, 2023, 2024, 2025, 2026)):
+def game_features(seasons=(2021, 2022, 2023, 2024, 2025, 2026), tuesday_info=False):
+    """tuesday_info=True (GM4.1): only inputs knowable at the Tuesday opener —
+    QB = team's starter in its most recent prior game; wind15 = 0 (no forecast data stored)."""
     import nfl_data_py as nfl
     p = load_pbp(sorted({min(seasons) - 1} | set(seasons)))
     sched = nfl.import_schedules(list(seasons))
@@ -118,6 +120,7 @@ def game_features(seasons=(2021, 2022, 2023, 2024, 2025, 2026)):
                 .reset_index(name="n").sort_values("n").groupby(["game_id", "posteam"]).tail(1)
                 .set_index(["game_id", "posteam"])["passer_player_id"])
     rows, t0 = [], time.time()
+    last_qb = {}
     for (season, week), games in sched.groupby(["season", "week"]):
         if week < 2:
             continue
@@ -125,8 +128,11 @@ def game_features(seasons=(2021, 2022, 2023, 2024, 2025, 2026)):
         if r is None:
             continue
         for _, g in games.iterrows():
-            qh = starters.get((g.game_id, g.home_team))
-            qa = starters.get((g.game_id, g.away_team))
+            if tuesday_info:
+                qh, qa = last_qb.get(g.home_team), last_qb.get(g.away_team)
+            else:
+                qh = starters.get((g.game_id, g.home_team))
+                qa = starters.get((g.game_id, g.away_team))
             eh, ph, *_h = expected_epa(r, g.home_team, g.away_team, qh, 1)
             ea, pa_, *_a = expected_epa(r, g.away_team, g.home_team, qa, 0)
             P = (ph + pa_) / 2
@@ -135,13 +141,18 @@ def game_features(seasons=(2021, 2022, 2023, 2024, 2025, 2026)):
                 "home": g.home_team, "away": g.away_team, "e_home": eh, "e_away": ea, "P": P,
                 "de_P": (eh - ea) * P, "se_P": (eh + ea) * P,
                 "rest_diff": (g.home_rest or 7) - (g.away_rest or 7), "div": int(g.div_game or 0),
-                "dome": int(str(g.roof) in ("dome", "closed")), "wind15": int((g.wind or 0) >= 15),
+                "dome": int(str(g.roof) in ("dome", "closed")), "wind15": 0 if tuesday_info else int((g.wind or 0) >= 15),
                 "qb_home": qh, "qb_away": qa, "q_home": _h[2], "q_away": _a[2],
                 "margin": (g.home_score - g.away_score) if pd.notna(g.home_score) else np.nan,
                 "total": (g.home_score + g.away_score) if pd.notna(g.home_score) else np.nan,
                 "close_spread_home": -g.spread_line if pd.notna(g.spread_line) else np.nan,
                 "close_total": g.total_line,
             })
+        for _, g in games.iterrows():
+            for tm in (g.home_team, g.away_team):
+                q = starters.get((g.game_id, tm))
+                if q is not None:
+                    last_qb[tm] = q
         logger.warning("[GM4] ratings %d W%d (%.0fs)", season, week, time.time() - t0)
     return pd.DataFrame(rows)
 
@@ -167,11 +178,15 @@ def fit_game_layer(df):
     return pd.concat(out)
 
 
+PRED_PATH_41 = os.path.join(_DATA, "nfl_gm41_predictions.csv")
+
 if __name__ == "__main__":
+    import sys
     logging.basicConfig(level=logging.WARNING, format="%(message)s")
-    feats = game_features()
+    tue = "--tuesday" in sys.argv
+    feats = game_features(tuesday_info=tue)
     preds = fit_game_layer(feats)
-    preds.to_csv(PRED_PATH, index=False)
+    preds.to_csv(PRED_PATH_41 if tue else PRED_PATH, index=False)
     d = preds[preds.margin.notna() & preds.close_spread_home.notna()]
     print("games", len(d), "seasons", sorted(d.season.unique()))
     print("descriptive only (eval is pre-registered separately): MAE margin model %.2f vs close %.2f; total model %.2f vs close %.2f"
