@@ -108,7 +108,85 @@ def _market_summary(books, mkey, sides):
     return out
 
 
-def build_nfl_games(days_ahead: int = 8) -> dict:
+_ABBR = {
+    "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL", "Baltimore Ravens": "BAL", "Buffalo Bills": "BUF",
+    "Carolina Panthers": "CAR", "Chicago Bears": "CHI", "Cincinnati Bengals": "CIN", "Cleveland Browns": "CLE",
+    "Dallas Cowboys": "DAL", "Denver Broncos": "DEN", "Detroit Lions": "DET", "Green Bay Packers": "GB",
+    "Houston Texans": "HOU", "Indianapolis Colts": "IND", "Jacksonville Jaguars": "JAX", "Kansas City Chiefs": "KC",
+    "Los Angeles Rams": "LA", "Los Angeles Chargers": "LAC", "Las Vegas Raiders": "LV", "Miami Dolphins": "MIA",
+    "Minnesota Vikings": "MIN", "New England Patriots": "NE", "New Orleans Saints": "NO", "New York Giants": "NYG",
+    "New York Jets": "NYJ", "Philadelphia Eagles": "PHI", "Pittsburgh Steelers": "PIT", "Seattle Seahawks": "SEA",
+    "San Francisco 49ers": "SF", "Tampa Bay Buccaneers": "TB", "Tennessee Titans": "TEN", "Washington Commanders": "WAS",
+}
+
+
+def _backtest_status():
+    import nfl_game_model as ngm
+    try:
+        with open(ngm.BACKTEST_PATH) as f:
+            bt = json.load(f)
+    except FileNotFoundError:
+        return None
+    return {"run_at": bt.get("run_at"), "n_games": bt.get("n_games"),
+            "passed": {m: bool(v.get("passed")) for m, v in bt.get("markets", {}).items()},
+            "markets": bt.get("markets"), "calibration": bt.get("calibration")}
+
+
+def _attach_model(game, pred, status):
+    """Add model prediction + gap per market side. take=True only if that market's backtest PASSED."""
+    import numpy as np
+    import nfl_game_model as ngm
+    passed = (status or {}).get("passed", {})
+    m, t = pred["dist"]["margin"], pred["dist"]["total"]
+    home, away = game["home"], game["away"]
+    ml = game.get("moneyline")
+    if ml:
+        ph = pred["p_home_win"]
+        for side, p in ((home, ph), (away, 1 - ph)):
+            s = ml["sides"][side]
+            s["model_p"] = round(p, 4)
+            s["gap"] = round((p - s["fair_prob"]) * 100, 1) if s.get("fair_prob") else None
+            s["gap_unit"] = "pp"
+            s["model_ev"] = round(p * s["best_price"] - 1, 3) if s.get("best_price") else None
+            s["take"] = bool(passed.get("moneyline") and s["gap"] and s["gap"] > 0 and (s["model_ev"] or 0) > 0)
+    sp = game.get("spread")
+    if sp:
+        for side, sign in ((home, 1.0), (away, -1.0)):
+            s = sp["sides"][side]
+            pt = s.get("point")
+            if pt is None:
+                continue
+            cov = sign * m + pt           # side's margin + its spread
+            pc = float(np.mean(cov > 0) / max(1e-9, 1 - np.mean(cov == 0)))
+            s["model_line"] = round(-sign * float(np.median(m)) * 2) / 2   # model's spread for this side
+            s["model_p"] = round(pc, 4)
+            s["gap"] = round(sign * float(np.median(m)) + pt, 1)          # +ve = model likes this side vs line (pts)
+            s["gap_unit"] = "pts"
+            s["model_ev"] = round(pc * s["best_price"] - 1, 3) if s.get("best_price") else None
+            s["take"] = bool(passed.get("spread") and s["gap"] > 0 and (s["model_ev"] or 0) > 0)
+    tot = game.get("total")
+    if tot:
+        for side in ("Over", "Under"):
+            s = tot["sides"][side]
+            ln = s.get("point")
+            if ln is None:
+                continue
+            po = float(np.mean(t > ln) / max(1e-9, 1 - np.mean(t == ln)))
+            p = po if side == "Over" else 1 - po
+            s["model_line"] = round(float(np.median(t)) * 2) / 2
+            s["model_p"] = round(p, 4)
+            g = float(np.median(t)) - ln
+            s["gap"] = round(g if side == "Over" else -g, 1)
+            s["gap_unit"] = "pts"
+            s["model_ev"] = round(p * s["best_price"] - 1, 3) if s.get("best_price") else None
+            s["take"] = bool(passed.get("total") and s["gap"] > 0 and (s["model_ev"] or 0) > 0)
+    game["model"] = {"p_home_win": round(pred["p_home_win"], 4), "median_margin": round(pred["median_margin"], 1),
+                     "median_total": round(pred["median_total"], 1),
+                     "proj_home": round((pred["median_total"] + pred["median_margin"]) / 2, 1),
+                     "proj_away": round((pred["median_total"] - pred["median_margin"]) / 2, 1)}
+
+
+def build_nfl_games(days_ahead: int = 8, with_model: bool = True) -> dict:
     now = datetime.now(timezone.utc)
     conn = _ro()
     try:
@@ -141,9 +219,28 @@ def build_nfl_games(days_ahead: int = 8) -> dict:
             "started": ko <= now, "odds_fetched_at": str(r["fetched_at"]),
             "moneyline": ml, "spread": sp, "total": tot,
         })
+    model_meta, status, n_model = None, None, 0
+    if with_model and games:
+        try:
+            import nfl_game_model as ngm
+            status = _backtest_status()
+            preds = ngm.predict_upcoming(2026)
+            model_meta = {k: v for k, v in preds.get("_meta", {}).items()}
+            for g in games:
+                key = (_ABBR.get(g["home"]), _ABBR.get(g["away"]))
+                if key in preds:
+                    _attach_model(g, preds[key], status)
+                    n_model += 1
+            if n_model < sum(1 for g in games if not g["started"] and
+                             g["kickoff_utc"][:10] <= (now + timedelta(days=4)).strftime("%Y-%m-%d")):
+                logger.warning("[GamesEdges] model attached to only %d/%d games", n_model, len(games))
+        except Exception as exc:
+            logger.warning("[GamesEdges] model prediction failed: %s", exc, exc_info=True)
+            model_meta = {"error": str(exc)}
     return {
         "sport": "NFL", "generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "n_games": len(games), "skipped_bad_json": skipped, "games": games,
+        "model_meta": model_meta, "n_with_model": n_model, "backtest": status,
         "method": "fair = median per-book multiplicative devig at consensus point; "
                   "shop_ev = fair × best − 1. No validated NFL side/total model — "
                   "edges are line-shopping + Wong teaser structure only.",

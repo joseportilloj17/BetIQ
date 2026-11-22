@@ -6966,6 +6966,13 @@ def lab_nfl_games(days_ahead: int = 8):
     return lng.build_nfl_games(days_ahead)
 
 
+@app.get("/api/nfl/picks")
+def nfl_picks(week: Optional[int] = None, season: int = 2026, budget: float = 50.0, unit: float = 10.0):
+    """NFL Lab Picks: FW-2 qualifying picks, prereg card, cross-game parlays, budget allocation."""
+    import nfl_picks as npk
+    return npk.plan(season, week, budget, unit)
+
+
 @app.get("/api/lab/nba")
 def lab_nba(game_date: Optional[str] = None):
     """NBA Lab: S5-4 frozen-sim forward predictions at every market line (read-only)."""

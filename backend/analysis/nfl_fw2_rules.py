@@ -241,18 +241,25 @@ def cmd_history(args):
                   f"@{p['price']:.2f} edge={p['edge']:+5.1f}pp act={p['actual']} {res}")
 
 
-def cmd_slate(args):
+def slate_picks(season=2026, week=11):
+    """Upcoming (not-yet-kicked-off) qualifying picks as dicts, plus counts."""
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     conn = _ro()
-    preds = [r for r in load_preds(conn, args.season, [args.week]) if (r["kickoff_utc"] or "") > now_iso]
-    fd = load_fd_prices(conn, sorted({(r["kickoff_utc"] or "")[:10] for r in preds} | {"2026-11-22", "2026-11-23", "2026-11-24"}))
+    preds = [r for r in load_preds(conn, season, [week]) if (r["kickoff_utc"] or "") > now_iso]
+    dates = sorted({(r["kickoff_utc"] or "")[:10] for r in preds})
+    # game_date in player_props can be the local (ET) date — include the day before each kickoff date
+    from datetime import date as _d, timedelta as _td
+    dates = sorted(set(dates) | {(_d.fromisoformat(d) - _td(days=1)).isoformat() for d in dates if d})
+    fd = load_fd_prices(conn, dates or ["0000-00-00"])
     conn.close()
-    pdb = _sleeper_player_db()
-    inj = {}
-    for v in pdb.values():
-        if v.get("full_name") and v.get("injury_status"):
-            inj[_normalize_player_name(v["full_name"])] = v["injury_status"]
-    rows, miss = [], 0
+    try:
+        pdb = _sleeper_player_db()
+    except Exception as exc:  # injury source optional, but say so
+        logger.warning("Sleeper player DB unavailable (no injury status): %s", exc)
+        pdb = {}
+    inj = {_normalize_player_name(v["full_name"]): v["injury_status"]
+           for v in pdb.values() if v.get("full_name") and v.get("injury_status")}
+    out, miss = [], 0
     for r in preds:
         c = classify(r, fd, now_iso)
         if not c:
@@ -261,19 +268,54 @@ def cmd_slate(args):
         if price is None:
             miss += 1
             continue
-        rows.append((rule, r, side, mp, mk, edge, price, inj.get(_normalize_player_name(r["player_name"]), "")))
-    print(f"Upcoming W{args.week} qualifying picks (FanDuel price; generated {now_iso}); "
-          f"{len(preds)} future main-line preds; fd_missing={miss}\n")
+        out.append(dict(rule=rule, player=r["player_name"], pos=r["position"], team=r["team"], opp=r["opponent"],
+                        game_id=r["game_id"], kickoff=r["kickoff_utc"], stat=r["stat_type"], line=r["prop_line"],
+                        side=side, model_p=round(mp, 4), mkt_p=round(mk, 4), edge_pp=round(edge, 1), price=price,
+                        ev=round(mp * (price - 1) - (1 - mp), 4),
+                        injury=inj.get(_normalize_player_name(r["player_name"]), ""),
+                        stake_units=0.5 if r["stat_type"] in ("receptions", "pass_tds") else 1.0))
+    out.sort(key=lambda x: -x["ev"])
+    return {"generated_at": now_iso, "season": season, "week": week, "n_future_main_preds": len(preds),
+            "fd_missing": miss, "picks": out}
+
+
+def prereg_card(picks, max_units=5.0):
+    """FW-2c + FW-2d by EV: 1/player, 2/game, max_units total; Questionable/Doubtful/Out held out."""
+    card, per_game, players, units, bench = [], defaultdict(int), set(), 0.0, []
+    for p in picks:
+        if p["rule"] not in ("FW-2c", "FW-2d"):
+            continue
+        if p["injury"] in ("Out", "IR", "Doubtful"):
+            continue
+        if p["injury"] == "Questionable" or p["player"] in players or per_game[p["game_id"]] >= 2 \
+                or units + p["stake_units"] > max_units:
+            bench.append(p)
+            continue
+        card.append(p)
+        players.add(p["player"])
+        per_game[p["game_id"]] += 1
+        units += p["stake_units"]
+    return card, bench
+
+
+def cmd_slate(args):
+    d = slate_picks(args.season, args.week)
+    print(f"Upcoming W{args.week} qualifying picks (FanDuel price; generated {d['generated_at']}); "
+          f"{d['n_future_main_preds']} future main-line preds; fd_missing={d['fd_missing']}\n")
     for rule in ("FW-2c", "FW-2d", "FW-2e"):
-        sel = sorted([x for x in rows if x[0] == rule], key=lambda x: -x[5])
+        sel = sorted([x for x in d["picks"] if x["rule"] == rule], key=lambda x: -x["edge_pp"])
         print(f"== {rule} ({len(sel)})")
-        for _, r, side, mp, mk, edge, price, st in sel:
-            ev = mp * (price - 1) - (1 - mp)
-            flag = f" [{st}]" if st else ""
-            print(f"  {r['kickoff_utc'][5:16]} {r['team'] or '':<4}v{r['opponent'] or '':<4} {r['player_name']:<22} "
-                  f"{r['position'] or '':<3} {r['stat_type']:<10} {side.upper():<5} {r['prop_line']:>5} @{price:.2f}  "
-                  f"model={mp:.3f} mkt={mk:.3f} edge={edge:+.1f}pp EV={ev:+.3f}{flag}")
+        for x in sel:
+            flag = f" [{x['injury']}]" if x["injury"] else ""
+            print(f"  {x['kickoff'][5:16]} {x['team'] or '':<4}v{x['opp'] or '':<4} {x['player']:<22} "
+                  f"{x['pos'] or '':<3} {x['stat']:<10} {x['side'].upper():<5} {x['line']:>5} @{x['price']:.2f}  "
+                  f"model={x['model_p']:.3f} mkt={x['mkt_p']:.3f} edge={x['edge_pp']:+.1f}pp EV={x['ev']:+.3f}{flag}")
         print()
+    card, bench = prereg_card(d["picks"])
+    print("== Pre-registered card (FW-2c+2d by EV, 1/player, 2/game, 5u)")
+    for x in card:
+        print(f"  {x['stake_units']}u  {x['player']:<22} {x['stat']:<10} {x['side'].upper()} {x['line']} @{x['price']:.2f}  EV={x['ev']:+.3f}")
+    print("  bench:", ", ".join(f"{x['player']} {x['stat']} {x['side']} {x['line']}{' ['+x['injury']+']' if x['injury'] else ''}" for x in bench[:6]))
 
 
 if __name__ == "__main__":

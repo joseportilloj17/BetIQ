@@ -3210,9 +3210,20 @@ Rockets +4.5  Alt Spread  -950"
   </div>
 
   <div class="tabs" style="margin-bottom:14px">
-    <div class="tab active" id="nfllab-tab-props" onclick="switchNflLabTab('props')">🎯 Player Props</div>
+    <div class="tab" id="nfllab-tab-picks" onclick="switchNflLabTab('picks')">✅ Picks</div>
+    <div class="tab active" id="nfllab-tab-props" onclick="switchNflLabTab('props')">🎯 All Props</div>
     <div class="tab" id="nfllab-tab-games" onclick="switchNflLabTab('games')">🏟️ Games &amp; Edges</div>
     <div class="tab" id="nfllab-tab-perf" onclick="switchNflLabTab('perf')">📈 Performance</div>
+  </div>
+
+  <!-- Picks pane -->
+  <div id="nfllab-pane-picks" style="display:none">
+    <div class="filter-row" style="margin-bottom:10px;flex-wrap:wrap;gap:10px;align-items:center;font-size:12px;color:var(--muted)">
+      <label>Budget $ <input type="number" id="nflk-budget" value="50" min="5" step="5" onchange="loadNflPicks()" style="width:70px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:6px"></label>
+      <label>$ per unit <input type="number" id="nflk-unit" value="10" min="1" step="1" onchange="loadNflPicks()" style="width:60px;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:6px"></label>
+      <button class="btn btn-ghost btn-sm" onclick="loadNflPicks()">↻ Refresh</button>
+    </div>
+    <div id="nflk-content"><div class="loading">Loading…</div></div>
   </div>
 
   <!-- Games & Edges pane -->
@@ -3262,7 +3273,7 @@ Rockets +4.5  Alt Spread  -950"
     <div id="nflp-context" style="font-size:11px;color:var(--muted);margin-bottom:8px"></div>
     <div class="grid-2" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px">
       <div class="card"><div class="card-title">Win rate vs breakeven by week</div><canvas id="nflp-chart-wr" height="190"></canvas></div>
-      <div class="card"><div class="card-title">Cumulative units (flat 1u)</div><canvas id="nflp-chart-cum" height="190"></canvas></div>
+      <div class="card"><div class="card-title">Cumulative units <span style="font-size:11px;color:var(--muted);font-weight:400">(flat 1u straight on every qualifying pick — no parlays, no 5u/player/game caps)</span></div><canvas id="nflp-chart-cum" height="190"></canvas></div>
     </div>
     <div class="card" style="margin-top:12px"><div class="card-title">Can the market prove me wrong? Brier(model) − Brier(devig market), by week <span style="font-size:11px;color:var(--muted);font-weight:400">(below 0 = model beats market; CI fully above 0 = market wins)</span></div><canvas id="nflp-chart-brier" height="150"></canvas></div>
     <div class="card" style="margin-top:12px"><div class="card-title">Week-over-week table</div><div id="nflp-table" class="table-wrap" style="font-size:12px"></div></div>
@@ -11399,13 +11410,66 @@ function renderNflLabTable() {
 let _nflLabTab = 'props';
 function switchNflLabTab(tab) {
   _nflLabTab = tab;
-  for (const t of ['props', 'games', 'perf']) {
+  for (const t of ['picks', 'props', 'games', 'perf']) {
     document.getElementById('nfllab-tab-' + t)?.classList.toggle('active', t === tab);
     const p = document.getElementById('nfllab-pane-' + t);
     if (p) p.style.display = t === tab ? '' : 'none';
   }
   if (tab === 'games') loadNflGames();
+  if (tab === 'picks') loadNflPicks();
   if (tab === 'perf') loadNflPerf();
+}
+
+// ── NFL Picks (pre-registered FW-2 + budget planner) ────────────────────────────
+async function loadNflPicks() {
+  const el = document.getElementById('nflk-content');
+  if (!el) return;
+  el.innerHTML = '<div class="loading">Loading picks… (~30s)</div>';
+  const b = document.getElementById('nflk-budget').value, u = document.getElementById('nflk-unit').value;
+  const d = await apiFetch(`/api/nfl/picks?budget=${b}&unit=${u}`);
+  if (!d || d.error) { el.innerHTML = `<span style="color:var(--muted)">${d?.error || 'Failed to load picks.'}</span>`; return; }
+  const money = v => (v < 0 ? '−$' : '$') + Math.abs(v).toFixed(2);
+  const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+  const stat = { pass_yds: 'Pass Yds', rush_yds: 'Rush Yds', rec_yds: 'Rec Yds', receptions: 'Rec', pass_tds: 'Pass TD' };
+  const chip = (txt, col) => `<span style="display:inline-block;padding:1px 7px;border-radius:10px;font-size:10px;font-weight:600;background:${col}22;color:${col}">${txt}</span>`;
+  const ruleCol = { 'FW-2c': '#22c55e', 'FW-2d': '#3b82f6', 'FW-2e': '#8890a8' };
+  let h = `<div style="font-size:11px;color:var(--muted);margin-bottom:10px">NFL · S${d.season} W${d.week} · generated ${d.generated_at} · ${d.picks.length} qualifying picks from ${d.n_future_main_preds} upcoming main-line preds (FanDuel price; ${d.fd_missing} lacked an FD price at the line) · ${d.notes}</div>`;
+  h += `<div class="card" style="border-left:3px solid var(--green)"><div class="card-title">Your $${d.budget} plan ($${d.unit}/unit) — spent ${money(d.spent)}, expected profit <span style="color:var(--green)">${money(d.expected_profit)}</span></div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="border-bottom:2px solid var(--border)"><th style="text-align:left;padding:5px">Bet</th><th style="text-align:left;padding:5px">Type</th><th style="text-align:right;padding:5px">Stake</th><th style="text-align:right;padding:5px">Odds</th><th style="text-align:right;padding:5px">Hit chance</th><th style="text-align:right;padding:5px">Pays</th><th style="text-align:right;padding:5px">EV</th></tr></thead><tbody>`;
+  for (const a of d.allocation) {
+    const typ = a.type === 'straight' ? chip('STRAIGHT', '#22c55e') : chip(a.type.toUpperCase(), a.type.includes('lottery') ? '#f59e0b' : '#3b82f6');
+    h += `<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px;font-weight:500">${a.desc}</td><td style="padding:5px">${typ}</td>
+      <td style="padding:5px;text-align:right">${money(a.stake)}</td><td style="padding:5px;text-align:right">${a.price.toFixed(2)}</td><td style="padding:5px;text-align:right">${pct(a.p)}</td>
+      <td style="padding:5px;text-align:right">${money(a.stake * a.price)}</td><td style="padding:5px;text-align:right;color:var(--green)">${money(a.stake * a.ev_per_dollar)}</td></tr>`;
+  }
+  h += `</tbody></table><div style="font-size:11px;color:var(--muted);margin-top:6px">Straights first at pre-registered stakes (1u yardage, ½u counts; 1/player, 2/game, 5u cap), then 2–3 leg cross-game parlays, then a small 6+ leg lottery if budget remains. Raise the budget to see parlays added. Hit chance for straights is model P (uncalibrated at the top end; FW-2c realized ~80% season).</div></div>`;
+  const onCard = new Set(d.card.map(c => c.player + c.stat));
+  for (const rule of ['FW-2c', 'FW-2d', 'FW-2e']) {
+    const rows = d.picks.filter(p => p.rule === rule);
+    const title = { 'FW-2c': 'FW-2c low-line OVER — BET', 'FW-2d': 'FW-2d QB rush — BET', 'FW-2e': 'FW-2e edge >15pp — TRACK ONLY, do not bet' }[rule];
+    h += `<div class="card" style="margin-top:12px;${rule === 'FW-2e' ? 'opacity:0.7' : ''}"><div class="card-title">${chip(rule, ruleCol[rule])} ${title} <span style="font-weight:400;color:var(--muted);font-size:11px">(${rows.length})</span></div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:4px">Kick</th><th style="text-align:left;padding:4px">Player</th><th style="padding:4px">Pos</th><th style="text-align:left;padding:4px">Bet</th><th style="text-align:right;padding:4px">FD</th><th style="text-align:right;padding:4px">Model</th><th style="text-align:right;padding:4px">Mkt</th><th style="text-align:right;padding:4px">Edge</th><th style="text-align:right;padding:4px">EV/$</th><th style="padding:4px">Status</th></tr></thead><tbody>`;
+    for (const p of rows) {
+      const ko = new Date(p.kickoff).toLocaleString('en-US', { timeZone: 'America/Chicago', weekday: 'short', hour: 'numeric', minute: '2-digit' });
+      const status = onCard.has(p.player + p.stat) ? chip('ON CARD', '#22c55e') : (p.injury ? chip(p.injury.toUpperCase(), '#f59e0b') : '');
+      h += `<tr style="border-bottom:1px solid var(--border)"><td style="padding:4px;color:var(--muted)">${ko}</td><td style="padding:4px;font-weight:500">${p.player} <span style="color:var(--muted);font-size:10px">${p.team || ''} v ${p.opp || ''}</span></td><td style="padding:4px;text-align:center;color:var(--muted)">${p.pos || ''}</td>
+        <td style="padding:4px"><b style="color:${p.side === 'over' ? 'var(--green)' : 'var(--red)'}">${p.side.toUpperCase()}</b> ${p.line} ${stat[p.stat] || p.stat}</td><td style="padding:4px;text-align:right">${p.price.toFixed(2)}</td>
+        <td style="padding:4px;text-align:right">${pct(p.model_p)}</td><td style="padding:4px;text-align:right;color:var(--muted)">${pct(p.mkt_p)}</td><td style="padding:4px;text-align:right;font-weight:600;color:var(--green)">+${p.edge_pp}pp</td>
+        <td style="padding:4px;text-align:right">+${p.ev.toFixed(2)}</td><td style="padding:4px">${status}</td></tr>`;
+    }
+    h += '</tbody></table></div>';
+  }
+  const bt = Object.fromEntries((d.parlay_backtest?.rows || []).map(r => [r.k, r]));
+  h += `<div class="card" style="margin-top:12px"><div class="card-title">Cross-game parlay ladder (best-EV leg per game, FW-2c/2d only)</div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="border-bottom:2px solid var(--border)"><th style="padding:4px">#</th><th style="text-align:left;padding:4px">Legs</th><th style="text-align:right;padding:4px">Odds</th><th style="text-align:right;padding:4px">Hit (indep)</th><th style="text-align:right;padding:4px">Hit (haircut)</th><th style="text-align:right;padding:4px">EV/$ (haircut)</th><th style="text-align:right;padding:4px">Backtest hit vs indep</th><th style="text-align:right;padding:4px">Backtest wks +</th></tr></thead><tbody>`;
+  for (const pr of d.parlays) {
+    const b = bt[pr.k];
+    h += `<tr style="border-bottom:1px solid var(--border)"><td style="padding:4px;text-align:center;font-weight:600">${pr.k}</td><td style="padding:4px;font-size:11px">${pr.legs.map(l => l.player + ' ' + l.side[0].toUpperCase() + l.line).join(' · ')}</td>
+      <td style="padding:4px;text-align:right">${pr.price.toFixed(2)}</td><td style="padding:4px;text-align:right;color:var(--muted)">${pct(pr.p_model_indep)}</td><td style="padding:4px;text-align:right">${pct(pr.p_haircut)}</td>
+      <td style="padding:4px;text-align:right;color:var(--green)">+${pr.ev_haircut.toFixed(2)}</td><td style="padding:4px;text-align:right;color:var(--muted)">${b ? b.hit_pct + '% vs ' + b.indep_pct + '%' : '—'}</td><td style="padding:4px;text-align:right;color:var(--muted)">${b ? b.weeks_profitable + '/' + b.weeks : '—'}</td></tr>`;
+  }
+  h += `</tbody></table><div style="font-size:11px;color:var(--muted);margin-top:6px">Backtest: ${d.parlay_backtest?.n_legs || '?'} graded FW-2c/2d legs, weeks ${(d.parlay_backtest?.weeks || []).join(',')}, random cross-game combos at FanDuel prices — ${d.parlay_backtest?.note || ''} Realized hit rates fall to about half of independence by 7 legs (legs fail together within a week), so deep parlays are lottery tickets: positive EV on paper, but you lose most weeks. Same-game stacks (e.g. WR yards + receptions) are not suggested — FanDuel's SGP copula prices that correlation (2026-10-03 study).</div></div>`;
+  el.innerHTML = h;
 }
 
 // ── NFL Games & Edges ──────────────────────────────────────────────────────────
@@ -11413,7 +11477,7 @@ let _nflGamesData = null;
 async function loadNflGames() {
   const el = document.getElementById('nflg-content');
   if (!el) return;
-  el.innerHTML = '<div class="loading">Loading…</div>';
+  el.innerHTML = '<div class="loading">Loading games + running model sims… (~30s first load, then cached hourly)</div>';
   const data = await apiFetch('/api/lab/nfl/games');
   if (!data || data.error) { el.innerHTML = `<span style="color:var(--muted);font-size:13px">${data?.error || 'No NFL fixtures available.'}</span>`; return; }
   _nflGamesData = data;
@@ -11427,60 +11491,79 @@ function renderNflGames() {
   const mf = document.getElementById('nflg-market')?.value || 'all';
   const posOnly = document.getElementById('nflg-posev')?.checked;
   const wongOnly = document.getElementById('nflg-wong')?.checked;
-  const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
-  const ev = v => v == null ? '—' : `<span style="color:${v > 0 ? 'var(--green)' : 'var(--muted)'};font-weight:${v > 0 ? 600 : 400}">${v > 0 ? '+' : ''}${(v * 100).toFixed(1)}%</span>`;
-  const pt = (v, sgn) => v == null ? '' : (sgn && v > 0 ? '+' : '') + v;
-  const short = n => (n || '').split(' ').slice(-1)[0];
+  const pct = v => v == null ? '—' : (v * 100).toFixed(0) + '%';
+  const sg = (v, d = 1) => v == null ? '—' : (v > 0 ? '+' : '') + Number(v).toFixed(d);
+  const abbr = n => (n || '').split(' ').slice(-1)[0];
+  const chip = (txt, col, title = '') => `<span title="${title}" style="display:inline-block;padding:1px 7px;border-radius:10px;font-size:10px;font-weight:700;background:${col}22;color:${col};white-space:nowrap">${txt}</span>`;
+  const bt = data.backtest;
+  const passed = bt?.passed || {};
   const markets = mf === 'all' ? ['moneyline', 'spread', 'total'] : [mf];
-  const mLabel = { moneyline: 'ML', spread: 'Spread', total: 'Total' };
-  let rows = [];
+  const mLabel = { moneyline: 'Moneyline', spread: 'Spread', total: 'Total' };
+
+  // Header / validation banner
+  const btTxt = bt ? Object.entries(passed).map(([m, ok]) => `${mLabel[m] || m}: ${ok ? '<b style="color:var(--green)">PASSED</b>' : '<b style="color:var(--red)">FAILED</b>'}`).join(' · ')
+                   : '<b style="color:var(--amber)">backtest running / not yet available</b>';
+  let h = `<div class="card" style="margin-bottom:12px;font-size:11px;color:var(--muted);line-height:1.6">
+    <b style="color:var(--text)">NFL · ${data.n_games} games · ${data.n_with_model} with model</b> · odds ${data.games[0]?.odds_fetched_at?.slice(0, 16) || '—'} UTC ·
+    model = unanchored drive sim, opponent-adjusted, ${data.model_meta?.n_sims || '?'} sims/game, HFA ${data.model_meta?.hfa != null ? data.model_meta.hfa.toFixed(1) : '?'} pts, W${data.model_meta?.week || '?'} inputs<br>
+    Walk-forward backtest 2023–25 vs closing lines (${bt?.n_games || '?'} games${bt?.run_at ? ', run ' + bt.run_at : ''}): ${btTxt}.
+    <b>TAKE</b> appears only on markets whose pre-registered backtest rule passed; otherwise the gap is shown greyed as <i>unvalidated</i>.
+    Fair = median no-vig across books at the consensus line. Wong dog legs (+1.5…+2.5, blind 80%/leg) are the only validated NFL game-level edge.</div>`;
+  h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:12px">';
+  let nCards = 0;
   for (const g of data.games) {
+    const rows = [];
     for (const mk of markets) {
       const m = g[mk];
       if (!m) continue;
       for (const [side, s] of Object.entries(m.sides)) {
-        if (posOnly && !(s.shop_ev > 0)) continue;
+        if (posOnly && !(s.shop_ev > 0) && !s.take) continue;
         if (wongOnly && !(s.wong && s.wong.validated)) continue;
-        rows.push({ g, mk, side, s, m });
+        rows.push({ mk, side, s });
       }
     }
+    if (!rows.length) continue;
+    nCards++;
+    const ko = new Date(g.kickoff_utc).toLocaleString('en-US', { timeZone: 'America/Chicago', weekday: 'short', month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    const mdl = g.model;
+    const anyTake = rows.some(r => r.s.take);
+    const anyWong = rows.some(r => r.s.wong && r.s.wong.validated);
+    h += `<div class="card" style="padding:12px 14px;border-left:3px solid ${anyTake ? 'var(--green)' : anyWong ? 'var(--teal)' : 'var(--border)'}">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+        <div style="font-size:15px;font-weight:700">${abbr(g.away)} <span style="color:var(--muted);font-weight:400">@</span> ${abbr(g.home)}</div>
+        <div style="font-size:11px;color:var(--muted)">${ko}${g.started ? ' ' + chip('LIVE', '#f59e0b') : ''}</div>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:8px">${mdl ? `Model: <b style="color:var(--text)">${abbr(g.away)} ${mdl.proj_away} – ${abbr(g.home)} ${mdl.proj_home}</b> · ${abbr(g.home)} win ${pct(mdl.p_home_win)}` : 'Model: n/a for this game'}${anyWong ? ' · ' + chip('WONG DOG LEG', '#14b8a6', 'Validated structural teaser edge') : ''}</div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em">
+        <th style="text-align:left;padding:3px 4px">Mkt</th><th style="text-align:left;padding:3px 4px">Side</th><th style="text-align:right;padding:3px 4px">Line</th>
+        <th style="text-align:right;padding:3px 4px">Model</th><th style="text-align:right;padding:3px 4px">Gap</th><th style="text-align:right;padding:3px 4px">Best</th><th style="text-align:right;padding:3px 4px"></th></tr></thead><tbody>`;
+    let lastMk = null;
+    for (const { mk, side, s } of rows) {
+      const isSpread = mk === 'spread', isTot = mk === 'total';
+      const line = mk === 'moneyline' ? pct(s.fair_prob) + ' <span style="color:var(--muted);font-size:10px">fair</span>' : (isSpread ? sg(s.point) : s.point);
+      const model = s.model_p == null ? '—' : (mk === 'moneyline' ? pct(s.model_p) : (isSpread ? sg(s.model_line) : s.model_line) + ` <span style="color:var(--muted);font-size:10px">${pct(s.model_p)}</span>`);
+      const gapUnit = s.gap_unit === 'pp' ? 'pp' : '';
+      const gapCol = s.gap == null ? 'var(--muted)' : (s.take ? 'var(--green)' : s.gap > 0 ? 'var(--text)' : 'var(--muted)');
+      const gap = s.gap == null ? '—' : `<span style="font-weight:${s.take ? 700 : 500};color:${gapCol}${s.take ? '' : ';opacity:' + (s.gap > 0 ? 0.85 : 0.5)}">${sg(s.gap)}${gapUnit}</span>`;
+      const flag = s.take ? chip('TAKE', '#22c55e', `Model EV ${sg(s.model_ev * 100)}% at best price`)
+                 : (s.gap > 0 ? `<span style="font-size:9px;color:var(--muted);font-style:italic" title="Backtest for this market did not pass — not a bet signal">unvalidated</span>` : '');
+      const shop = s.shop_ev > 0 ? ` <span style="color:var(--green);font-size:10px" title="Line-shop EV vs no-vig consensus">+${(s.shop_ev * 100).toFixed(1)}%</span>` : '';
+      const wong = s.wong ? ' ' + chip(s.wong.validated ? 'WONG' : 'wong fav', s.wong.validated ? '#14b8a6' : '#8890a8', s.wong.note) : '';
+      h += `<tr style="border-top:1px solid ${lastMk !== mk ? 'var(--border)' : 'transparent'}">
+        <td style="padding:4px;color:var(--muted);font-size:11px">${lastMk !== mk ? mLabel[mk] : ''}</td>
+        <td style="padding:4px;font-weight:500">${isTot ? side : abbr(side)}${wong}</td>
+        <td style="padding:4px;text-align:right">${line}</td>
+        <td style="padding:4px;text-align:right">${model}</td>
+        <td style="padding:4px;text-align:right">${gap}</td>
+        <td style="padding:4px;text-align:right">${s.best_price ?? '—'}<span style="color:var(--muted);font-size:10px"> ${s.best_book || ''}</span>${shop}</td>
+        <td style="padding:4px;text-align:right">${flag}</td></tr>`;
+      lastMk = mk;
+    }
+    h += '</tbody></table></div>';
   }
-  const nPos = rows.filter(r => r.s.shop_ev > 0).length;
-  let html = `<div style="font-size:11px;color:var(--muted);margin-bottom:8px">
-    NFL · next ${data.n_games} games · odds snapshot ${data.games[0]?.odds_fetched_at?.slice(0, 16) || '—'} UTC · ${rows.length} sides shown (${nPos} with +EV vs no-vig consensus) ·
-    <b>No validated NFL side/total model</b> — edges are line-shopping vs the no-vig consensus of ${data.games[0]?.spread?.n_books || '?'} books, plus Wong dog teaser structure (blind 80.0%/leg, N=135).
-  </div>`;
-  html += `<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="border-bottom:2px solid var(--border)">
-    <th style="padding:6px;text-align:left">Kick (CT)</th><th style="padding:6px;text-align:left">Game</th><th style="padding:6px">Mkt</th>
-    <th style="padding:6px;text-align:left">Side</th><th style="padding:6px;text-align:right">Line</th><th style="padding:6px;text-align:right">Fair P</th>
-    <th style="padding:6px;text-align:right">Fair odds</th><th style="padding:6px;text-align:right">Best</th><th style="padding:6px;text-align:left">Book</th>
-    <th style="padding:6px;text-align:right">Shop EV</th><th style="padding:6px;text-align:right">FanDuel</th><th style="padding:6px;text-align:right">FD EV</th>
-    <th style="padding:6px;text-align:right">Line range</th><th style="padding:6px;text-align:left">Structure</th></tr></thead><tbody>`;
-  let lastG = null;
-  for (const { g, mk, side, s, m } of rows) {
-    const ko = new Date(g.kickoff_utc).toLocaleString('en-US', { timeZone: 'America/Chicago', weekday: 'short', hour: 'numeric', minute: '2-digit' });
-    const newG = lastG !== g.fixture_id; lastG = g.fixture_id;
-    const sideLbl = mk === 'total' ? side : short(side);
-    const wong = s.wong ? `<span style="color:${s.wong.validated ? 'var(--green)' : 'var(--muted)'}" title="${s.wong.note}">${s.wong.validated ? '✓ Wong dog leg' : 'Wong fav (track)'}</span>` : '';
-    html += `<tr style="border-top:${newG ? '2px' : '1px'} solid var(--border)">
-      <td style="padding:5px 6px;color:var(--muted)">${newG ? ko + (g.started ? ' <span style="color:var(--amber)">LIVE</span>' : '') : ''}</td>
-      <td style="padding:5px 6px;font-weight:${newG ? 600 : 400}">${newG ? short(g.away) + ' @ ' + short(g.home) : ''}</td>
-      <td style="padding:5px 6px;text-align:center;color:var(--muted)">${mLabel[mk]}</td>
-      <td style="padding:5px 6px">${sideLbl}</td>
-      <td style="padding:5px 6px;text-align:right">${pt(s.point, mk === 'spread')}</td>
-      <td style="padding:5px 6px;text-align:right">${pct(s.fair_prob)}</td>
-      <td style="padding:5px 6px;text-align:right;color:var(--muted)">${s.fair_price ?? '—'}</td>
-      <td style="padding:5px 6px;text-align:right;font-weight:600">${s.best_price ?? '—'}</td>
-      <td style="padding:5px 6px;color:var(--muted)">${s.best_book || ''}</td>
-      <td style="padding:5px 6px;text-align:right">${ev(s.shop_ev)}</td>
-      <td style="padding:5px 6px;text-align:right">${s.fd_price ? s.fd_price + (s.fd_point != null && s.fd_point !== s.point ? ` <span style="color:var(--amber)">(${pt(s.fd_point, mk === 'spread')})</span>` : '') : '—'}</td>
-      <td style="padding:5px 6px;text-align:right">${ev(s.fd_ev)}</td>
-      <td style="padding:5px 6px;text-align:right;color:var(--muted)">${s.point_range && s.point_range[0] !== s.point_range[1] ? pt(s.point_range[0], mk === 'spread') + ' … ' + pt(s.point_range[1], mk === 'spread') : ''}</td>
-      <td style="padding:5px 6px">${wong}</td></tr>`;
-  }
-  html += '</tbody></table>';
-  if (!rows.length) html = '<span style="color:var(--muted);font-size:13px">No sides match the current filters.</span>';
-  el.innerHTML = html;
+  h += '</div>';
+  if (!nCards) h += '<span style="color:var(--muted);font-size:13px">No games match the current filters.</span>';
+  el.innerHTML = h;
 }
 
 // ── NFL Performance (week-over-week) ─────────────────────────────────────────
