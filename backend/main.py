@@ -6959,6 +6959,39 @@ def lab_props(
     return lp.build_lab_props(season, week, include_weather)
 
 
+@app.get("/api/lab/nfl/games")
+def lab_nfl_games(days_ahead: int = 8):
+    """NFL Lab Games & Edges: ML/spread/total best lines, no-vig fair, shop EV, Wong flags."""
+    import lab_nfl_games as lng
+    return lng.build_nfl_games(days_ahead)
+
+
+@app.get("/api/lab/nba")
+def lab_nba(game_date: Optional[str] = None):
+    """NBA Lab: S5-4 frozen-sim forward predictions at every market line (read-only)."""
+    import lab_nba_forward as lnf
+    return lnf.build_nba_lab(game_date)
+
+
+@app.get("/api/nfl/performance")
+def nfl_performance(
+    season: int = 2026,
+    population: str = "fw2_live",
+    stat: Optional[str] = None,
+    side: Optional[str] = None,
+    position: Optional[str] = None,
+    depth: Optional[str] = "main",
+    min_edge: float = 3.0,
+    price: str = "fd",
+):
+    """Week-over-week NFL prop performance (WR vs BE, ROI + CI, cumulative units, Brier vs market)."""
+    import nfl_performance as nperf
+    if population not in ("fw2_live", "FW-2c", "FW-2d", "FW-2e", "all"):
+        raise HTTPException(400, f"unknown population {population!r}")
+    return nperf.weekly_performance(season, population, stat or None, side or None,
+                                    position or None, depth or None, min_edge, price)
+
+
 @app.get("/api/scorecard/{sport}")
 def scorecard_get(
     sport: str,

@@ -349,6 +349,7 @@
   <div class="nav-item" onclick="showPage('fixtures')">⚡ Fixtures</div>
   <div class="nav-item" onclick="showPage('scorecard')" style="color:var(--teal);font-weight:600">📋 Scorecard</div>
   <div class="nav-item" onclick="showPage('nfllab')" style="color:var(--teal)">🏈 NFL Lab</div>
+  <div class="nav-item" onclick="showPage('nbalab')" style="color:var(--teal)">🏀 NBA Lab</div>
   <div class="nav-item" onclick="showPage('oddslab')">🔬 Odds Lab</div>
   <div class="nav-item" id="nav-settle" onclick="showPage('settle')">🤖 Auto-Settle</div>
   <div class="nav-item" onclick="showPage('livebets')" style="color:var(--amber);font-weight:600">💸 Live Bets</div>
@@ -3188,8 +3189,10 @@ Rockets +4.5  Alt Spread  -950"
 
   <!-- Trend Chart -->
   <div class="card" style="margin-top:12px">
-    <div class="card-title">MAE Trend by Week</div>
+    <div class="card-title">Week-over-week: does the model beat the market? <a onclick="showPage('nfllab');switchNflLabTab('perf')" style="font-size:11px;color:var(--blue);cursor:pointer;font-weight:400">Full performance view (bet-type dial) →</a></div>
+    <div id="sc-trend-context" style="font-size:11px;color:var(--muted);margin-bottom:6px"></div>
     <canvas id="sc-trend-chart" height="200"></canvas>
+    <canvas id="sc-trend-wr" height="170" style="margin-top:12px"></canvas>
   </div>
 </div>
 
@@ -3206,6 +3209,66 @@ Rockets +4.5  Alt Spread  -950"
     </div>
   </div>
 
+  <div class="tabs" style="margin-bottom:14px">
+    <div class="tab active" id="nfllab-tab-props" onclick="switchNflLabTab('props')">🎯 Player Props</div>
+    <div class="tab" id="nfllab-tab-games" onclick="switchNflLabTab('games')">🏟️ Games &amp; Edges</div>
+    <div class="tab" id="nfllab-tab-perf" onclick="switchNflLabTab('perf')">📈 Performance</div>
+  </div>
+
+  <!-- Games & Edges pane -->
+  <div id="nfllab-pane-games" style="display:none">
+    <div class="filter-row" style="margin-bottom:10px;flex-wrap:wrap;gap:8px;align-items:center">
+      <select id="nflg-market" onchange="renderNflGames()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+        <option value="all">ML + Spread + Total</option>
+        <option value="moneyline">Moneyline</option>
+        <option value="spread">Spread</option>
+        <option value="total">Total</option>
+      </select>
+      <label style="font-size:12px;color:var(--muted);display:flex;gap:4px;align-items:center"><input type="checkbox" id="nflg-posev" onchange="renderNflGames()"> +EV shop only</label>
+      <label style="font-size:12px;color:var(--muted);display:flex;gap:4px;align-items:center"><input type="checkbox" id="nflg-wong" onchange="renderNflGames()"> Wong teaser legs only</label>
+      <button class="btn btn-ghost btn-sm" onclick="loadNflGames()">↻ Refresh</button>
+    </div>
+    <div id="nflg-content"><div class="loading">Loading…</div></div>
+  </div>
+
+  <!-- Performance pane -->
+  <div id="nfllab-pane-perf" style="display:none">
+    <div class="filter-row" style="margin-bottom:10px;flex-wrap:wrap;gap:8px;align-items:center">
+      <select id="nflp-pop" onchange="loadNflPerf()" title="Bet type" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+        <option value="fw2_live">Live bets (FW-2c + FW-2d)</option>
+        <option value="FW-2c">FW-2c low-line OVER</option>
+        <option value="FW-2d">FW-2d QB rush</option>
+        <option value="FW-2e">FW-2e edge &gt;15pp (track)</option>
+        <option value="all">All graded preds (edge dial)</option>
+      </select>
+      <select id="nflp-stat" onchange="loadNflPerf()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+        <option value="">All stats</option><option value="pass_yds">Pass Yds</option><option value="rush_yds">Rush Yds</option>
+        <option value="rec_yds">Rec Yds</option><option value="receptions">Receptions</option><option value="pass_tds">Pass TDs</option>
+      </select>
+      <select id="nflp-side" onchange="loadNflPerf()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+        <option value="">Both sides</option><option value="over">OVER</option><option value="under">UNDER</option>
+      </select>
+      <select id="nflp-pos" onchange="loadNflPerf()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+        <option value="">All positions</option><option value="QB">QB</option><option value="RB">RB</option><option value="WR">WR</option><option value="TE">TE</option>
+      </select>
+      <select id="nflp-depth" onchange="loadNflPerf()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+        <option value="main">Main lines</option><option value="near_alt">Near alt</option><option value="deep_alt">Deep alt</option><option value="">All depths</option>
+      </select>
+      <label style="font-size:12px;color:var(--muted)">Min edge <input type="range" id="nflp-edge" min="0" max="25" step="1" value="3" oninput="document.getElementById('nflp-edge-v').textContent=this.value+'pp'" onchange="loadNflPerf()" style="vertical-align:middle"> <span id="nflp-edge-v">3pp</span></label>
+      <select id="nflp-price" onchange="loadNflPerf()" title="Price source for FW-2 rules" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+        <option value="fd">FanDuel price (prereg)</option><option value="stored">Stored best-book price</option>
+      </select>
+    </div>
+    <div id="nflp-context" style="font-size:11px;color:var(--muted);margin-bottom:8px"></div>
+    <div class="grid-2" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px">
+      <div class="card"><div class="card-title">Win rate vs breakeven by week</div><canvas id="nflp-chart-wr" height="190"></canvas></div>
+      <div class="card"><div class="card-title">Cumulative units (flat 1u)</div><canvas id="nflp-chart-cum" height="190"></canvas></div>
+    </div>
+    <div class="card" style="margin-top:12px"><div class="card-title">Can the market prove me wrong? Brier(model) − Brier(devig market), by week <span style="font-size:11px;color:var(--muted);font-weight:400">(below 0 = model beats market; CI fully above 0 = market wins)</span></div><canvas id="nflp-chart-brier" height="150"></canvas></div>
+    <div class="card" style="margin-top:12px"><div class="card-title">Week-over-week table</div><div id="nflp-table" class="table-wrap" style="font-size:12px"></div></div>
+  </div>
+
+  <div id="nfllab-pane-props">
   <!-- Filters -->
   <div class="filter-row" style="margin-bottom:14px;flex-wrap:wrap;gap:8px">
     <select id="nfllab-stat" onchange="renderNflLabTable()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
@@ -3239,6 +3302,38 @@ Rockets +4.5  Alt Spread  -950"
   </div>
 
   <div id="nfllab-content"><div class="loading">Loading…</div></div>
+  </div>
+</div>
+
+<!-- ── NBA Lab ── -->
+<div class="page" id="page-nbalab">
+  <div class="page-header">
+    <div>
+      <div class="page-title">🏀 NBA Lab</div>
+      <div class="page-sub">S5-4 frozen sim — P(side) at every market-posted line vs devigged market</div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span id="nbalab-coverage" style="font-size:11px;padding:3px 8px;border-radius:12px;background:var(--surface2);color:var(--muted)"></span>
+      <button class="btn btn-ghost btn-sm" onclick="loadNbaLab()">↻ Refresh</button>
+    </div>
+  </div>
+  <div class="filter-row" style="margin-bottom:12px;flex-wrap:wrap;gap:8px;align-items:center">
+    <select id="nbalab-date" onchange="loadNbaLab(this.value)" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px"></select>
+    <select id="nbalab-game" onchange="renderNbaLab()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px"><option value="">All games</option></select>
+    <select id="nbalab-stat" onchange="renderNbaLab()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+      <option value="">All stats</option><option value="player_points">Points</option><option value="player_rebounds">Rebounds</option>
+      <option value="player_assists">Assists</option><option value="player_threes">3PM</option><option value="player_pra">PRA</option>
+      <option value="player_steals">Steals</option><option value="player_blocks">Blocks</option>
+    </select>
+    <select id="nbalab-side" onchange="renderNbaLab()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px"><option value="">Both sides</option><option value="over">OVER</option><option value="under">UNDER</option></select>
+    <select id="nbalab-depth" onchange="renderNbaLab()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px"><option value="main">Main lines</option><option value="alt">Alt lines</option><option value="">All</option></select>
+    <select id="nbalab-edge" onchange="renderNbaLab()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px">
+      <option value="-999">All edges</option><option value="3">Edge ≥ 3pp</option><option value="5" selected>Edge ≥ 5pp</option><option value="10">Edge ≥ 10pp</option>
+    </select>
+    <label style="font-size:12px;color:var(--muted);display:flex;gap:4px;align-items:center"><input type="checkbox" id="nbalab-band" checked onchange="renderNbaLab()"> Price 1.67–3.50</label>
+  </div>
+  <div id="nbalab-games" style="margin-bottom:10px"></div>
+  <div id="nbalab-content"><div class="loading">Loading…</div></div>
 </div>
 
 <!-- ── Odds Lab (Creator Tier) ── -->
@@ -3753,6 +3848,7 @@ function showPage(name, skipHash) {
     researcher:  loadResearcher,
     scorecard:   loadScorecard,
     nfllab:      loadNflLab,
+    nbalab:      () => loadNbaLab(),
   };
   loaders[name]?.();
 }
@@ -11299,6 +11395,224 @@ function renderNflLabTable() {
   el.innerHTML = html;
 }
 
+// ── NFL Lab tabs ───────────────────────────────────────────────────────────────
+let _nflLabTab = 'props';
+function switchNflLabTab(tab) {
+  _nflLabTab = tab;
+  for (const t of ['props', 'games', 'perf']) {
+    document.getElementById('nfllab-tab-' + t)?.classList.toggle('active', t === tab);
+    const p = document.getElementById('nfllab-pane-' + t);
+    if (p) p.style.display = t === tab ? '' : 'none';
+  }
+  if (tab === 'games') loadNflGames();
+  if (tab === 'perf') loadNflPerf();
+}
+
+// ── NFL Games & Edges ──────────────────────────────────────────────────────────
+let _nflGamesData = null;
+async function loadNflGames() {
+  const el = document.getElementById('nflg-content');
+  if (!el) return;
+  el.innerHTML = '<div class="loading">Loading…</div>';
+  const data = await apiFetch('/api/lab/nfl/games');
+  if (!data || data.error) { el.innerHTML = `<span style="color:var(--muted);font-size:13px">${data?.error || 'No NFL fixtures available.'}</span>`; return; }
+  _nflGamesData = data;
+  renderNflGames();
+}
+
+function renderNflGames() {
+  const el = document.getElementById('nflg-content');
+  const data = _nflGamesData;
+  if (!el || !data) return;
+  const mf = document.getElementById('nflg-market')?.value || 'all';
+  const posOnly = document.getElementById('nflg-posev')?.checked;
+  const wongOnly = document.getElementById('nflg-wong')?.checked;
+  const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+  const ev = v => v == null ? '—' : `<span style="color:${v > 0 ? 'var(--green)' : 'var(--muted)'};font-weight:${v > 0 ? 600 : 400}">${v > 0 ? '+' : ''}${(v * 100).toFixed(1)}%</span>`;
+  const pt = (v, sgn) => v == null ? '' : (sgn && v > 0 ? '+' : '') + v;
+  const short = n => (n || '').split(' ').slice(-1)[0];
+  const markets = mf === 'all' ? ['moneyline', 'spread', 'total'] : [mf];
+  const mLabel = { moneyline: 'ML', spread: 'Spread', total: 'Total' };
+  let rows = [];
+  for (const g of data.games) {
+    for (const mk of markets) {
+      const m = g[mk];
+      if (!m) continue;
+      for (const [side, s] of Object.entries(m.sides)) {
+        if (posOnly && !(s.shop_ev > 0)) continue;
+        if (wongOnly && !(s.wong && s.wong.validated)) continue;
+        rows.push({ g, mk, side, s, m });
+      }
+    }
+  }
+  const nPos = rows.filter(r => r.s.shop_ev > 0).length;
+  let html = `<div style="font-size:11px;color:var(--muted);margin-bottom:8px">
+    NFL · next ${data.n_games} games · odds snapshot ${data.games[0]?.odds_fetched_at?.slice(0, 16) || '—'} UTC · ${rows.length} sides shown (${nPos} with +EV vs no-vig consensus) ·
+    <b>No validated NFL side/total model</b> — edges are line-shopping vs the no-vig consensus of ${data.games[0]?.spread?.n_books || '?'} books, plus Wong dog teaser structure (blind 80.0%/leg, N=135).
+  </div>`;
+  html += `<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="border-bottom:2px solid var(--border)">
+    <th style="padding:6px;text-align:left">Kick (CT)</th><th style="padding:6px;text-align:left">Game</th><th style="padding:6px">Mkt</th>
+    <th style="padding:6px;text-align:left">Side</th><th style="padding:6px;text-align:right">Line</th><th style="padding:6px;text-align:right">Fair P</th>
+    <th style="padding:6px;text-align:right">Fair odds</th><th style="padding:6px;text-align:right">Best</th><th style="padding:6px;text-align:left">Book</th>
+    <th style="padding:6px;text-align:right">Shop EV</th><th style="padding:6px;text-align:right">FanDuel</th><th style="padding:6px;text-align:right">FD EV</th>
+    <th style="padding:6px;text-align:right">Line range</th><th style="padding:6px;text-align:left">Structure</th></tr></thead><tbody>`;
+  let lastG = null;
+  for (const { g, mk, side, s, m } of rows) {
+    const ko = new Date(g.kickoff_utc).toLocaleString('en-US', { timeZone: 'America/Chicago', weekday: 'short', hour: 'numeric', minute: '2-digit' });
+    const newG = lastG !== g.fixture_id; lastG = g.fixture_id;
+    const sideLbl = mk === 'total' ? side : short(side);
+    const wong = s.wong ? `<span style="color:${s.wong.validated ? 'var(--green)' : 'var(--muted)'}" title="${s.wong.note}">${s.wong.validated ? '✓ Wong dog leg' : 'Wong fav (track)'}</span>` : '';
+    html += `<tr style="border-top:${newG ? '2px' : '1px'} solid var(--border)">
+      <td style="padding:5px 6px;color:var(--muted)">${newG ? ko + (g.started ? ' <span style="color:var(--amber)">LIVE</span>' : '') : ''}</td>
+      <td style="padding:5px 6px;font-weight:${newG ? 600 : 400}">${newG ? short(g.away) + ' @ ' + short(g.home) : ''}</td>
+      <td style="padding:5px 6px;text-align:center;color:var(--muted)">${mLabel[mk]}</td>
+      <td style="padding:5px 6px">${sideLbl}</td>
+      <td style="padding:5px 6px;text-align:right">${pt(s.point, mk === 'spread')}</td>
+      <td style="padding:5px 6px;text-align:right">${pct(s.fair_prob)}</td>
+      <td style="padding:5px 6px;text-align:right;color:var(--muted)">${s.fair_price ?? '—'}</td>
+      <td style="padding:5px 6px;text-align:right;font-weight:600">${s.best_price ?? '—'}</td>
+      <td style="padding:5px 6px;color:var(--muted)">${s.best_book || ''}</td>
+      <td style="padding:5px 6px;text-align:right">${ev(s.shop_ev)}</td>
+      <td style="padding:5px 6px;text-align:right">${s.fd_price ? s.fd_price + (s.fd_point != null && s.fd_point !== s.point ? ` <span style="color:var(--amber)">(${pt(s.fd_point, mk === 'spread')})</span>` : '') : '—'}</td>
+      <td style="padding:5px 6px;text-align:right">${ev(s.fd_ev)}</td>
+      <td style="padding:5px 6px;text-align:right;color:var(--muted)">${s.point_range && s.point_range[0] !== s.point_range[1] ? pt(s.point_range[0], mk === 'spread') + ' … ' + pt(s.point_range[1], mk === 'spread') : ''}</td>
+      <td style="padding:5px 6px">${wong}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  if (!rows.length) html = '<span style="color:var(--muted);font-size:13px">No sides match the current filters.</span>';
+  el.innerHTML = html;
+}
+
+// ── NFL Performance (week-over-week) ─────────────────────────────────────────
+let _nflpSeq = 0;
+async function loadNflPerf() {
+  const seq = ++_nflpSeq;
+  const pop = document.getElementById('nflp-pop').value;
+  const q = new URLSearchParams({
+    population: pop,
+    stat: document.getElementById('nflp-stat').value,
+    side: document.getElementById('nflp-side').value,
+    position: document.getElementById('nflp-pos').value,
+    depth: pop === 'all' ? document.getElementById('nflp-depth').value : 'main',
+    min_edge: document.getElementById('nflp-edge').value,
+    price: document.getElementById('nflp-price').value,
+  });
+  document.getElementById('nflp-depth').disabled = pop !== 'all';
+  document.getElementById('nflp-edge').disabled = pop !== 'all';
+  const ctxEl = document.getElementById('nflp-context');
+  const tbl = document.getElementById('nflp-table');
+  ctxEl.textContent = 'Loading… (FW-2 rule populations take ~30s on first load, then cached 10 min)';
+  const d = await apiFetch('/api/nfl/performance?' + q);
+  if (seq !== _nflpSeq) return;
+  if (!d || d.error) { ctxEl.textContent = d?.error || 'Failed to load performance.'; tbl.innerHTML = ''; return; }
+  const f = d.filters, t = d.totals;
+  const ciTxt = s => s && s.roi_ci ? `[${s.roi_ci[0] > 0 ? '+' : ''}${s.roi_ci[0]}, ${s.roi_ci[1] > 0 ? '+' : ''}${s.roi_ci[1]}]` : '[n/a]';
+  const tot = (lbl, s) => s && s.n ? `${lbl}: N=${s.n}, WR ${s.wr}% vs BE ${s.be}%, ROI ${s.roi > 0 ? '+' : ''}${s.roi}% ${ciTxt(s)}` : `${lbl}: N=0`;
+  ctxEl.innerHTML = `<b>${d.sport} ${d.season}</b> · population=${f.population} · stat=${f.stat} · side=${f.side} · pos=${f.position} · depth=${f.depth} · min edge=${f.min_edge_pp} · price=${f.price}<br>
+    ${tot('Season', t.season)} &nbsp;|&nbsp; ${tot('In-sample W2–W9', t.in_sample_w2_w9)} &nbsp;|&nbsp; ${tot('Forward W10+', t.forward_w10_plus)}<br>${d.notes}`;
+  const W = d.weeks.filter(w => w.n);
+  const labels = W.map(w => 'W' + w.week + ` (N=${w.n})`);
+  mkChart('nflp-chart-wr', 'line', { labels, datasets: [
+    { label: 'Win rate %', data: W.map(w => w.wr), borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.1)', fill: false, lineTension: 0.2 },
+    { label: 'Breakeven % (avg 1/price)', data: W.map(w => w.be), borderColor: '#ef4444', borderDash: [5, 5], fill: false, lineTension: 0 },
+  ] }, { scales: { xAxes: [{ ticks: { fontColor: '#8890a8' }, gridLines: { color: '#2e3148' } }],
+                   yAxes: [{ ticks: { fontColor: '#8890a8', suggestedMin: 30, suggestedMax: 100 }, gridLines: { color: '#2e3148' } }] } });
+  mkChart('nflp-chart-cum', 'bar', { labels: W.map(w => 'W' + w.week), datasets: [
+    { type: 'line', label: 'Cumulative units', data: W.map(w => w.cum_units), borderColor: '#22c55e', fill: false, yAxisID: 'y1' },
+    { label: 'Weekly ROI %', data: W.map(w => w.roi), backgroundColor: W.map(w => w.roi >= 0 ? 'rgba(34,197,94,0.35)' : 'rgba(239,68,68,0.45)'), yAxisID: 'y2' },
+  ] }, { scales: { xAxes: [{ ticks: { fontColor: '#8890a8' }, gridLines: { color: '#2e3148' } }],
+                   yAxes: [{ id: 'y1', position: 'left', ticks: { fontColor: '#22c55e' }, gridLines: { color: '#2e3148' }, scaleLabel: { display: true, labelString: 'units', fontColor: '#8890a8' } },
+                           { id: 'y2', position: 'right', ticks: { fontColor: '#8890a8' }, gridLines: { display: false }, scaleLabel: { display: true, labelString: 'ROI %', fontColor: '#8890a8' } }] } });
+  const B = d.weeks.filter(w => w.brier);
+  mkChart('nflp-chart-brier', 'line', { labels: B.map(w => 'W' + w.week + ` (N=${w.brier.n})`), datasets: [
+    { label: 'Model − market Brier', data: B.map(w => w.brier.diff), borderColor: '#a855f7', fill: false, lineTension: 0 },
+    { label: '95% CI high', data: B.map(w => w.brier.ci ? w.brier.ci[1] : null), borderColor: 'rgba(168,85,247,0.35)', borderDash: [3, 3], fill: '-1', backgroundColor: 'rgba(168,85,247,0.08)', pointRadius: 0 },
+    { label: '95% CI low', data: B.map(w => w.brier.ci ? w.brier.ci[0] : null), borderColor: 'rgba(168,85,247,0.35)', borderDash: [3, 3], fill: '-2', backgroundColor: 'rgba(168,85,247,0.08)', pointRadius: 0 },
+    { label: 'Market parity (0)', data: B.map(() => 0), borderColor: '#8890a8', borderWidth: 1, pointRadius: 0, fill: false },
+  ] });
+  const sg = v => v == null ? '—' : (v > 0 ? '+' : '') + v;
+  let h = `<table style="width:100%;border-collapse:collapse"><thead><tr style="border-bottom:2px solid var(--border)">
+    <th style="padding:5px;text-align:left">Week</th><th style="padding:5px;text-align:right">N</th><th style="padding:5px;text-align:right">W–L</th>
+    <th style="padding:5px;text-align:right">WR</th><th style="padding:5px;text-align:right">BE</th><th style="padding:5px;text-align:right">WR−BE</th>
+    <th style="padding:5px;text-align:right">ROI</th><th style="padding:5px;text-align:right">95% CI</th><th style="padding:5px;text-align:right">Games</th>
+    <th style="padding:5px;text-align:right">Cum u</th><th style="padding:5px;text-align:right">Brier Δ vs mkt [CI] (N)</th></tr></thead><tbody>`;
+  for (const w of d.weeks) {
+    const b = w.brier;
+    const bCol = b && b.ci ? (b.ci[1] < 0 ? 'var(--green)' : (b.ci[0] > 0 ? 'var(--red)' : 'var(--muted)')) : 'var(--muted)';
+    h += `<tr style="border-bottom:1px solid var(--border)"><td style="padding:4px 5px">W${w.week}${w.week >= 10 ? ' <span style="color:var(--teal);font-size:10px">fwd</span>' : ''}</td>
+      <td style="padding:4px 5px;text-align:right">${w.n || 0}</td><td style="padding:4px 5px;text-align:right">${w.n ? w.w + '–' + (w.n - w.w) : '—'}</td>
+      <td style="padding:4px 5px;text-align:right">${w.n ? w.wr + '%' : '—'}</td><td style="padding:4px 5px;text-align:right;color:var(--muted)">${w.n ? w.be + '%' : '—'}</td>
+      <td style="padding:4px 5px;text-align:right;color:${w.n && w.wr >= w.be ? 'var(--green)' : 'var(--red)'}">${w.n ? sg(Math.round((w.wr - w.be) * 10) / 10) + 'pp' : '—'}</td>
+      <td style="padding:4px 5px;text-align:right;font-weight:600;color:${(w.roi || 0) >= 0 ? 'var(--green)' : 'var(--red)'}">${w.n ? sg(w.roi) + '%' : '—'}</td>
+      <td style="padding:4px 5px;text-align:right;color:var(--muted)">${w.roi_ci ? '[' + sg(w.roi_ci[0]) + ', ' + sg(w.roi_ci[1]) + ']' : (w.n ? 'n/a (<3 games)' : '')}</td>
+      <td style="padding:4px 5px;text-align:right;color:var(--muted)">${w.n_games || ''}</td><td style="padding:4px 5px;text-align:right">${sg(w.cum_units)}</td>
+      <td style="padding:4px 5px;text-align:right;color:${bCol}">${b ? sg(b.diff) + (b.ci ? ' [' + sg(b.ci[0]) + ', ' + sg(b.ci[1]) + ']' : '') + ` (${b.n})` : '—'}</td></tr>`;
+  }
+  h += '</tbody></table><div style="font-size:11px;color:var(--muted);margin-top:6px">WR−BE is the primary forward read (odds-mix independent). N&lt;30 weeks are noise — read the season / forward totals above. Brier Δ is computed on every graded row matching the stat/pos/depth filters, independent of bet selection.</div>';
+  tbl.innerHTML = h;
+}
+
+// ── NBA Lab ────────────────────────────────────────────────────────────────────
+let _nbaLabData = null;
+async function loadNbaLab(date) {
+  const el = document.getElementById('nbalab-content');
+  if (!el) return;
+  el.innerHTML = '<div class="loading">Loading…</div>';
+  const data = await apiFetch('/api/lab/nba' + (date ? '?game_date=' + encodeURIComponent(date) : ''));
+  if (!data || data.error) { el.innerHTML = `<span style="color:var(--muted);font-size:13px">${data?.error || 'No NBA forward predictions stored.'}</span>`; return; }
+  _nbaLabData = data;
+  const ds = document.getElementById('nbalab-date');
+  ds.innerHTML = (data.available_dates || []).map(d => `<option value="${d}"${d === data.game_date ? ' selected' : ''}>${d}</option>`).join('');
+  const gs = document.getElementById('nbalab-game');
+  gs.innerHTML = '<option value="">All games</option>' + data.games.map(g => `<option value="${g.game_id}">${g.away} @ ${g.home}</option>`).join('');
+  document.getElementById('nbalab-coverage').textContent = `${data.game_date} · ${data.n_games} games · ${data.n_props} props · ${data.model_version || ''}`;
+  const warn = [];
+  if (data.games_missing_market_anchor) warn.push(`⚠ ${data.games_missing_market_anchor}/${data.n_games} games have no market spread/total anchor (blowout + pace inputs missing)`);
+  if (data.n_excluded_phantom_alt_under) warn.push(`${data.n_excluded_phantom_alt_under} alt-UNDER rows hidden (market posts alt OVERs only — storage bug, OPS-8)`);
+  if (data.n_fallback_no_market) warn.push(`${data.n_fallback_no_market} rows with no market line hidden`);
+  document.getElementById('nbalab-games').innerHTML = `<div style="font-size:11px;color:var(--amber);margin-bottom:6px">UNCALIBRATED: ${data.notes}</div>` +
+    (warn.length ? `<div style="font-size:11px;color:var(--muted)">${warn.join(' · ')}</div>` : '');
+  renderNbaLab();
+}
+
+function renderNbaLab() {
+  const el = document.getElementById('nbalab-content');
+  const d = _nbaLabData;
+  if (!el || !d) return;
+  const gF = document.getElementById('nbalab-game').value, sF = document.getElementById('nbalab-stat').value;
+  const sideF = document.getElementById('nbalab-side').value, dF = document.getElementById('nbalab-depth').value;
+  const eF = parseFloat(document.getElementById('nbalab-edge').value), band = document.getElementById('nbalab-band').checked;
+  const gm = Object.fromEntries(d.games.map(g => [g.game_id, g]));
+  const rows = d.props.filter(p => (!gF || p.game_id === gF) && (!sF || p.stat === sF) && (!sideF || p.side === sideF)
+    && (!dF || p.depth === dF) && (p.edge_pp ?? -999) >= eF && (!band || (p.best_price >= 1.667 && p.best_price <= 3.5)));
+  const lbl = { player_points: 'PTS', player_rebounds: 'REB', player_assists: 'AST', player_threes: '3PM', player_pra: 'PRA', player_steals: 'STL', player_blocks: 'BLK' };
+  const pct = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+  let h = `<div style="font-size:11px;color:var(--muted);margin-bottom:8px">NBA · ${d.game_date} · ${rows.length} of ${d.n_props} props · filters: game=${gF || 'all'}, stat=${sF || 'all'}, side=${sideF || 'both'}, depth=${dF || 'all'}, edge≥${eF > -999 ? eF + 'pp' : 'any'}${band ? ', price 1.67–3.50' : ''} · edges &gt;20pp are usually sim minutes/availability artifacts until calibrated</div>`;
+  h += `<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="border-bottom:2px solid var(--border)">
+    <th style="padding:6px;text-align:left">Player</th><th style="padding:6px;text-align:left">Game</th><th style="padding:6px">Stat</th><th style="padding:6px">Side</th>
+    <th style="padding:6px;text-align:right">Line</th><th style="padding:6px;text-align:right">Sim med</th><th style="padding:6px;text-align:right">Sim P</th>
+    <th style="padding:6px;text-align:right">Mkt P</th><th style="padding:6px;text-align:right">Edge</th><th style="padding:6px;text-align:right">Best</th>
+    <th style="padding:6px;text-align:left">Book</th><th style="padding:6px;text-align:right">EV/u</th><th style="padding:6px">Depth</th><th style="padding:6px">Inj</th><th style="padding:6px">Result</th></tr></thead><tbody>`;
+  for (const p of rows.slice(0, 300)) {
+    const g = gm[p.game_id] || {};
+    const ab = n => (n || '').split(' ').slice(-1)[0];
+    h += `<tr style="border-bottom:1px solid var(--border)"><td style="padding:4px 6px;font-weight:500">${p.player}</td>
+      <td style="padding:4px 6px;color:var(--muted)">${ab(g.away)} @ ${ab(g.home)}</td><td style="padding:4px 6px;text-align:center">${lbl[p.stat] || p.stat}</td>
+      <td style="padding:4px 6px;text-align:center;font-weight:600;color:${p.side === 'over' ? 'var(--green)' : 'var(--red)'}">${p.side.toUpperCase()}</td>
+      <td style="padding:4px 6px;text-align:right">${p.line}</td><td style="padding:4px 6px;text-align:right;color:var(--muted)">${p.sim_median ?? '—'}</td>
+      <td style="padding:4px 6px;text-align:right">${pct(p.sim_p)}</td><td style="padding:4px 6px;text-align:right">${pct(p.mkt_p)}</td>
+      <td style="padding:4px 6px;text-align:right;font-weight:600;color:${(p.edge_pp || 0) > 0 ? 'var(--green)' : 'var(--red)'}">${p.edge_pp != null ? (p.edge_pp > 0 ? '+' : '') + p.edge_pp + 'pp' : '—'}</td>
+      <td style="padding:4px 6px;text-align:right">${p.best_price ?? '—'}</td><td style="padding:4px 6px;color:var(--muted)">${p.best_book || ''}</td>
+      <td style="padding:4px 6px;text-align:right">${p.ev != null ? (p.ev > 0 ? '+' : '') + p.ev.toFixed(2) : '—'}</td>
+      <td style="padding:4px 6px;text-align:center;color:var(--muted)">${p.depth}</td><td style="padding:4px 6px;text-align:center;color:var(--amber)">${p.injury || ''}</td>
+      <td style="padding:4px 6px;text-align:center">${p.hit == null ? '' : (p.hit ? '<span style="color:var(--green)">✓ ' + p.actual + '</span>' : '<span style="color:var(--red)">✗ ' + p.actual + '</span>')}</td></tr>`;
+  }
+  h += '</tbody></table>';
+  if (rows.length > 300) h += `<div style="font-size:11px;color:var(--muted);margin-top:6px">Showing 300 of ${rows.length}.</div>`;
+  if (!rows.length) h = '<span style="color:var(--muted);font-size:13px">No props match the current filters.</span>';
+  el.innerHTML = h;
+}
+
 async function loadOddsLab() {
   loadCreditMeter();
   loadLineShopping();
@@ -15721,42 +16035,33 @@ function _renderMissesTable(allRow) {
 }
 
 async function _loadTrendChart(pos, mv, ld) {
-  // Fetch all weeks for trend
-  let url = `/api/scorecard/NFL?season=2026&stat_type=_ALL_&position=${pos}&model_version=${mv}&line_depth=${ld}`;
-  let rows = [];
-  try {
-    const res = await fetch(url);
-    const data = await res.json();
-    rows = data.rows || [];
-  } catch(e) { return; }
-
-  const weekRows = rows.filter(r => r.week > 0).sort((a,b) => a.week - b.week);
-  if (!weekRows.length) return;
-
-  const labels = weekRows.map(r => 'W' + r.week);
-  const modelMAE = weekRows.map(r => r.mae);
-  const mktMAE = weekRows.map(r => r.market_mae);
-
-  const ctx = document.getElementById('sc-trend-chart');
-  if (_scTrendChart) _scTrendChart.destroy();
-  _scTrendChart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [
-        { label: 'Model MAE', data: modelMAE, borderColor: 'rgb(59,130,246)', backgroundColor: 'rgba(59,130,246,0.1)', tension: 0.3, fill: false },
-        { label: 'Market MAE', data: mktMAE, borderColor: 'rgb(239,68,68)', backgroundColor: 'rgba(239,68,68,0.1)', tension: 0.3, fill: false, borderDash: [5,5] },
-      ]
-    },
-    options: {
-      responsive: true,
-      plugins: { legend: { labels: { color: 'rgb(156,163,175)' } } },
-      scales: {
-        x: { ticks: { color: 'rgb(156,163,175)' }, grid: { color: 'rgba(156,163,175,0.1)' } },
-        y: { ticks: { color: 'rgb(156,163,175)' }, grid: { color: 'rgba(156,163,175,0.1)' }, title: { display: true, text: 'MAE', color: 'rgb(156,163,175)' } }
-      }
-    }
-  });
+  // Replaces the old MAE trend: MAE vs market says nothing about bet outcomes.
+  // Brier(model) − Brier(devig market) per week with game-clustered CI is falsifiable;
+  // WR vs BE on model-favoured sides (edge ≥ 3pp) is the betting read.
+  const stat = document.getElementById('sc-stat')?.value;
+  const q = new URLSearchParams({ population: 'all', min_edge: 3,
+    stat: stat && stat !== '_ALL_' ? stat : '', position: pos && pos !== '_ALL_' ? pos : '',
+    depth: ld && ld !== '_ALL_' ? ld : '' });
+  const ctxEl = document.getElementById('sc-trend-context');
+  const d = await apiFetch('/api/nfl/performance?' + q);
+  if (!d || d.error || !d.weeks?.length) { if (ctxEl) ctxEl.textContent = d?.error || 'No graded weeks.'; return; }
+  const f = d.filters, t = d.totals.season;
+  if (ctxEl) ctxEl.innerHTML = `NFL ${d.season} · all graded preds · stat=${f.stat} · pos=${f.position} · depth=${f.depth} · model-favoured side, edge ≥ 3pp, stored price · ` +
+    `season N=${t.n || 0}, WR ${t.wr ?? '—'}% vs BE ${t.be ?? '—'}%, ROI ${t.roi ?? '—'}% ${t.roi_ci ? '[' + t.roi_ci[0] + ', ' + t.roi_ci[1] + ']' : ''} · model-version filter not applied here` +
+    `<br>Top: Brier Δ below 0 = model beats market that week; CI band fully above 0 = market wins (proves model wrong).`;
+  const B = d.weeks.filter(w => w.brier);
+  if (_scTrendChart) { _scTrendChart.destroy(); _scTrendChart = null; }
+  mkChart('sc-trend-chart', 'line', { labels: B.map(w => 'W' + w.week + ` (N=${w.brier.n})`), datasets: [
+    { label: 'Brier model − market', data: B.map(w => w.brier.diff), borderColor: '#a855f7', fill: false, lineTension: 0 },
+    { label: '95% CI high', data: B.map(w => w.brier.ci ? w.brier.ci[1] : null), borderColor: 'rgba(168,85,247,0.35)', borderDash: [3, 3], fill: '-1', backgroundColor: 'rgba(168,85,247,0.08)', pointRadius: 0 },
+    { label: '95% CI low', data: B.map(w => w.brier.ci ? w.brier.ci[0] : null), borderColor: 'rgba(168,85,247,0.35)', borderDash: [3, 3], fill: '-2', backgroundColor: 'rgba(168,85,247,0.08)', pointRadius: 0 },
+    { label: 'Market parity', data: B.map(() => 0), borderColor: '#8890a8', borderWidth: 1, pointRadius: 0, fill: false },
+  ] });
+  const W = d.weeks.filter(w => w.n);
+  mkChart('sc-trend-wr', 'line', { labels: W.map(w => 'W' + w.week + ` (N=${w.n})`), datasets: [
+    { label: 'Win rate % (edge ≥ 3pp)', data: W.map(w => w.wr), borderColor: '#3b82f6', fill: false },
+    { label: 'Breakeven %', data: W.map(w => w.be), borderColor: '#ef4444', borderDash: [5, 5], fill: false },
+  ] });
 }
 
 // ── Per-Prediction Table ──────────────────────────────────────────────────────
