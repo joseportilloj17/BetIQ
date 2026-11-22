@@ -1,6 +1,6 @@
 # BetIQ — Open Items
 
-Last updated: 2026-11-09
+Last updated: 2026-11-22
 **Last reconciled**: 2026-11-07 (re-check weekly)
 
 ## B1: Minutes Model — ALL COMPLETE
@@ -1502,6 +1502,24 @@ All items collecting forward data. Each has a decision date and minimum N.
 - W10 live bets (FW-2c+2d combined): 3/5 settled, +1.64u. 1 pending (Love rush_yds — Sleeper data gap).
 - (c) edge >15pp dropped from borderline significant to non-significant — validates track-only decision.
 - Jordan Love rush_yds actual missing from Sleeper — data gap to investigate.
+
+### 2026-11-22: W11 Sunday capture incident + ad-hoc pipeline run
+
+**What happened**: W11 forward preds only covered TNF (567 rows, stored Thu Nov 19 10:05 CT — before Sunday props were first fetched at 2026-11-20T00:03Z). Fri/Sat daily runs and Sun 9 AM `pregame_sun` refresh never fired: the morning chain runs synchronously in `_loop()` (scheduler.py:4998) ahead of the NFL block (scheduler.py:5188), and chains were taking hours (fixture_refresh 6414s, afternoon chain 66968s, scout "TIMED OUT after 5455s" vs 300s ceiling — `_run_with_ceiling` abandons the thread but it keeps running → orphan threads, server ~180% CPU). Morning chain re-started 3× on Nov 22 (08:14, 09:43, 09:48).
+**Disk full**: 537 MB free. Cause: `safe_migrate` writes a full bets.db copy (~300 MB) on every DB init with no retention — 54 copies / 13 GB in `data/backups/safe_migrate/`. User-approved cleanup: kept newest 3, freed ~12 GB.
+**Fix applied (user-approved exception to single-writer rule)**: historical.db backed up via `sqlite3.backup()` to `checkpoints/pre_w11_adhoc_20261122/`, then one-off `run_weekly_pipeline(2026, 11, fetch_props=False)` at 2026-11-22T16:00Z → 5,295 forward preds stored (162 players; 7 early + 3 late + SNF games, all pre-kickoff). 13 `fantasy_consensus` inserts failed `database is locked` (forward preds for those players were stored). MNF props not yet posted.
+
+| # | Item | Status | Notes |
+|---|------|--------|-------|
+| OPS-1 | `safe_migrate` backup retention | **OPEN** | Add retention (keep N=3) + skip when free disk < 2× DB size. P0 — will refill disk in ~3 weeks. |
+| OPS-2 | Chains block `_loop()` / orphaned timed-out threads | **OPEN** | Move NFL fantasy block before chains or run chains in own thread; ceiling must not leak threads; investigate morning-chain re-trigger loop. |
+| OPS-3 | Restart server | **OPEN** | Running d4e0c2c vs disk f9321cd (`version_match=false`); restart after W11 Sunday slate to clear orphan threads. |
+| OPS-4 | ESPN NFL injuries endpoint 400 | **OPEN** | Every fetch Nov 20–22 returned 400; NFL injury records = 0. Sleeper is the only injury source this weekend. |
+| OPS-5 | NHL ATS model load `No module named '_loss'` | **OPEN** | sklearn pickle/version mismatch in betiq env; NHL sub-model unavailable, repeated every mock-gen. |
+| OPS-6 | W11 grading date | **OPEN** | W11 settles after MNF (Nov 23); Tuesday grader Nov 24. FW-5/FW-6 "~2026-11-21" unblock estimate was early → now ~2026-11-24. |
+
+**FW-2 evaluator**: `backend/analysis/nfl_fw2_rules.py` (read-only). `history` mode per-week table; `slate` mode upcoming picks. **Pricing note**: prereg says FanDuel price; the logged W10 numbers above were computed with the row's stored (latest-any-book) price — `--price stored` reproduces FW-2d W10 exactly (N=20, 12W, +14.4%). FanDuel-priced W10: FW-2c 18/23 +37.2% (14 picks lacked an FD price at the same line), FW-2d 11/18 +15.2%, FW-2e 5/12 −24.2%.
+**W11 TNF (FD-priced)**: FW-2c 1-0 (+1 void: Deion Burks no stat line), FW-2d none, FW-2e 1-2. Season FW-2c N=129 79.8% WR vs 56.9% BE, ROI +40.8% [+27.1, +52.7] (game-clustered).
 
 ## Tested Hypotheses — Null Results
 
