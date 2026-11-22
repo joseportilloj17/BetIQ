@@ -1513,7 +1513,7 @@ All items collecting forward data. Each has a decision date and minimum N.
 |---|------|--------|-------|
 | OPS-1 | `safe_migrate` backup retention | **OPEN** | Add retention (keep N=3) + skip when free disk < 2× DB size. P0 — will refill disk in ~3 weeks. |
 | OPS-2 | Chains block `_loop()` / orphaned timed-out threads | **OPEN** | Move NFL fantasy block before chains or run chains in own thread; ceiling must not leak threads; investigate morning-chain re-trigger loop. |
-| OPS-3 | Restart server | **OPEN** | Running d4e0c2c vs disk f9321cd (`version_match=false`); restart after W11 Sunday slate to clear orphan threads. |
+| OPS-3 | Restart server | **DONE** | Restarted 2026-11-22 via launchctl kickstart; running == disk (dd7615f), version_match=true, orphan threads cleared. |
 | OPS-4 | ESPN NFL injuries endpoint 400 | **OPEN** | Every fetch Nov 20–22 returned 400; NFL injury records = 0. Sleeper is the only injury source this weekend. |
 | OPS-5 | NHL ATS model load `No module named '_loss'` | **OPEN** | sklearn pickle/version mismatch in betiq env; NHL sub-model unavailable, repeated every mock-gen. |
 | OPS-7 | NBA forward preds never graded | **OPEN — P1** | `nba_forward_preds`: 0 rows with `actual_value` for every game_date since S5-2 day 1 (2026-11-15; 59K+ rows). No NBA grading lines in app log. S5-2 first Brier read (~late-Dec) is blocked until grading runs. Investigate grader wiring (INFRA-3 said "runs after nightly_ats"). |
