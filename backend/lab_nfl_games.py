@@ -120,16 +120,37 @@ _ABBR = {
 }
 
 
-def _backtest_status():
-    import nfl_game_model as ngm
+def _load_bt(path):
     try:
-        with open(ngm.BACKTEST_PATH) as f:
-            bt = json.load(f)
+        with open(path) as f:
+            return json.load(f)
     except FileNotFoundError:
         return None
-    return {"run_at": bt.get("run_at"), "n_games": bt.get("n_games"),
-            "passed": {m: bool(v.get("passed")) for m, v in bt.get("markets", {}).items()},
-            "markets": bt.get("markets"), "calibration": bt.get("calibration")}
+
+
+def _select_model():
+    """Release gate (pre-registered 2026-11-22, nfl_game_model_gamma docstring):
+    GAMMA-1 replaces the GM1 sim iff its backtest beat the sim on margin MAE, total MAE
+    and ML Brier.  TAKE flags come from the chosen model's own PASS_RULES result."""
+    import nfl_game_model as ngm
+    import nfl_game_model_gamma as ngg
+    g = _load_bt(ngg.BACKTEST_PATH)
+    if g and g.get("head_to_head_vs_sim", {}).get("beats_sim_all3"):
+        bt, mod, name = g, ngg, "GAMMA-1 (player-projection shifted gamma)"
+    else:
+        bt, mod, name = _load_bt(ngm.BACKTEST_PATH), ngm, "GM1 (unanchored drive sim)"
+        if g is None:
+            logger.warning("[GamesEdges] GAMMA-1 backtest not found — using GM1")
+    status = None if bt is None else {
+        "model": name, "run_at": bt.get("run_at"), "n_games": bt.get("n_games"),
+        "passed": {m: bool(v.get("passed")) for m, v in bt.get("markets", {}).items()},
+        "markets": bt.get("markets"), "calibration": bt.get("calibration"),
+        "head_to_head_vs_sim": (g or {}).get("head_to_head_vs_sim")}
+    return mod, status
+
+
+def _backtest_status():
+    return _select_model()[1]
 
 
 def _attach_model(game, pred, status):
@@ -222,9 +243,8 @@ def build_nfl_games(days_ahead: int = 8, with_model: bool = True) -> dict:
     model_meta, status, n_model = None, None, 0
     if with_model and games:
         try:
-            import nfl_game_model as ngm
-            status = _backtest_status()
-            preds = ngm.predict_upcoming(2026)
+            mod, status = _select_model()
+            preds = mod.predict_upcoming(2026)
             model_meta = {k: v for k, v in preds.get("_meta", {}).items()}
             for g in games:
                 key = (_ABBR.get(g["home"]), _ABBR.get(g["away"]))

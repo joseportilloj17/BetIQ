@@ -11505,7 +11505,7 @@ function renderNflGames() {
                    : '<b style="color:var(--amber)">backtest running / not yet available</b>';
   let h = `<div class="card" style="margin-bottom:12px;font-size:11px;color:var(--muted);line-height:1.6">
     <b style="color:var(--text)">NFL · ${data.n_games} games · ${data.n_with_model} with model</b> · odds ${data.games[0]?.odds_fetched_at?.slice(0, 16) || '—'} UTC ·
-    model = unanchored drive sim, opponent-adjusted, ${data.model_meta?.n_sims || '?'} sims/game, HFA ${data.model_meta?.hfa != null ? data.model_meta.hfa.toFixed(1) : '?'} pts, W${data.model_meta?.week || '?'} inputs<br>
+    model = <b style="color:var(--text)">${bt?.model || 'GM1 (unanchored drive sim)'}</b>, W${data.model_meta?.week || '?'} inputs${bt?.head_to_head_vs_sim ? ` · GAMMA-1 vs sim (${bt.head_to_head_vs_sim.n_games} games): margin MAE ${bt.head_to_head_vs_sim.margin_mae.gamma} vs ${bt.head_to_head_vs_sim.margin_mae.sim}, total MAE ${bt.head_to_head_vs_sim.total_mae.gamma} vs ${bt.head_to_head_vs_sim.total_mae.sim}, ML Brier ${bt.head_to_head_vs_sim.ml_brier.gamma} vs ${bt.head_to_head_vs_sim.ml_brier.sim} (market MAE ${bt.head_to_head_vs_sim.market_margin_mae} / ${bt.head_to_head_vs_sim.market_total_mae})` : ''}<br>
     Walk-forward backtest 2023–25 vs closing lines (${bt?.n_games || '?'} games${bt?.run_at ? ', run ' + bt.run_at : ''}): ${btTxt}.
     <b>TAKE</b> appears only on markets whose pre-registered backtest rule passed; otherwise the gap is shown greyed as <i>unvalidated</i>.
     Fair = median no-vig across books at the consensus line. Wong dog legs (+1.5…+2.5, blind 80%/leg) are the only validated NFL game-level edge.</div>`;
