@@ -6966,6 +6966,20 @@ def lab_nfl_games(days_ahead: int = 8):
     return lng.build_nfl_games(days_ahead)
 
 
+@app.post("/api/nfl/odds-history/backfill")
+def nfl_odds_history_backfill(seasons: str = "2023,2024,2025,2026", dry_run: bool = False,
+                              limit: Optional[int] = None):
+    """Start background backfill of historical NFL game-odds snapshots (Tue/Fri per week)."""
+    import nfl_odds_history as noh
+    return noh.start_background(tuple(int(s) for s in seasons.split(",")), dry_run, limit)
+
+
+@app.get("/api/nfl/odds-history/status")
+def nfl_odds_history_status():
+    import nfl_odds_history as noh
+    return noh.STATUS
+
+
 @app.get("/api/nfl/picks")
 def nfl_picks(week: Optional[int] = None, season: int = 2026, budget: float = 50.0, unit: float = 10.0):
     """NFL Lab Picks: FW-2 qualifying picks, prereg card, cross-game parlays, budget allocation."""
