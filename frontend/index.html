@@ -11291,6 +11291,7 @@ function switchOddsLabTab(tab) {
 
 // ── NFL Lab ─────────────────────────────────────────────────────────────────
 let _nflLabData = null;
+let _nflLabLimit = 300;   // rows rendered; "Show more" raises it (was a hard 200 cap that hid rows)
 
 async function loadNflLab() {
   const el = document.getElementById('nfllab-content');
@@ -11319,7 +11320,8 @@ async function loadNflLab() {
   renderNflLabTable();
 }
 
-function renderNflLabTable() {
+function renderNflLabTable(keepLimit) {
+  if (!keepLimit) _nflLabLimit = 300;
   const el = document.getElementById('nfllab-content');
   if (!el || !_nflLabData) return;
   const data = _nflLabData;
@@ -11365,7 +11367,7 @@ function renderNflLabTable() {
     : s === 'Doubtful' ? '<span style="color:var(--red)">D</span>' : '');
 
   let html = `<div style="font-size:11px;color:var(--muted);margin-bottom:8px">
-    NFL · S${data.season} W${data.week} · ${rows.length} props shown · P(over): shifted-gamma (yardage), NegBin (counts) · edges use gamma · main lines ${depthF ? 'only' : '+ alts'}
+    NFL · S${data.season} W${data.week} · ${Math.min(rows.length, _nflLabLimit)} of ${rows.length} props shown (sorted by |edge|) · P(over): shifted-gamma (yardage), NegBin (counts) · edges use gamma · main lines ${depthF ? 'only' : '+ alts'}
   </div>`;
   html += `<table style="width:100%;border-collapse:collapse;font-size:12px">
   <thead><tr style="border-bottom:2px solid var(--border)">
@@ -11382,7 +11384,7 @@ function renderNflLabTable() {
     <th style="padding:6px 4px;text-align:center">Inj</th>
   </tr></thead><tbody>`;
 
-  const limit = 200;
+  const limit = _nflLabLimit;
   for (const r of rows.slice(0, limit)) {
     const edge = r._edge;
     const dir = (r.consensus_mean || 0) > (r.prop_line || 0) ? 'OVER' : 'UNDER';
@@ -11402,7 +11404,10 @@ function renderNflLabTable() {
     </tr>`;
   }
   html += '</tbody></table>';
-  if (rows.length > limit) html += `<div style="color:var(--muted);font-size:11px;margin-top:8px">Showing ${limit} of ${rows.length} — narrow filters to see more.</div>`;
+  if (rows.length > limit) html += `<div style="color:var(--muted);font-size:11px;margin-top:8px">Showing ${limit} of ${rows.length} (sorted by |edge|) —
+    <button class="btn" style="font-size:11px;padding:2px 8px" onclick="_nflLabLimit += 500; renderNflLabTable(true)">Show 500 more</button>
+    <button class="btn" style="font-size:11px;padding:2px 8px" onclick="_nflLabLimit = Infinity; renderNflLabTable(true)">Show all</button>
+    or narrow filters.</div>`;
   el.innerHTML = html;
 }
 
