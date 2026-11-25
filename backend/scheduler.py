@@ -18,7 +18,7 @@ import time
 import traceback
 import threading
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -5315,24 +5315,50 @@ def _loop(interval_mins: int, auto_retrain: bool):
         except Exception as _exc:
             print(f"[Scheduler] ERROR in pre-kickoff refresh: {_exc}")
 
-        # Fantasy forward grading — grade last week's predictions on Tuesdays (after MNF settles)
+        # Fantasy forward grading — catch-up: grade every week whose last kickoff is
+        # >18h past and that has no graded rows yet.  (Was Tuesday-only with
+        # week = get_current_nfl_week()-1, which (a) never caught up after downtime —
+        # W11 missed when the server was down Tue 2026-11-24 — and (b) was off by one:
+        # Sep-10-anchored weeks put Tuesday inside the week that just finished.)
         try:
             ct_now = _now_ct()
-            _is_nfl_season_g = ct_now.month >= 9 or ct_now.month <= 1
-            _grade_ran_today = _scheduler_state.get("last_fantasy_grade") == today_ct
-            if _is_nfl_season_g and ct_now.weekday() == 1 and not _grade_ran_today and ct_now.hour >= 12:
-                from fantasy_projections import grade_forward_predictions as _grade_fp, get_current_nfl_week as _get_week
-                _s, _w = _get_week()
-                _grade_week = max(1, _w - 1)  # grade last week
-                _grade_result = _grade_fp(_s, _grade_week)
-                _scheduler_state["last_fantasy_grade"] = today_ct
-                _graded = _grade_result.get("graded", 0)
-                print(f"[Scheduler] Fantasy forward grade: week {_grade_week}, {_graded} predictions graded")
+            _is_nfl_season_g = ct_now.month >= 9 or ct_now.month <= 2
+            if _is_nfl_season_g and ct_now.hour >= 9:
+                import sqlite3 as _sq_g
+                from fantasy_projections import grade_forward_predictions as _grade_fp, _HIST_DB as _g_db
+                _cutoff = (datetime.now(timezone.utc) - timedelta(hours=18)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                _gc = _sq_g.connect(os.path.abspath(_g_db), timeout=30)
                 try:
-                    from pipeline_health import record_run as _rec_ph
-                    _rec_ph("nfl_grading", rows_written=_graded)
-                except Exception:
-                    pass
+                    _due = _gc.execute("""
+                        SELECT season, week FROM fantasy_forward_preds
+                        GROUP BY season, week
+                        HAVING SUM(graded_at IS NOT NULL) = 0 AND MAX(kickoff_utc) < ?
+                        ORDER BY season, week
+                    """, (_cutoff,)).fetchall()
+                finally:
+                    _gc.close()
+                for _s, _grade_week in _due:
+                    _gkey = f"fantasy_grade_attempt_{_s}_{_grade_week}"
+                    if _scheduler_state.get(_gkey) == today_ct:
+                        continue  # one attempt per week per day
+                    _scheduler_state[_gkey] = today_ct
+                    _grade_result = _grade_fp(_s, _grade_week)
+                    _graded = _grade_result.get("graded", 0)
+                    print(f"[Scheduler] Fantasy forward grade: {_s} W{_grade_week}, {_graded} predictions graded")
+                    if _graded:
+                        _scheduler_state["pending_scorecard_nfl"] = (_s, _grade_week)
+                        _scheduler_state.pop("nfl_grading_alert", None)
+                    else:
+                        _msg = f"NFL grading for completed {_s} W{_grade_week} wrote 0 rows: {_grade_result.get('error')}"
+                        logger.warning("[Scheduler] ALERT: %s", _msg)
+                        _scheduler_state["nfl_grading_alert"] = _msg
+                    try:
+                        from pipeline_health import record_run as _rec_ph
+                        _rec_ph("nfl_grading", rows_written=_graded,
+                                errors=0 if _graded else 1,
+                                error_details=None if _graded else _grade_result.get("error"))
+                    except Exception as _ph_exc:
+                        logger.warning("[Scheduler] pipeline_health record failed: %s", _ph_exc)
         except Exception as _exc:
             logger.error("[Scheduler] ERROR in fantasy forward grading: %s\n%s", _exc, traceback.format_exc())
             try:
@@ -5341,17 +5367,15 @@ def _loop(interval_mins: int, auto_retrain: bool):
             except Exception:
                 pass
 
-        # Model Scorecard — compute + email after grading on Tuesdays 1 PM CT
+        # Model Scorecard — compute + email for the week the grader just graded
+        # (was Tuesday-only with the same off-by-one week as the grader).
         try:
-            ct_now_sc = _now_ct()
-            _is_nfl_sc = ct_now_sc.month >= 9 or ct_now_sc.month <= 1
-            _sc_ran_today = _scheduler_state.get("last_scorecard_nfl") == today_ct
-            if _is_nfl_sc and ct_now_sc.weekday() == 1 and not _sc_ran_today and ct_now_sc.hour >= 13:
+            _sc_pending = _scheduler_state.get("pending_scorecard_nfl")
+            if _sc_pending:
                 from model_scorecard import compute_weekly_scorecard as _sc_compute, \
                     compute_season_to_date as _sc_std, format_email_summary as _sc_email
-                from fantasy_projections import get_current_nfl_week as _get_week_sc
-                _sc_s, _sc_w = _get_week_sc()
-                _sc_grade_week = max(1, _sc_w - 1)
+                _sc_s, _sc_grade_week = _sc_pending
+                _scheduler_state.pop("pending_scorecard_nfl", None)  # one attempt; errors alert below
                 _sc_n = _sc_compute("NFL", _sc_s, _sc_grade_week, force=True)
                 _sc_std_n = _sc_std("NFL", _sc_s, _sc_grade_week)
                 _scheduler_state["last_scorecard_nfl"] = today_ct
