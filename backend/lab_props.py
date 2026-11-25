@@ -747,6 +747,11 @@ def build_lab_props(season: int | None = None,
     for g in games:
         team_game[g["home_team"]] = g
         team_game[g["away_team"]] = g
+    # Preds/Sleeper use alternate codes for some teams (Rams = "LAR", nflverse = "LA");
+    # without these the whole team silently dropped from the Lab (GB@LA showed GB only).
+    for _alt, _canon in {"LAR": "LA", "JAC": "JAX", "WSH": "WAS", "OAK": "LV", "SD": "LAC"}.items():
+        if _canon in team_game and _alt not in team_game:
+            team_game[_alt] = team_game[_canon]
 
     # ── 2. Load stored v1.2 predictions ──
     conn = sqlite3.connect(os.path.abspath(_HIST_DB))
