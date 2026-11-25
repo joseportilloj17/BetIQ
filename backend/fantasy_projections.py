@@ -2973,7 +2973,7 @@ def get_current_nfl_week() -> tuple[int, int]:
 
 
 def run_weekly_pipeline(season: int | None = None, week: int | None = None,
-                        fetch_props: bool = True) -> dict:
+                        fetch_props: bool = True, props_hours_ahead: int = 72) -> dict:
     """
     Full pipeline: fetch projections → build consensus → match to props → rank gaps.
 
@@ -3022,7 +3022,7 @@ def run_weekly_pipeline(season: int | None = None, week: int | None = None,
         try:
             from creator_tier import fetch_player_props
             print("  [Props] Fetching NFL props from TheOddsAPI...")
-            fetch_player_props("americanfootball_nfl", hours_ahead=72)
+            fetch_player_props("americanfootball_nfl", hours_ahead=props_hours_ahead)
         except Exception as exc:
             print(f"  [Props] Fetch failed (will use stored): {exc}")
 

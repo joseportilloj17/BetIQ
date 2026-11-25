@@ -6974,6 +6974,46 @@ def nfl_odds_history_backfill(seasons: str = "2023,2024,2025,2026", dry_run: boo
     return noh.start_background(tuple(int(s) for s in seasons.split(",")), dry_run, limit)
 
 
+_NFL_PIPELINE_STATUS: dict = {"running": False}
+
+
+@app.post("/api/nfl/pipeline/run")
+def nfl_pipeline_run(week: Optional[int] = None, fetch_props: bool = True, props_hours_ahead: int = 72):
+    """Run the NFL weekly fantasy pipeline (props fetch → consensus → forward preds) now,
+    in a background thread inside the server (single-writer).  Same code path as the
+    Wed–Sat scheduler job; use when the scheduler loop is stuck behind other chains."""
+    import threading
+    import fantasy_projections as fp
+    if _NFL_PIPELINE_STATUS.get("running"):
+        return {"error": "already running", **_NFL_PIPELINE_STATUS}
+    _NFL_PIPELINE_STATUS.clear()
+    _NFL_PIPELINE_STATUS.update(running=True, started=datetime.utcnow().isoformat(), week=week,
+                                props_hours_ahead=props_hours_ahead)
+
+    def _run():
+        try:
+            r = fp.run_weekly_pipeline(week=week, fetch_props=fetch_props,
+                                       props_hours_ahead=props_hours_ahead)
+            _NFL_PIPELINE_STATUS.update(n_gaps=r.get("n_gaps", 0), n_matched=r.get("n_matched", 0),
+                                        sources=r.get("sources", []))
+            if not r.get("n_gaps"):
+                logging.getLogger("NFLPipeline").warning("[NFLPipeline] manual run produced 0 gaps: %s", {k: r.get(k) for k in ("error", "n_matched")})
+        except Exception as exc:
+            logging.getLogger("NFLPipeline").error("[NFLPipeline] manual run failed: %s", exc, exc_info=True)
+            _NFL_PIPELINE_STATUS["error"] = str(exc)
+        finally:
+            _NFL_PIPELINE_STATUS["running"] = False
+            _NFL_PIPELINE_STATUS["finished"] = datetime.utcnow().isoformat()
+
+    threading.Thread(target=_run, daemon=True, name="NFLPipelineManual").start()
+    return {"started": True, **_NFL_PIPELINE_STATUS}
+
+
+@app.get("/api/nfl/pipeline/status")
+def nfl_pipeline_status():
+    return _NFL_PIPELINE_STATUS
+
+
 @app.get("/api/nfl/odds-history/status")
 def nfl_odds_history_status():
     import nfl_odds_history as noh
