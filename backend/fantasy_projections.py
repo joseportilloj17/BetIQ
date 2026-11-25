@@ -2949,19 +2949,23 @@ def get_current_nfl_week() -> tuple[int, int]:
     """
     from datetime import date
     today = date.today()
-    # NFL 2026 season starts ~Sep 10, 2026
-    # Each week is 7 days
+    # NFL weeks turn over on TUESDAY (after MNF): week N = Tue..Mon.
+    # 2026 W1 kicks off Thu Sep 10 → W1 Tuesday = Sep 8.  (Was anchored on the
+    # Thursday, which labelled Tue/Wed as the just-finished week: the Wednesday
+    # pipeline re-ran last week instead of building the upcoming slate, and the
+    # Lab showed last week until Thursday.  Fixed 2026-11-25.)
+    def _w1_tuesday(y: int) -> date:
+        sep1 = date(y, 9, 1)
+        labor_day = date(y, 9, 1 + (0 - sep1.weekday()) % 7)  # first Monday of Sep
+        return date.fromordinal(labor_day.toordinal() + 1)      # Tuesday after; W1 Thu = +2
     if today.month >= 9:
         season = today.year
-        # Week 1 starts around Sep 10
-        season_start = date(today.year, 9, 10)
     elif today.month <= 2:
         season = today.year - 1
-        season_start = date(today.year - 1, 9, 10)
     else:
         # Offseason
         season = today.year
-        season_start = date(today.year, 9, 10)
+    season_start = _w1_tuesday(season)
 
     days_since = (today - season_start).days
     week = max(1, min(18, (days_since // 7) + 1))
